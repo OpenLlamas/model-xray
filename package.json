@@ -1,0 +1,39 @@
+{
+  "name": "model-xray",
+  "version": "0.1.0",
+  "description": "X-ray your LLM endpoints. Audit OpenAI-compatible relays for fake or watered-down models.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OpenLlamas/model-xray.git"
+  },
+  "bin": {
+    "model-xray": "./dist/src/cli.js"
+  },
+  "files": [
+    "dist/src"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "keywords": [
+    "llm",
+    "openai",
+    "audit",
+    "relay",
+    "proxy",
+    "cli"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "npm run build && npm run test:only",
+    "test:only": "node --test dist/test/*.test.js dist/test/unit/*.test.js",
+    "prepublishOnly": "npm run build"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}
