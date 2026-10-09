@@ -1,3 +1,5 @@
+import type { Usage, UsageRejection } from './types.js';
+
 export interface SseEvent {
   data: string;
   event: string | null;
@@ -84,8 +86,38 @@ export interface StreamChunk {
   contentDelta: string;
   reasoningDelta: string;
   toolCallDeltas: ToolCallDelta[];
-  usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } | null;
+  usage: Usage | null;
+  /** payload 带 usage 键但被 validateUsage 拒绝时的原因；未带 usage 键为 null */
+  usageReason: UsageRejection | null;
   finishReason: string | null;
+}
+
+/**
+ * usage 三字段统一校验（非流式与流式共用，杜绝两处规则漂移）：
+ * - 任一字段缺失/非有限数字 → usage null + 'missing'；
+ * - 任一字段为负 → usage null + 'negative'；
+ * - total_tokens !== prompt_tokens + completion_tokens → usage null + 'inconsistent'（疑似计费字段篡改）。
+ */
+export function validateUsage(value: unknown): { usage: Usage | null; reason: UsageRejection | null } {
+  if (typeof value !== 'object' || value === null) return { usage: null, reason: 'missing' };
+  const u = value as Record<string, unknown>;
+  const prompt = u['prompt_tokens'];
+  const completion = u['completion_tokens'];
+  const total = u['total_tokens'];
+  const fields = [prompt, completion, total];
+  if (fields.some((v) => typeof v !== 'number' || !Number.isFinite(v))) {
+    return { usage: null, reason: 'missing' };
+  }
+  if (fields.some((v) => (v as number) < 0)) {
+    return { usage: null, reason: 'negative' };
+  }
+  if ((total as number) !== (prompt as number) + (completion as number)) {
+    return { usage: null, reason: 'inconsistent' };
+  }
+  return {
+    usage: { prompt_tokens: prompt as number, completion_tokens: completion as number, total_tokens: total as number },
+    reason: null,
+  };
 }
 
 /** Parse one SSE data payload into a normalized chunk. Returns null for non-JSON or [DONE]. */
@@ -122,23 +154,15 @@ export function parseStreamPayload(data: string): StreamChunk | null {
   }
 
   let usage: StreamChunk['usage'] = null;
-  if (typeof obj['usage'] === 'object' && obj['usage'] !== null) {
-    const u = obj['usage'] as Record<string, unknown>;
-    if (
-      typeof u['prompt_tokens'] === 'number' &&
-      typeof u['completion_tokens'] === 'number' &&
-      typeof u['total_tokens'] === 'number'
-    ) {
-      usage = {
-        prompt_tokens: u['prompt_tokens'],
-        completion_tokens: u['completion_tokens'],
-        total_tokens: u['total_tokens'],
-      };
-    }
+  let usageReason: StreamChunk['usageReason'] = null;
+  if ('usage' in obj) {
+    const validated = validateUsage(obj['usage']);
+    usage = validated.usage;
+    usageReason = validated.reason;
   }
 
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
-  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, finishReason };
+  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason };
 }
 
 export function extractText(value: unknown): string {

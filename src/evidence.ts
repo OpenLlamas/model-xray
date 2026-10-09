@@ -66,6 +66,8 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       textPreview: truncate(result.text, PREVIEW_CHARS),
       textChars: result.text.length,
       usage: result.usage,
+      usageRejected: result.usageRejected,
+      attempts: result.attempts,
       toolCallCount: result.toolCalls.length,
       error: result.error,
     },
