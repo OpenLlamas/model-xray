@@ -55,6 +55,8 @@ function sampleReport(textPreview: string): AuditReport {
           textPreview,
           textChars: textPreview.length,
           usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
+          usageRejected: null,
+          attempts: 1,
           toolCallCount: 0,
           error: null,
         },

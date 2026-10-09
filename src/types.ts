@@ -10,6 +10,9 @@ export interface Usage {
   total_tokens: number;
 }
 
+/** usage 被校验拒绝的原因：missing=缺字段/非数字，negative=负值，inconsistent=total≠分项和 */
+export type UsageRejection = 'missing' | 'negative' | 'inconsistent';
+
 export interface TextPart {
   type: 'text';
   text: string;
@@ -56,6 +59,10 @@ export interface ChatResult {
   text: string;
   reasoning: string | null;
   usage: Usage | null;
+  /** usage 非 null 时为 null，否则为拒绝原因（missing/negative/inconsistent） */
+  usageRejected: UsageRejection | null;
+  /** 实际尝试次数（含首次；重试后成功则 >1），供计费污染闸判断重复计费风险 */
+  attempts: number;
   toolCalls: ToolCall[];
   ttftMs: number | null;
   durationMs: number;
@@ -107,6 +114,10 @@ export interface EvidenceResponse {
   textPreview: string;
   textChars: number;
   usage: Usage | null;
+  /** usage 非 null 时为 null，否则为拒绝原因 */
+  usageRejected: UsageRejection | null;
+  /** 实际尝试次数（≥1，重试后成功则 >1） */
+  attempts: number;
   toolCallCount: number;
   error: string | null;
 }
@@ -143,6 +154,12 @@ export interface RunConfig {
   html: boolean;
   yes: boolean;
   quiet: boolean;
+  /** 宣称价格（每百万 tokens，单位需与端点余额显示单位一致）；启用实测倍率探针 */
+  priceInput?: number | null;
+  priceOutput?: number | null;
+  /** 指纹基线对比：输入基线文件 / 本轮基线输出路径 */
+  baselineIn?: string | null;
+  baselineOut?: string | null;
 }
 
 export interface Rng {

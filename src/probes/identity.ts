@@ -30,6 +30,14 @@ interface IdentitySample {
   evidenceId: string;
 }
 
+function familiesIn(text: string): Set<string> {
+  const declared = new Set<string>();
+  for (const [name, pattern] of MODEL_ALIAS) {
+    if (pattern.test(text)) declared.add(name);
+  }
+  return declared;
+}
+
 function detectFalsified(samples: readonly IdentitySample[], expect: readonly string[]): boolean {
   if (expect.length === 0) return false;
   const expectedAliases = new Set<string>();
@@ -41,10 +49,7 @@ function detectFalsified(samples: readonly IdentitySample[], expect: readonly st
   if (expectedAliases.size === 0) return false;
   let mismatch = 0;
   for (const sample of samples) {
-    const declared = new Set<string>();
-    for (const [name, pattern] of MODEL_ALIAS) {
-      if (pattern.test(sample.result.text)) declared.add(name);
-    }
+    const declared = familiesIn(sample.result.text);
     if (declared.size === 0) continue;
     const consistentWithExpect = [...declared].some((d) => expectedAliases.has(d));
     if (!consistentWithExpect) mismatch += 1;
@@ -81,7 +86,10 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const texts = samples.map((s) => s.result.text);
   const normalized = texts.map(normalize);
   const answerable = normalized.filter((t) => t.length >= 3).length;
-  const identicalPairs = normalized.filter((t, i) => i > 0 && t === normalized[i - 1]).length;
+  // 逐字一致只在「非空非纯空白」的归一化文本之间统计：空响应没有指纹含义，
+  // 参与相邻比较会把「多个空回答」误判成模板特判，冤枉限流/截断下的端点。
+  const nonEmpty = normalized.filter((t) => t.length > 0);
+  const identicalPairs = nonEmpty.filter((t, i) => i > 0 && t === nonEmpty[i - 1]).length;
 
   const schemaProbe = ctx.rng.pick(SCHEMA_PROBES);
   const schemaResult = await ctx.client.chat({
@@ -106,6 +114,13 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   const refusalCount = texts.filter((t) => REFUSAL_PATTERNS.some((p) => p.test(t))).length;
   metrics['refusals'] = refusalCount;
+
+  // 模型族指纹集合（各次自述声明的并集），供指纹基线对比使用
+  const familyUnion = new Set<string>();
+  for (const sample of samples) {
+    for (const family of familiesIn(sample.result.text)) familyUnion.add(family);
+  }
+  metrics['families'] = familyUnion.size > 0 ? [...familyUnion].sort().join(',') : 'none';
 
   if (samples.length === 0) {
     return {
@@ -136,14 +151,21 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     });
   }
   if (answerable === 0 && samples.length > 0) {
-    score = Math.min(score, 30);
-    level = 'fail';
-    headline = '身份探针无有效回答';
+    // 全部空响应：没有证据指控端点（可能是限流/截断/内容过滤），按证据不足处理，不碰 score/level
     findings.push({
-      level: 'fail',
-      message: '自述问题均无实质回答（空响应或纯拒答），无法完成身份核验。',
+      level: 'info',
+      message: `共采样 ${samples.length} 次自述 + 1 次格式合规探针，全部返回空响应，无法完成身份核验（不作为异常指控）。`,
       evidenceIds: [],
     });
+    return {
+      id: 'identity',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: '身份探针无有效回答（全部空响应），无法核验',
+      findings,
+      metrics,
+    };
   } else if (refusalCount >= 3 && !falsified) {
     findings.push({ level: 'warn', message: '自述问题全部被回避，行为指纹结论置信度低。', evidenceIds: [] });
     score = Math.min(score, 85);

@@ -1,8 +1,9 @@
 #!/usr/bin/env node
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { parseArgs } from 'node:util';
 import { runAudit } from './runner.js';
 import { createRng } from './random.js';
+import { buildBaseline, loadBaseline } from './baseline.js';
 import { writeReports } from './report/files.js';
 import { renderConsole } from './report/console.js';
 import type { AuditReport, RunConfig } from './types.js';
@@ -16,17 +17,27 @@ Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
   --key <key>               API key (or env MODEL_XRAY_KEY / OPENAI_API_KEY)
   --model <model>           Model name to audit, e.g. gpt-4o
-  --claimed-context <n>     Advertised context window in tokens (enables context probe)
-  --expect <list>           Claimed capabilities: vision,tool,thinking or none (default: vision,tool)
+  --claimed-context <n>     Advertised context window in tokens, integer in [1000, 100000000] (enables context probe)
+  --expect <list>           Claimed capabilities, comma-separated from: vision,tool,thinking (or "none"; default: vision,tool)
+  --price-input <n>         Claimed input price per 1M tokens, must be > 0 (with --price-output, enables measured-rate probe)
+  --price-output <n>        Claimed output price per 1M tokens, must be > 0 (must appear with --price-input)
+  --retries <n>             Retries per request on 408/409/429/5xx, integer in [0, 3] (default: 0)
+                            注意：每次重试都会真实计费，默认不重试；开了重试会令实测倍率判定作废（防重复计费污染）
+  --baseline <path>         Compare fingerprints against a baseline file (seed is reused unless --seed)
+  --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<stamp>.json)
   --deep                    More samples (slower, more tokens)
-  --seed <n>                Random seed for reproducibility (default: time-based)
-  --timeout <seconds>       Per-request timeout (default: 60)
+  --seed <n>                Random seed, integer in [1, 2147483646] (default: time-based; with --baseline defaults to baseline seed)
+  --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 60)
   --out <dir>               Report output directory (default: reports)
   --yes                     Skip the token-cost confirmation on remote endpoints
   --dry-run                 Print the planned requests and token estimate, then exit
   --quiet                   Only print the final verdict
   --help                    Show this help
   --version                 Print version
+
+Notes:
+  价格为「每百万 tokens 的宣称价格」，必须为正数；单位需与该站余额显示单位一致（美元/quota 均可），工具只算比值，不做单位换算。
+  数值参数均按严格整数校验（不接受 "12abc"、前导空白等）；非法输入立即 exit 2 并给出正确示例。
 
 Exit codes: 0 pass/warn · 1 fail · 2 error
 `;
@@ -44,9 +55,14 @@ async function main(argv: string[]): Promise<number> {
         model: { type: 'string' },
         'claimed-context': { type: 'string' },
         expect: { type: 'string' },
+        'price-input': { type: 'string' },
+        'price-output': { type: 'string' },
+        baseline: { type: 'string' },
+        'baseline-out': { type: 'string' },
         deep: { type: 'boolean', default: false },
         seed: { type: 'string' },
         timeout: { type: 'string' },
+        retries: { type: 'string' },
         out: { type: 'string', default: 'reports' },
         yes: { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
@@ -80,6 +96,7 @@ async function main(argv: string[]): Promise<number> {
   const apiKey = values.key ?? process.env['MODEL_XRAY_KEY'] ?? process.env['OPENAI_API_KEY'] ?? '';
   if (!baseUrl || !model) {
     console.error('缺少必填参数 --base-url 与 --model。');
+    console.error('示例：model-xray test --base-url https://relay.example.com/v1 --key sk-xxx --model gpt-4o');
     console.error(HELP);
     return 2;
   }
@@ -87,30 +104,90 @@ async function main(argv: string[]): Promise<number> {
     new URL(baseUrl);
   } catch {
     console.error(`--base-url 不是合法 URL：${baseUrl}`);
+    console.error('示例：--base-url https://relay.example.com/v1（通常以 /v1 结尾）');
     return 2;
   }
   if (!apiKey && !values['dry-run']) {
     console.error('缺少 API key：--key 或环境变量 MODEL_XRAY_KEY / OPENAI_API_KEY。');
+    console.error('示例：--key sk-xxx，或先执行 export MODEL_XRAY_KEY=sk-xxx');
     return 2;
   }
 
-  const claimedContext = values['claimed-context'] ? Number.parseInt(values['claimed-context'], 10) : null;
-  if (claimedContext !== null && (!Number.isFinite(claimedContext) || claimedContext <= 0)) {
-    console.error('--claimed-context 必须是正整数。');
-    return 2;
+  let claimedContext: number | null = null;
+  if (values['claimed-context'] !== undefined) {
+    claimedContext = strictInt(values['claimed-context'], 1000, 100000000, 'claimed-context', '32000');
+    if (claimedContext === null) return 2;
   }
+
+  const expectAllowed = ['vision', 'tool', 'thinking'] as const;
   const expectRaw = (values.expect ?? 'vision,tool').trim();
-  const expect = expectRaw === '' || expectRaw === 'none' ? [] : expectRaw.split(',').map((s) => s.trim()).filter(Boolean);
-  const seed = values.seed ? Number.parseInt(values.seed, 10) : Date.now() % 2147483647;
-  if (!Number.isFinite(seed)) {
-    console.error('--seed 必须是整数。');
-    return 2;
+  let expect: string[] = [];
+  if (expectRaw !== '' && expectRaw !== 'none') {
+    const tokens = expectRaw.split(',').map((s) => s.trim()).filter(Boolean);
+    const unknown = tokens.filter((t) => !(expectAllowed as readonly string[]).includes(t));
+    if (unknown.length > 0) {
+      console.error(`--expect 含未知能力声明：${unknown.join(', ')}。合法值：${expectAllowed.join(', ')}（或 none 表示不宣称任何能力）。`);
+      console.error('示例：--expect vision,tool');
+      return 2;
+    }
+    expect = [...new Set(tokens)];
   }
-  const timeoutSeconds = values.timeout ? Number.parseInt(values.timeout, 10) : 60;
-  if (!Number.isFinite(timeoutSeconds) || timeoutSeconds <= 0) {
-    console.error('--timeout 必须是正整数秒数。');
-    return 2;
+
+  const priceInputRaw = values['price-input'];
+  const priceOutputRaw = values['price-output'];
+  let priceInput: number | null = null;
+  let priceOutput: number | null = null;
+  if (priceInputRaw !== undefined || priceOutputRaw !== undefined) {
+    if (priceInputRaw === undefined || priceOutputRaw === undefined) {
+      console.error('--price-input 与 --price-output 必须成对出现。');
+      console.error('示例：--price-input 2.5 --price-output 10');
+      return 2;
+    }
+    const parsedInput = positiveNumber(priceInputRaw, 'price-input');
+    const parsedOutput = positiveNumber(priceOutputRaw, 'price-output');
+    if (parsedInput === null || parsedOutput === null) return 2;
+    priceInput = parsedInput;
+    priceOutput = parsedOutput;
   }
+
+  // --baseline fail-fast：文件不存在 / 基线畸形都立即 exit 2，不发起任何请求（runner 内的 catch 降级仅供库调用方）
+  let baselineData: ReturnType<typeof loadBaseline> | null = null;
+  if (values.baseline !== undefined) {
+    let readable = false;
+    try {
+      readable = statSync(values.baseline).isFile();
+    } catch {
+      readable = false;
+    }
+    if (!readable) {
+      console.error(`--baseline 文件不存在或不可读：${values.baseline}`);
+      console.error('下一步：先跑一次审计（--baseline-out 会生成基线文件），或核对路径拼写。示例：--baseline reports/baseline-2026-01-01T00-00-00-000Z.json');
+      return 2;
+    }
+    try {
+      baselineData = loadBaseline(values.baseline);
+    } catch (error) {
+      console.error(`--baseline 基线文件非法：${error instanceof Error ? error.message : String(error)}`);
+      console.error('下一步：用对应 --baseline-out 重新生成基线，或修正文件内容后重试。');
+      return 2;
+    }
+  }
+
+  // seed 沿用：提供 --baseline 且未显式 --seed 时，用基线文件的 seed（保证题集可比）；显式 --seed 优先。
+  let seed: number;
+  if (values.seed !== undefined) {
+    const parsedSeed = strictInt(values.seed, 1, 2147483646, 'seed', '12345');
+    if (parsedSeed === null) return 2;
+    seed = parsedSeed;
+  } else if (baselineData !== null && Number.isFinite(baselineData.seed)) {
+    seed = baselineData.seed;
+  } else {
+    seed = (Date.now() % 2147483646) + 1;
+  }
+  const timeoutSeconds = values.timeout !== undefined ? strictInt(values.timeout, 1, 3600, 'timeout', '60') : 60;
+  if (timeoutSeconds === null) return 2;
+  const retries = values.retries !== undefined ? strictInt(values.retries, 0, 3, 'retries', '1') : 0;
+  if (retries === null) return 2;
 
   const cfg: RunConfig = {
     baseUrl,
@@ -121,11 +198,15 @@ async function main(argv: string[]): Promise<number> {
     deep: values.deep === true,
     seed,
     timeoutMs: timeoutSeconds * 1000,
-    retries: 1,
+    retries,
     outDir: values.out ?? 'reports',
     html: true,
     yes: values.yes === true,
     quiet: values.quiet === true,
+    priceInput,
+    priceOutput,
+    baselineIn: values.baseline ?? null,
+    baselineOut: values['baseline-out'] ?? null,
   };
 
   const cost = estimateCost(cfg);
@@ -140,14 +221,14 @@ async function main(argv: string[]): Promise<number> {
 
   if (!isLocalEndpoint(baseUrl) && !cfg.yes) {
     if (!process.stdin.isTTY) {
-      console.error('远程端点需确认成本。请加 --yes 跳过确认，或先跑 --dry-run 查看预估。');
+      console.error('远程端点需确认成本。下一步：加 --yes 跳过确认，或先跑 --dry-run 查看预估。');
       return 2;
     }
     const confirmed = await confirm(
       `将对远程端点发起真实请求（预估 ~${cost.inputTokens.toLocaleString()} tokens 输入）。继续？[y/N] `,
     );
     if (!confirmed) {
-      console.error('已取消。');
+      console.error('已取消。下一步：确认成本后重跑，加 --yes 可跳过确认；先 --dry-run 可预览请求量。');
       return 2;
     }
   }
@@ -159,15 +240,25 @@ async function main(argv: string[]): Promise<number> {
     });
   } catch (error) {
     console.error(`审计失败：${error instanceof Error ? error.message : String(error)}`);
+    console.error('下一步：检查端点可达性与 --base-url 拼写（通常以 /v1 结尾），或加大 --timeout 后重试。');
     return 2;
   }
 
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   let written;
   try {
-    written = writeReports(report, cfg.outDir, stamp);
+    // 每轮审计默认落盘指纹基线（可用 --baseline-out 指定路径），供后续 --baseline 复测对比
+    const baseline = buildBaseline(report.outcomes, {
+      model: report.meta.model,
+      seed: report.meta.seed,
+      probesetVersion: report.meta.probesetVersion,
+      assetsVersion: report.meta.assetsVersion,
+      createdAt: report.meta.startedAt,
+    });
+    written = writeReports(report, cfg.outDir, stamp, baseline, cfg.baselineOut);
   } catch (error) {
     console.error(`报告写入失败：${error instanceof Error ? error.message : String(error)}`);
+    console.error(`下一步：检查 --out 目录（当前：${cfg.outDir}）是否可写，或换一个输出目录重试。示例：--out reports`);
     return 2;
   }
 
@@ -177,6 +268,7 @@ async function main(argv: string[]): Promise<number> {
   console.error(`  ${written.markdownPath}`);
   console.error(`  ${written.htmlPath}`);
   console.error(`  ${written.jsonPath}`);
+  if (written.baselinePath) console.error(`  ${written.baselinePath}`);
 
   if (report.overall === 'fail') return 1;
   return 0;
@@ -230,6 +322,36 @@ function readVersion(): string {
   }
 }
 
+/**
+ * 严格整数解析：/^[+-]?\d+$/ + Number.isSafeInteger + 范围校验。
+ * 非法时向 stderr 输出含范围、实际值与正确示例的中文错误，返回 null（调用方 return 2）。
+ * 取代 Number.parseInt —— parseInt('12abc')===12 会静默吞掉尾部垃圾字符。
+ */
+function strictInt(raw: string, min: number, max: number, name: string, example: string): number | null {
+  const fail = (): null => {
+    console.error(`--${name} 必须是 [${min}, ${max}] 的整数。收到：${JSON.stringify(raw)}。`);
+    console.error(`示例：--${name} ${example}`);
+    return null;
+  };
+  if (!/^[+-]?\d+$/.test(raw)) return fail();
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < min || value > max) return fail();
+  return value;
+}
+
+/** 严格正数解析（价格）：必须形如数字、Number() 后有限且 > 0；空串/0/负数/非数字一律报错。 */
+function positiveNumber(raw: string, name: string): number | null {
+  const fail = (): null => {
+    console.error(`--${name} 必须为正数（每百万 tokens 宣称价格）。收到：${JSON.stringify(raw)}。`);
+    console.error(`示例：--${name === 'price-input' ? 'price-input 2.5' : 'price-output 10'}（与另一价格 flag 成对使用）`);
+    return null;
+  };
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return fail();
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fail();
+  return value;
+}
+
 const invokedDirectly = process.argv[1] !== undefined && process.argv[1].replace(/\\/g, '/').endsWith('/cli.js');
 if (invokedDirectly) {
   main(process.argv.slice(2))
@@ -238,6 +360,7 @@ if (invokedDirectly) {
     })
     .catch((error) => {
       console.error(`未捕获错误：${error instanceof Error ? error.stack : String(error)}`);
+      console.error('下一步：带上完整命令与该堆栈反馈问题；重跑时可先 --dry-run 验证参数。');
       process.exitCode = 2;
     });
 }

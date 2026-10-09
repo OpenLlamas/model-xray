@@ -1,4 +1,5 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
+import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
 
 export type MockMode =
@@ -11,7 +12,10 @@ export type MockMode =
   | 'no-vision'
   | 'tool-fail'
   | 'dumb'
-  | 'flaky';
+  | 'flaky'
+  | 'flaky500'
+  | 'badusage'
+  | 'empty';
 
 export interface MockBehavior {
   mode: MockMode;
@@ -19,6 +23,11 @@ export interface MockBehavior {
   identityName: string;
   inflateFactor: number;
   failEvery: number;
+  balanceSeries: number[];
+  /** badusage：交替注入 inconsistent/negative usage 的计数器 */
+  badUsageSeq: number;
+  /** flaky500：已注入过 500 的请求体摘要（同体重放即重试 → 返回 200） */
+  seen500: Set<string>;
 }
 
 export interface MockOptions {
@@ -27,6 +36,8 @@ export interface MockOptions {
   identityName?: string;
   inflateFactor?: number;
   failEvery?: number;
+  /** GET /dashboard/billing/usage 按查询次数从该序列取值（用尽后取最后一个） */
+  balanceSeries?: number[];
 }
 
 export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
@@ -43,7 +54,7 @@ export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, nu
 export interface MockServer {
   server: Server;
   baseUrl: string;
-  state: { served: number };
+  state: { served: number; balanceQueries: number };
 }
 
 export function createMockServer(options: MockOptions): Promise<MockServer> {
@@ -53,17 +64,30 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     identityName: options.identityName ?? 'GLM-4',
     inflateFactor: options.inflateFactor ?? 4,
     failEvery: options.failEvery ?? 0,
+    balanceSeries: options.balanceSeries ?? [100.0, 99.5],
+    badUsageSeq: 0,
+    seen500: new Set<string>(),
   };
-  const state = { served: 0 };
+  const state = { served: 0, balanceQueries: 0 };
 
   const server = createServer(async (req, res) => {
+    if (req.method === 'GET' && req.url !== undefined && req.url.split('?')[0]?.endsWith('/dashboard/billing/usage')) {
+      const series = behavior.balanceSeries;
+      const index = Math.min(state.balanceQueries, series.length - 1);
+      const value = index >= 0 && series[index] !== undefined ? (series[index] as number) : 0;
+      state.balanceQueries += 1;
+      sendJson(res, 200, { object: 'list', total_usage: value });
+      return;
+    }
     if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) {
       sendJson(res, 404, { error: { message: 'not found' } });
       return;
     }
     let body: Record<string, unknown>;
+    let rawBody = '';
     try {
-      body = JSON.parse(await readBody(req)) as Record<string, unknown>;
+      rawBody = await readBody(req);
+      body = JSON.parse(rawBody) as Record<string, unknown>;
     } catch {
       sendJson(res, 400, { error: { message: 'invalid json' } });
       return;
@@ -72,6 +96,16 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     if (behavior.mode === 'flaky' && behavior.failEvery > 0 && state.served % behavior.failEvery === 0) {
       sendJson(res, 500, { error: { message: 'injected fault' } });
       return;
+    }
+    // flaky500：瞬时故障模拟——每个唯一请求体首次返回 500，客户端重试（同请求体）即返回 200；
+    // balance 端点不受影响（上方已提前返回）。
+    if (behavior.mode === 'flaky500') {
+      const digest = createHash('sha1').update(rawBody).digest('hex');
+      if (!behavior.seen500.has(digest)) {
+        behavior.seen500.add(digest);
+        sendJson(res, 500, { error: { message: 'injected transient 500' } });
+        return;
+      }
     }
     handle(res, behavior, body, state);
   });
@@ -94,6 +128,12 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
   const stream = body['stream'] === true;
   const imageUrl = findImageUrl(last);
   const modelName = typeof body['model'] === 'string' ? body['model'] : 'mock-model';
+
+  // empty：所有 chat 请求一律返回 200 + 空 content（模拟限流/截断下端点「成功但无内容」）
+  if (behavior.mode === 'empty') {
+    sendReply(res, behavior, '', estimate(allText), stream);
+    return;
+  }
 
   const toolResultNonce = findToolResultNonce(messages);
   if (toolResultNonce !== null) {
@@ -363,6 +403,16 @@ function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, 
 function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string): Record<string, number> {
   if (behavior.mode === 'const-usage') {
     return { prompt_tokens: 500, completion_tokens: 50, total_tokens: 550 };
+  }
+  // badusage：奇数笔 total≠分项和（inconsistent）、偶数笔 prompt_tokens 为负（negative），交替注入
+  if (behavior.mode === 'badusage') {
+    behavior.badUsageSeq += 1;
+    const completion = Math.max(1, Math.ceil(reply.length / 3.2));
+    const prompt = Math.max(10, estimatedTokens);
+    if (behavior.badUsageSeq % 2 === 1) {
+      return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion + 7 };
+    }
+    return { prompt_tokens: -prompt, completion_tokens: completion, total_tokens: -prompt + completion };
   }
   const completion = Math.max(1, Math.ceil(reply.length / 3.2));
   let prompt = Math.max(10, estimatedTokens);

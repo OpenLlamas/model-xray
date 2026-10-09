@@ -1,5 +1,5 @@
-import { SseParser, parseStreamPayload, extractText, type ToolCallDelta } from './sse.js';
-import type { ChatRequest, ChatResult, ClientOptions, OpenAIClient, ToolCall, Usage } from './types.js';
+import { SseParser, parseStreamPayload, extractText, validateUsage, type ToolCallDelta } from './sse.js';
+import type { ChatRequest, ChatResult, ClientOptions, OpenAIClient, ToolCall, Usage, UsageRejection } from './types.js';
 
 const RETRYABLE_STATUS = new Set([408, 409, 429, 500, 502, 503, 504]);
 
@@ -9,9 +9,11 @@ export function createClient(options: ClientOptions): OpenAIClient {
 
   async function chat(req: ChatRequest): Promise<ChatResult> {
     let lastResult: ChatResult | null = null;
-    for (let attempt = 0; attempt <= options.retries; attempt += 1) {
-      if (attempt > 0) await sleep(backoffMs(attempt));
+    for (let attempt = 1; attempt <= options.retries + 1; attempt += 1) {
+      if (attempt > 1) await sleep(backoffMs(attempt));
       lastResult = await attemptChat(chatUrl, options, req);
+      // 记录实际尝试次数：计费探针用它识别「审计窗口内存在重试」的重复计费风险
+      lastResult.attempts = attempt;
       if (lastResult.ok || !RETRYABLE_STATUS.has(lastResult.status)) return lastResult;
     }
     return lastResult ?? errorResult('no attempt executed');
@@ -47,11 +49,22 @@ async function attemptChat(url: string, options: ClientOptions, req: ChatRequest
     }
     return await readJson(response, started);
   } catch (error) {
+    const durationMs = Date.now() - started;
+    // 错误四分类：timeout / network / HTTP <status> / invalid JSON，让 stderr 与 finding 一眼可分辨
+    if (isAbortError(error, controller)) {
+      return errorResult(`timeout：${options.timeoutMs}ms 超时（含流式总时长）`, 0, durationMs);
+    }
     const message = error instanceof Error ? error.message : String(error);
-    return errorResult(message, 0, Date.now() - started);
+    return errorResult(`network：${message}`, 0, durationMs);
   } finally {
     clearTimeout(timer);
   }
+}
+
+function isAbortError(error: unknown, controller: AbortController): boolean {
+  if (error instanceof Error && error.name === 'AbortError') return true;
+  const reason: unknown = controller.signal.reason;
+  return reason instanceof Error && reason.name === 'AbortError';
 }
 
 async function readJson(response: Response, started: number): Promise<ChatResult> {
@@ -65,12 +78,15 @@ async function readJson(response: Response, started: number): Promise<ChatResult
       : {};
     const text = extractText(message['content']);
     const reasoning = extractText(message['reasoning_content']) + extractText(message['reasoning']);
+    const { usage, reason } = validateUsage(parsed['usage']);
     return {
       ok: true,
       status: response.status,
       text,
       reasoning: reasoning.length > 0 ? reasoning : null,
-      usage: extractUsage(parsed['usage']),
+      usage,
+      usageRejected: reason,
+      attempts: 1,
       toolCalls: extractToolCalls(message['tool_calls']),
       ttftMs: null,
       durationMs,
@@ -91,6 +107,7 @@ async function readStream(response: Response, started: number): Promise<ChatResu
   let reasoning = '';
   let ttftMs: number | null = null;
   let usage: Usage | null = null;
+  let usageRejected: UsageRejection | null = null;
   let finishReason: string | null = null;
   const toolAcc = new Map<number, { id: string; name: string; args: string }>();
   const rawParts: string[] = [];
@@ -113,7 +130,12 @@ async function readStream(response: Response, started: number): Promise<ChatResu
       }
       text += deltaText;
       reasoning += deltaReasoning;
-      if (chunk.usage) usage = chunk.usage;
+      if (chunk.usage) {
+        usage = chunk.usage;
+        usageRejected = null;
+      } else if (chunk.usageReason !== null) {
+        usageRejected = chunk.usageReason;
+      }
       if (chunk.finishReason) finishReason = chunk.finishReason;
       for (const delta of chunk.toolCallDeltas) mergeToolDelta(toolAcc, delta);
     }
@@ -141,6 +163,8 @@ async function readStream(response: Response, started: number): Promise<ChatResu
     text,
     reasoning: reasoning.length > 0 ? reasoning : null,
     usage,
+    usageRejected: usage !== null ? null : (usageRejected ?? 'missing'),
+    attempts: 1,
     toolCalls,
     ttftMs,
     durationMs: Date.now() - started,
@@ -155,23 +179,6 @@ function mergeToolDelta(acc: Map<number, { id: string; name: string; args: strin
   if (delta.name) existing.name = delta.name;
   if (delta.arguments) existing.args += delta.arguments;
   acc.set(delta.index, existing);
-}
-
-function extractUsage(value: unknown): Usage | null {
-  if (typeof value !== 'object' || value === null) return null;
-  const u = value as Record<string, unknown>;
-  if (
-    typeof u['prompt_tokens'] === 'number' &&
-    typeof u['completion_tokens'] === 'number' &&
-    typeof u['total_tokens'] === 'number'
-  ) {
-    return {
-      prompt_tokens: u['prompt_tokens'],
-      completion_tokens: u['completion_tokens'],
-      total_tokens: u['total_tokens'],
-    };
-  }
-  return null;
 }
 
 function extractToolCalls(value: unknown): ToolCall[] {
@@ -209,6 +216,8 @@ function errorResult(message: string, status = 0, durationMs = 0): ChatResult {
     text: '',
     reasoning: null,
     usage: null,
+    usageRejected: null,
+    attempts: 1,
     toolCalls: [],
     ttftMs: null,
     durationMs,

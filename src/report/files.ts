@@ -1,6 +1,7 @@
-import { mkdirSync, writeFileSync } from 'node:fs';
-import { join, resolve } from 'node:path';
+import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { dirname, join, resolve } from 'node:path';
 import type { AuditReport } from '../types.js';
+import type { BaselineFile } from '../baseline.js';
 import { renderMarkdown } from './markdown.js';
 import { renderHtml } from './html.js';
 
@@ -8,16 +9,52 @@ export interface WrittenReports {
   markdownPath: string;
   htmlPath: string;
   jsonPath: string;
+  baselinePath: string | null;
 }
 
-export function writeReports(report: AuditReport, outDir: string, stamp: string): WrittenReports {
+/**
+ * 原子写：先写同目录临时文件，再 rename 覆盖目标。
+ * - Node 在 Windows 上 rename 走 MOVEFILE_REPLACE_EXISTING，可安全覆盖已存在的 --baseline-out；
+ * - 读方（含并发复测）永远不会看到半截 JSON/报告；
+ * - finally 兜底：rename 失败时清理残留 tmp，不让 *.tmp 垃圾堆积。
+ */
+export function atomicWrite(path: string, data: string): void {
+  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  try {
+    writeFileSync(tmp, data, 'utf8');
+    renameSync(tmp, path);
+  } finally {
+    if (existsSync(tmp)) {
+      try {
+        unlinkSync(tmp);
+      } catch {
+        // 清理失败不掩盖原始写入错误
+      }
+    }
+  }
+}
+
+export function writeReports(
+  report: AuditReport,
+  outDir: string,
+  stamp: string,
+  baseline: BaselineFile | null = null,
+  baselineOut: string | null = null,
+): WrittenReports {
   const dir = resolve(outDir);
   mkdirSync(dir, { recursive: true });
   const markdownPath = join(dir, `report-${stamp}.md`);
   const htmlPath = join(dir, `report-${stamp}.html`);
   const jsonPath = join(dir, `report-${stamp}.json`);
-  writeFileSync(markdownPath, renderMarkdown(report), 'utf8');
-  writeFileSync(htmlPath, renderHtml(report), 'utf8');
-  writeFileSync(jsonPath, JSON.stringify(report, null, 2), 'utf8');
-  return { markdownPath, htmlPath, jsonPath };
+  atomicWrite(markdownPath, renderMarkdown(report));
+  atomicWrite(htmlPath, renderHtml(report));
+  atomicWrite(jsonPath, JSON.stringify(report, null, 2));
+
+  let baselinePath: string | null = null;
+  if (baseline !== null) {
+    baselinePath = baselineOut ? resolve(baselineOut) : join(dir, `baseline-${stamp}.json`);
+    mkdirSync(dirname(baselinePath), { recursive: true });
+    atomicWrite(baselinePath, JSON.stringify(baseline, null, 2));
+  }
+  return { markdownPath, htmlPath, jsonPath, baselinePath };
 }

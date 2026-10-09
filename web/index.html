@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
+<title>model-xray web 壳</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f1115; color: #d7dae0; }
+  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  h4 { margin: 18px 0 6px; font-size: 14px; color: #aab2bf; }
+  .privacy { color: #8b93a1; font-size: 13px; margin: 4px 0 0; }
+  .tabs { display: flex; gap: 8px; margin: 18px 0; }
+  .tabs button { padding: 8px 16px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
+  .tabs button[aria-selected="true"] { background: #2b6cb0; border-color: #2b6cb0; color: #fff; }
+  .panel { background: #14171d; border: 1px solid #2a2f3a; border-radius: 8px; padding: 16px; }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; color: #aab2bf; }
+  input[type="text"], textarea { width: 100%; padding: 8px; background: #0f1115; color: #e6e9ee; border: 1px solid #2a2f3a; border-radius: 6px; font: inherit; }
+  textarea { min-height: 150px; }
+  .row { display: flex; gap: 12px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 220px; }
+  .checks { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; }
+  .checks label { display: flex; align-items: center; gap: 6px; margin: 0; }
+  button.primary { margin-top: 12px; padding: 8px 18px; background: #2b6cb0; border: none; color: #fff; border-radius: 6px; cursor: pointer; font: inherit; }
+  button.secondary { padding: 6px 14px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
+  .error { color: #ff6b6b; margin-top: 10px; white-space: pre-wrap; }
+  pre.command { background: #0b0d11; border: 1px solid #2a2f3a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .hints { color: #9fb3c8; font-size: 13px; }
+  .placeholder { color: #8b93a1; }
+  table.probes { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  table.probes th, table.probes td { border: 1px solid #2a2f3a; padding: 6px 10px; text-align: left; font-size: 14px; }
+  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
+  .badge-pass { background: #1e4620; color: #7ddf87; }
+  .badge-warn { background: #4a3a12; color: #ffd66b; }
+  .badge-fail { background: #4d1f1f; color: #ff8585; }
+  .badge-unknown { background: #262b34; color: #9aa3b2; }
+  .dropzone { border: 2px dashed #2a2f3a; border-radius: 8px; padding: 18px; text-align: center; color: #8b93a1; margin: 10px 0; }
+  .dropzone.over { border-color: #2b6cb0; }
+  #file-status { font-size: 13px; color: #9fb3c8; min-height: 1.2em; }
+  .scorecard-head { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  .scorecard-head .total { font-size: 18px; }
+  ul.findings, ul.notes { margin: 6px 0; padding-left: 20px; }
+  ul.findings li, ul.notes li { margin: 4px 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>model-xray <span class="privacy">web 壳（纯静态）</span></h1>
+  <p class="privacy">所有数据仅在浏览器本地处理，key 不会经过本页面；页面不发任何网络请求、不做任何存储。key 通过终端环境变量进入 CLI。</p>
+
+  <div class="tabs">
+    <button id="tab-cmd" type="button" aria-selected="true">① 生成命令</button>
+    <button id="tab-report" type="button" aria-selected="false">② 渲染报告</button>
+  </div>
+
+  <section id="panel-cmd" class="panel">
+    <label>目标终端（决定引号风格；key 永远不进命令，用环境变量设置）</label>
+    <div class="checks">
+      <label><input type="radio" name="shell-mode" value="posix" checked> PowerShell / bash / zsh（单引号）</label>
+      <label><input type="radio" name="shell-mode" value="cmd"> cmd.exe（双引号，参数不能含双引号或 %）</label>
+    </div>
+    <div class="row">
+      <div>
+        <label for="f-base-url">--base-url *（如 https://relay.example.com/v1）</label>
+        <input id="f-base-url" type="text" placeholder="https://relay.example.com/v1">
+      </div>
+      <div>
+        <label for="f-model">--model *（如 gpt-4o）</label>
+        <input id="f-model" type="text" placeholder="gpt-4o">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="f-claimed-context">--claimed-context（标称上下文，正整数，非空才输出）</label>
+        <input id="f-claimed-context" type="text" inputmode="numeric" placeholder="32000">
+      </div>
+      <div>
+        <label>--expect（宣称能力，全不选 → none）</label>
+        <div class="checks">
+          <label><input id="f-expect-vision" type="checkbox"> vision</label>
+          <label><input id="f-expect-tool" type="checkbox"> tool</label>
+          <label><input id="f-expect-thinking" type="checkbox"> thinking</label>
+        </div>
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="f-price-input">--price-input（每百万 tokens，正数）</label>
+        <input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5">
+      </div>
+      <div>
+        <label for="f-price-output">--price-output（须与 price-input 成对）</label>
+        <input id="f-price-output" type="text" inputmode="decimal" placeholder="10">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="f-seed">--seed（正整数）</label>
+        <input id="f-seed" type="text" inputmode="numeric" placeholder="12345">
+      </div>
+      <div>
+        <label for="f-timeout">--timeout（秒，正整数）</label>
+        <input id="f-timeout" type="text" inputmode="numeric" placeholder="60">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label for="f-out">--out（报告输出目录，缺省 reports）</label>
+        <input id="f-out" type="text" placeholder="reports">
+      </div>
+      <div>
+        <label for="f-baseline">--baseline（基线文件路径）</label>
+        <input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json">
+      </div>
+    </div>
+    <div class="checks">
+      <label><input id="f-deep" type="checkbox"> --deep（更多样本，更慢）</label>
+      <label><input id="f-dry-run" type="checkbox"> --dry-run（只打印计划，不发请求）</label>
+      <label><input id="f-yes" type="checkbox"> --yes（跳过成本确认）</label>
+    </div>
+
+    <button id="btn-generate" class="primary" type="button">生成命令</button>
+    <div id="cmd-error" class="error" hidden></div>
+
+    <div id="cmd-result" hidden>
+      <label>复制到终端执行（命令里没有 key；key 用环境变量设置，见下方提示。请在 PowerShell 或 bash/zsh 中执行，cmd.exe 不支持）</label>
+      <pre id="command-out" class="command"></pre>
+      <button id="btn-copy" class="secondary" type="button">复制命令</button>
+      <div id="copy-status" class="hints" hidden></div>
+      <div id="copy-fallback" hidden>
+        <textarea id="copy-fallback-text" readonly></textarea>
+        <p class="hints">请手动复制：点击文本框 → Ctrl+A 全选 → Ctrl+C。</p>
+      </div>
+      <pre id="hints-out" class="hints"></pre>
+    </div>
+  </section>
+
+  <section id="panel-report" class="panel" hidden>
+    <label for="report-json">粘贴 report-*.json 的完整内容</label>
+    <textarea id="report-json" placeholder='{"meta": …, "total": …, "outcomes": […] }'></textarea>
+    <div id="drop-zone" class="dropzone">把 .json 文件拖到这里，或用下方选择文件（仅读取本地文件，不上传）</div>
+    <input id="report-file" type="file" accept=".json,application/json">
+    <div id="file-status"></div>
+
+    <button id="btn-render" class="primary" type="button">渲染评分卡</button>
+    <div id="report-error" class="error" hidden></div>
+    <div id="report-out"></div>
+  </section>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>
