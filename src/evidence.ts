@@ -69,6 +69,7 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       usageRejected: result.usageRejected,
       attempts: result.attempts,
       toolCallCount: result.toolCalls.length,
+      finishReason: result.finishReason,
       error: result.error,
     },
     ttftMs: result.ttftMs,

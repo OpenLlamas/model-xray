@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'no
 import { dirname, join, resolve } from 'node:path';
 import type { AuditReport } from '../types.js';
 import type { BaselineFile } from '../baseline.js';
+import { renderJson } from './json.js';
 import { renderMarkdown } from './markdown.js';
 import { renderHtml } from './html.js';
 
@@ -48,7 +49,7 @@ export function writeReports(
   const jsonPath = join(dir, `report-${stamp}.json`);
   atomicWrite(markdownPath, renderMarkdown(report));
   atomicWrite(htmlPath, renderHtml(report));
-  atomicWrite(jsonPath, JSON.stringify(report, null, 2));
+  atomicWrite(jsonPath, renderJson(report));
 
   let baselinePath: string | null = null;
   if (baseline !== null) {

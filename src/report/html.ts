@@ -1,10 +1,24 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
 import { levelLabel, PROBE_ORDER, statusTag } from '../scoring.js';
+import { collectAnomalies } from './summary.js';
+
+/** 每维度一行静态说明：测什么 / 评分依据（纯展示，不参与评分）。 */
+const DIMENSION_DESC: Readonly<Record<string, string>> = {
+  identity: '身份与指纹：多角度自述问答与行为指纹比对，识破换标签/套皮；评分依据：自述一致性与指纹命中',
+  context: '长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率',
+  billing: 'token 计量与线性：端点自报 usage 对比本地 tokenizer 实算；评分依据：偏差幅度与线性度',
+  capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
+  quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
+  ttft: '流式首字延迟：采样 TTFT 分位数；评分依据：p50/p95 分段阈值',
+  decoy: '诱饵对照项：不计分，仅用于识别「对固定题集特判」的端点',
+};
 
 export function renderHtml(report: AuditReport): string {
   const meta = report.meta;
   const totalText = report.total === null ? '未判定' : `${report.total}/100`;
   const verdictClass = report.overall === 'pass' ? 'ok' : report.overall === 'fail' ? 'bad' : 'warn';
+  const anomalies = collectAnomalies(report);
+  const boxLevel = anomalies.some((a) => a.level === 'fail') ? 'fail' : anomalies.length > 0 ? 'warn' : 'ok';
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -25,20 +39,49 @@ th{background:#f0f0f0}
 .ev summary{cursor:pointer;font-weight:600}
 .ev pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:8px;border-radius:4px;font-size:13px}
 .muted{color:var(--muted);font-size:13px}
-@media (prefers-color-scheme:dark){body{background:#161616;color:#e8e8e8}table{background:#1f1f1f}th{background:#2a2a2a}.ev{background:#1f1f1f}.ev pre{background:#2a2a2a}:root{--line:#3a3a3a;--muted:#999}}
+.anomaly{margin:16px 0;padding:10px 14px;border-radius:6px;border:1px solid}
+.anomaly.fail{background:#fdecea;border-color:#e6a5a0;color:#7a1218}
+.anomaly.warn{background:#fff4e0;border-color:#e0b25a;color:#6b4400}
+.anomaly.ok{background:#e8f6ec;border-color:#9ccfae;color:#0a5c26}
+.anomaly-title{font-weight:700;margin-bottom:6px}
+.anomaly ul{margin:0;padding-left:20px}
+.anomaly .dim{font-weight:700}
+@media (prefers-color-scheme:dark){
+body{background:#161616;color:#e8e8e8}table{background:#1f1f1f}th{background:#2a2a2a}.ev{background:#1f1f1f}.ev pre{background:#2a2a2a}:root{--line:#3a3a3a;--muted:#999}
+.anomaly.fail{background:#3a1214;color:#ffb4ae;border-color:#6e2a2e}
+.anomaly.warn{background:#33260d;color:#ffd48a;border-color:#6e5522}
+.anomaly.ok{background:#0f2a18;color:#8fdca8;border-color:#2c5a3c}
+}
 </style>
 </head>
 <body><main>
 <h1>model-xray 报告 — ${esc(meta.model)}</h1>
 <p><span class="badge ${verdictClass}">${esc(levelLabel(report.overall))}</span><strong>总分 ${esc(totalText)}</strong></p>
+<div class="anomaly ${boxLevel}">
+<div class="anomaly-title">异常要点${anomalies.length > 0 ? `（${anomalies.length} 项）` : ''}</div>
+${
+  anomalies.length === 0
+    ? '<div>未发现异常</div>'
+    : `<ul>${anomalies
+        .map(
+          (a) =>
+            `<li><span class="tag ${a.level}">${esc(a.level.toUpperCase())}</span> <span class="dim">${esc(a.probe)}</span> ${esc(a.message)}${
+              a.evidenceIds.length > 0 ? ` <span class="muted">(${esc(a.evidenceIds.join(', '))})</span>` : ''
+            }</li>`,
+        )
+        .join('\n')}</ul>`
+}
+</div>
 <p class="muted">端点 ${esc(meta.baseUrl)} · seed ${meta.seed} · 题集 ${esc(meta.probesetVersion)} · ${esc(meta.startedAt)} · 耗时 ${(meta.durationMs / 1000).toFixed(1)}s · model-xray ${esc(meta.tool)}</p>
 
 <h2>分项得分</h2>
-<table><thead><tr><th>检测项</th><th>判定</th><th>得分</th><th>摘要</th></tr></thead><tbody>
+<table><thead><tr><th>检测项</th><th>判定</th><th>得分</th><th>权重</th><th>摘要</th></tr></thead><tbody>
 ${report.scores
   .map(
     (entry) =>
-      `<tr><td>${esc(entry.id)}</td><td class="tag ${entry.level}">${esc(statusTag(entry.level))}</td><td>${entry.score ?? '-'}</td><td>${esc(entry.headline)}</td></tr>`,
+      `<tr><td>${esc(entry.id)}<div class="muted">${esc(DIMENSION_DESC[entry.id] ?? '')}</div></td><td class="tag ${entry.level}">${esc(
+        statusTag(entry.level),
+      )}</td><td>${entry.score ?? '-'}</td><td>${entry.weight === 0 ? '-' : entry.weight}</td><td>${esc(entry.headline)}</td></tr>`,
   )
   .join('\n')}
 </tbody></table>

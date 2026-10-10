@@ -19,6 +19,8 @@ npx model-xray test \
 
 One command → one markdown report: red/green table, verdict, raw evidence.
 
+Exit codes: 0 = pass/warn; 1 = fail; 2 = argument error or inconclusive (insufficient scorable items).
+
 ### What it checks
 
 | Check | What it does |
@@ -39,6 +41,8 @@ One command → one markdown report: red/green table, verdict, raw evidence.
 | `--price-input <n>` / `--price-output <n>` | Claimed price per 1M tokens, must appear as a pair; enables the measured-rate probe |
 | `--baseline <path>` | Compare fingerprints against a baseline file; its seed is reused unless `--seed` is explicit |
 | `--baseline-out <path>` | Write this run's baseline file (defaults to `reports/baseline-<stamp>.json`) |
+| `--yes` | Skip the interactive token-cost confirmation on remote endpoints (required in scripts / non-TTY) |
+| `--dry-run` | Print the planned requests and token estimate, then exit without sending anything |
 
 ### Boundaries & caveats
 
@@ -69,6 +73,32 @@ Notes:
 - The page makes **zero network requests** and uses **no storage** (no localStorage / cookies); the key enters through your terminal's environment variable, never through the page.
 - The generated command quotes arguments with single quotes, which `cmd.exe` does not support — run it in **PowerShell** or **bash/zsh**. Values containing a single quote or control characters are rejected with an error instead of being quoted, because shell quoting rules differ.
 
+### Guard: local always-on monitor (P2)
+
+`model-xray guard` runs a transparent local forwarding proxy that watches **real traffic** instead of firing one-shot probes:
+
+```bash
+# PowerShell: set the key via environment variable (guard has no --key flag, so the key never enters shell history)
+$env:MODEL_XRAY_KEY = 'sk-xxx'
+model-xray guard --base-url https://your-relay.example.com/v1 \
+  --price-input 2 --price-output 8 --reconcile-minutes 15 --out reports/guard
+```
+
+Point your client's `base-url` at `http://127.0.0.1:8621/v1` (any local client works; the client-side API key must equal `MODEL_XRAY_KEY` — mismatched requests are rejected with 401 and never forwarded). Path semantics: the incoming request path is appended to `--base-url` as-is, and a repeat of the full `--base-url` path prefix (e.g. `/v1` in both) is deduplicated automatically — so `--base-url` may or may not include `/v1` (if a station genuinely serves a doubled prefix like `/v1/v1`, point `--base-url` at the site root). `--base-url` must not carry a query string or fragment.
+
+What it watches per request:
+
+- **Model consistency** — request `model` vs the model the endpoint actually answers with; a mismatch alerts immediately (`model_mismatch`).
+- **Token accounting** — SSE/JSON responses are parsed for `usage` (bytes pass through untouched); negative or inconsistent token counts raise `usage_invalid`.
+- **Rolling billing reconciliation** — with claimed prices given, the balance is sampled at window boundaries: Δspend ÷ expected cost = measured rate. Rate > 1.5 alerts as fail; outside the drift band (|ratio−1| > 0.05 and > 0.2) warns; a top-up during the window (`Δ<0`) voids the window (`skipped_recharge`) instead of producing a bogus ratio.
+- **JSONL audit log** — one line per request plus reconcile/anomaly/fingerprint/score events under `--out` (default `reports/guard`), rotated daily. **Metadata only**: no conversation content, no credentials, no upstream error bodies, no query strings — verified by dedicated redaction tests.
+- **Truncation / disconnects** — `finish_reason=length` is recorded; client disconnects mid-stream mark the request `aborted`.
+- **Live scorecard** — every 20 forwarded requests a one-line multi-dimension score is printed (availability / usage accounting / identity / latency / cost), plus a final card on exit; rolling window = last 100 forwarded requests (locally rejected 401/403 never enter the window); the `观测` (observed) counters — truncation rate / missing usage / aborts — are informational and never affect the grade; with tiny windows a single request can pull the overall grade red, which is normal jitter.
+
+Optional: `--fingerprint-minutes 60` re-runs the identity-family probe periodically and alerts when the model-family fingerprint drifts (the probe sends real requests and costs real money — off by default).
+
+Boundaries: only `chat/completions`, `completions`, and `embeddings` get deep inspection; other paths are forwarded untouched with a basic log line. HTTP/1.1 only; upstream responses are requested with `Accept-Encoding: identity` on deep-inspected endpoints (the only byte-level rewrite besides credential replacement). The balance probe polls the one-api style usage endpoint (its `total_usage` is read as ÷100); stations without such an endpoint degrade reconciliation to token-only stats with a `skipped` note. Local auth uses a constant-time comparison; `Ctrl+C` (or closing stdin) stops guard and settles the final window before flush.
+
 ### Status
 
 Work in progress. This repository will host the CLI, the versioned test assets, and the maintainers' own published reports (`reports/`).
@@ -85,6 +115,8 @@ npx model-xray test \
 ```
 
 一条命令 → 一份 markdown 报告：红绿表格、结论、原始证据。
+
+退出码：0=通过/可疑；1=不通过；2=参数错误或未能得出结论（可评分项不足）。
 
 ### 检测项
 
@@ -106,6 +138,8 @@ npx model-xray test \
 | `--price-input <n>` / `--price-output <n>` | 每百万 tokens 的宣称价格，必须成对出现；启用实测倍率探针 |
 | `--baseline <path>` | 与基线文件做指纹对比；未显式给 `--seed` 时沿用基线 seed |
 | `--baseline-out <path>` | 落盘本轮基线（缺省写到 `reports/baseline-<stamp>.json`） |
+| `--yes` | 跳过远程端点的交互式成本确认（脚本/非 TTY 环境必需） |
+| `--dry-run` | 只打印计划请求量与 token 预估，不发任何请求 |
 
 ### 边界与注意
 
@@ -135,6 +169,32 @@ npx model-xray test \
 
 - 页面零网络请求、零存储（无 localStorage / cookie）；key 通过终端环境变量进入，不经过页面。
 - 生成的命令使用单引号包裹参数，`cmd.exe` 不支持单引号——请在 **PowerShell** 或 **bash/zsh** 中执行。含单引号或换行等控制字符的参数值会被直接拒绝并报错（各 shell 转义规则不一致，宁可拒绝也不产出会被静默损坏的命令）。
+
+### Guard：本地常驻监控（P2）
+
+`model-xray guard` 启动一个本地透明转发代理，盯**真实流量**而不是一次性探测：
+
+```powershell
+# PowerShell：key 走环境变量（guard 不提供 --key 旗标，key 永不进入命令行历史）
+$env:MODEL_XRAY_KEY = 'sk-xxx'
+model-xray guard --base-url https://your-relay.example.com/v1 `
+  --price-input 2 --price-output 8 --reconcile-minutes 15 --out reports/guard
+```
+
+把客户端的 `base-url` 改成 `http://127.0.0.1:8621/v1`（本地任意客户端均可；客户端侧 API key 须与 `MODEL_XRAY_KEY` 一致，不一致的请求直接 401、绝不转发）。路径语义：请求路径原样拼接到 `--base-url` 之后；与 `--base-url` 完整路径前缀重复的部分（如都带 `/v1`）会自动去重——`--base-url` 带不带 `/v1` 均可（若站点确有 `/v1/v1` 类双前缀路由，请把 `--base-url` 设为站点根）。`--base-url` 不得携带 query 或 fragment。
+
+逐请求盯什么：
+
+- **模型一致性** —— 请求的 `model` 与端点实际应答的模型不一致，立即告警（`model_mismatch`）。
+- **Token 记账** —— 解析 SSE/JSON 响应里的 `usage`（字节原样透传）；token 为负或分项对不上报 `usage_invalid`。
+- **滚动对账** —— 提供宣称价格后，窗口首尾各查一次余额：Δ扣费 ÷ 应缴金额 = 实测倍率。倍率 > 1.5 按 fail 告警；超出漂移带宽（|ratio−1| > 0.05 且 > 0.2）按 warn 告警；窗口内充值（Δ<0）作废该窗口（`skipped_recharge`），不出假倍率。
+- **JSONL 审计日志** —— 每请求一行，外加 reconcile/anomaly/fingerprint/score 事件，写入 `--out`（默认 `reports/guard`）并按日轮转。**只记元数据**：无对话内容、无凭证、无上游错误体、无 query——有专门的脱敏测试钉死这条红线。
+- **截断与断连** —— `finish_reason=length` 记录在案；客户端流中断开标记 `aborted`。
+- **实时评分卡** —— 每 20 个已转发请求输出一次多维单行评分（可用性/计量/身份/时延/成本），退出时无论计数再输出一张终卡；滚动窗口为最近 100 个已转发请求（本地 401/403 拒绝的请求不转发、不入窗）；「观测」项（截断率/缺用量/中止）仅记录不计总评；小样本（窗口内请求很少时）单笔异常即可拉红总评，属正常抖动。
+
+可选：`--fingerprint-minutes 60` 周期性复跑身份族指纹探针，模型族漂移即告警（探针发真实请求、产生真实计费——默认关闭）。
+
+边界：只有 `chat/completions`、`completions`、`embeddings` 做深检，其余路径原样转发并记基础行；仅支持 HTTP/1.1；深检端点会强制 `Accept-Encoding: identity`（除凭证替换外唯一的字节级改写）。余额探针按 one-api 风格 usage 接口读取（`total_usage` 按 ÷100 折算），站点没有该接口时对账降级为纯 token 统计并出 `skipped` 提示。本地鉴权用常量时间比较；`Ctrl+C`（或关闭 stdin）停止时先结算最后一个对账窗口再落盘。
 
 ### 状态
 

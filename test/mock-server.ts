@@ -15,7 +15,15 @@ export type MockMode =
   | 'flaky'
   | 'flaky500'
   | 'badusage'
-  | 'empty';
+  | 'empty'
+  | 'swap-model'
+  | 'slow-stream'
+  | 'auth-required'
+  | 'thinking-starve'
+  | 'json-as-sse'
+  | 'sse-as-json'
+  | 'sse-empty'
+  | 'sse-comments';
 
 export interface MockBehavior {
   mode: MockMode;
@@ -28,6 +36,19 @@ export interface MockBehavior {
   badUsageSeq: number;
   /** flaky500：已注入过 500 的请求体摘要（同体重放即重试 → 返回 200） */
   seen500: Set<string>;
+  /** 可编程余额：base + rate × 已消耗成本（guard 对账 e2e 用；rate=null 时按 balanceSeries 走） */
+  balanceBase: number;
+  balanceRate: number | null;
+  /** 成本核算价格（$/M tokens），与 guard 侧 --price-* 对应 */
+  priceInput: number;
+  priceOutput: number;
+  costAccumulated: number;
+  /** thinking-starve：max_tokens 低于该阈值时返回推理占满预算响应（content 截断 + finish_reason=length） */
+  starveBelow: number;
+  /** thinking-starve：starved 响应的正文（''=纯空；也可为 '{"a":' 类非空截断） */
+  starveTruncated: string | null;
+  /** thinking-starve：命中的问题豁免 starvation（照常作答），用于构造「部分样本被截断」场景 */
+  starveExempt: RegExp | null;
 }
 
 export interface MockOptions {
@@ -38,6 +59,17 @@ export interface MockOptions {
   failEvery?: number;
   /** GET /dashboard/billing/usage 按查询次数从该序列取值（用尽后取最后一个） */
   balanceSeries?: number[];
+  /** 可编程扣费倍率：余额 = balanceBase + balanceRate × Σ(usage 成本)，供对账 ratio=k 的确定性 e2e */
+  balanceBase?: number;
+  balanceRate?: number;
+  priceInput?: number;
+  priceOutput?: number;
+  /** thinking-starve：starvation 触发阈值（请求 max_tokens < 该值即截断），默认 1024 */
+  starveBelow?: number;
+  /** thinking-starve：starved 响应正文，默认 ''（空 content）；'{"a":' 类非空截断用于测 isStarved 捕获 */
+  starveTruncated?: string;
+  /** thinking-starve：豁免 starvation 的问题正则（命中则照常作答），用于构造「部分样本被截断」场景 */
+  starveExempt?: RegExp;
 }
 
 export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
@@ -54,7 +86,16 @@ export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, nu
 export interface MockServer {
   server: Server;
   baseUrl: string;
-  state: { served: number; balanceQueries: number };
+  state: {
+    served: number;
+    balanceQueries: number;
+    /** 每个 chat 请求收到的 Authorization 头原值（guard 凭证注入断言用） */
+    authSeen: string[];
+    /** 每个 chat 请求收到的 Proxy-Authorization 头原值（凭证剥离断言用） */
+    proxyAuthSeen: string[];
+    /** 每个 chat 请求实际到达的完整原始 URL（含 query；guard 前缀去重与 query 透明断言用） */
+    pathSeen: string[];
+  };
 }
 
 export function createMockServer(options: MockOptions): Promise<MockServer> {
@@ -67,22 +108,47 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     balanceSeries: options.balanceSeries ?? [100.0, 99.5],
     badUsageSeq: 0,
     seen500: new Set<string>(),
+    balanceBase: options.balanceBase ?? 100,
+    balanceRate: options.balanceRate === undefined ? null : options.balanceRate,
+    priceInput: options.priceInput ?? 2,
+    priceOutput: options.priceOutput ?? 8,
+    costAccumulated: 0,
+    starveBelow: options.starveBelow ?? 1024,
+    starveTruncated: options.starveTruncated ?? null,
+    starveExempt: options.starveExempt ?? null,
   };
-  const state = { served: 0, balanceQueries: 0 };
+  const state: MockServer['state'] = { served: 0, balanceQueries: 0, authSeen: [], proxyAuthSeen: [], pathSeen: [] };
 
   const server = createServer(async (req, res) => {
+    // auth-required：所有路径统一 401（无效 key 场景，全部探针证据不足）
+    if (behavior.mode === 'auth-required') {
+      sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+      return;
+    }
     if (req.method === 'GET' && req.url !== undefined && req.url.split('?')[0]?.endsWith('/dashboard/billing/usage')) {
-      const series = behavior.balanceSeries;
-      const index = Math.min(state.balanceQueries, series.length - 1);
-      const value = index >= 0 && series[index] !== undefined ? (series[index] as number) : 0;
+      let value: number;
+      if (behavior.balanceRate !== null) {
+        // 可编程倍率模式：余额跟随已消耗成本（guard 对账 e2e 的确定性数据源）。
+        // 注意单位：/dashboard/billing/usage 的 total_usage 按 one-api 语义为「分」（probeBalance 会 ÷100 折算），
+        // 故这里乘 100——保证 guard 读到的 USD 值恰为 base + rate×cost。
+        value = (behavior.balanceBase + behavior.balanceRate * behavior.costAccumulated) * 100;
+      } else {
+        const series = behavior.balanceSeries;
+        const index = Math.min(state.balanceQueries, series.length - 1);
+        value = index >= 0 && series[index] !== undefined ? (series[index] as number) : 0;
+      }
       state.balanceQueries += 1;
       sendJson(res, 200, { object: 'list', total_usage: value });
       return;
     }
-    if (req.method !== 'POST' || !req.url?.endsWith('/chat/completions')) {
+    // query 透明转发语义：guard 会原样转发 query（真实中转可能需要），mock 路由按去 query 后的 path 匹配
+    if (req.method !== 'POST' || !req.url?.split('?')[0]?.endsWith('/chat/completions')) {
       sendJson(res, 404, { error: { message: 'not found' } });
       return;
     }
+    state.pathSeen.push(req.url ?? '');
+    if (typeof req.headers.authorization === 'string') state.authSeen.push(req.headers.authorization);
+    if (typeof req.headers['proxy-authorization'] === 'string') state.proxyAuthSeen.push(req.headers['proxy-authorization']);
     let body: Record<string, unknown>;
     let rawBody = '';
     try {
@@ -129,16 +195,63 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
   const imageUrl = findImageUrl(last);
   const modelName = typeof body['model'] === 'string' ? body['model'] : 'mock-model';
 
+  // slow-stream：先发一个内容 chunk 然后挂住连接不结束（guard 客户端断连 e2e 用）
+  if (behavior.mode === 'slow-stream') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.write(
+      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model: modelName, choices: [{ index: 0, delta: { content: 'partial' }, finish_reason: null }] })}\n\n`,
+    );
+    const hold = setInterval(() => {
+      try {
+        res.write(': keepalive\n\n');
+      } catch {
+        clearInterval(hold);
+      }
+    }, 200);
+    const release = (): void => clearInterval(hold);
+    res.on('close', release);
+    res.on('error', release);
+    return;
+  }
+
   // empty：所有 chat 请求一律返回 200 + 空 content（模拟限流/截断下端点「成功但无内容」）
   if (behavior.mode === 'empty') {
-    sendReply(res, behavior, '', estimate(allText), stream);
+    sendReply(res, behavior, '', estimate(allText), stream, modelName);
+    return;
+  }
+
+  // sse-empty：2xx + event-stream 头 + 零字节 body（writeHead 后立即 end，与请求 stream 标志无关；
+  // 模拟中转站「空体误标 SSE」，guard 须诚实降级而非伪装成已检）
+  if (behavior.mode === 'sse-empty') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.end();
+    return;
+  }
+
+  // sse-comments：2xx + event-stream 头 + body 恰为 ": keep-alive\n\n"（仅 SSE 注释行，无 data: 行；
+  // 模拟 keep-alive 注释流，guard 兜底①整体 JSON 解析必失败 → 诚实降级）
+  if (behavior.mode === 'sse-comments') {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+    res.end(': keep-alive\n\n');
     return;
   }
 
   const toolResultNonce = findToolResultNonce(messages);
   if (toolResultNonce !== null) {
-    sendReply(res, behavior, `已收到工具结果，nonce ${toolResultNonce} 确认。`, estimate(allText), stream);
+    sendReply(res, behavior, `已收到工具结果，nonce ${toolResultNonce} 确认。`, estimate(allText), stream, modelName);
     return;
+  }
+
+  // thinking-starve：模拟 thinking 模型「推理占满 max_tokens 预算」——
+  // 预算 < 阈值时 content 为空（或指定截断正文）+ finish_reason=length + usage(completion_tokens==max_tokens)；
+  // 预算足够（或问题命中豁免正则）时照常作答 finish_reason=stop。
+  if (behavior.mode === 'thinking-starve') {
+    const maxTokens = typeof body['max_tokens'] === 'number' ? body['max_tokens'] : 0;
+    const exempt = behavior.starveExempt !== null && behavior.starveExempt.test(userText);
+    if (maxTokens > 0 && maxTokens < behavior.starveBelow && !exempt) {
+      sendStarvedReply(res, behavior, behavior.starveTruncated ?? '', estimate(allText), stream, modelName, maxTokens);
+      return;
+    }
   }
 
   if (behavior.mode === 'no-vision' && imageUrl !== null) {
@@ -159,18 +272,18 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
       const clipped = allText.slice(-keepChars);
       const clippedUser = userText.length > keepChars ? userText.slice(-keepChars) : userText;
       const reply = solve(clipped, behavior, clippedUser, imageUrl, modelName, state.served);
-      sendReply(res, behavior, reply, estimatedTokens, stream);
+      sendReply(res, behavior, reply, estimatedTokens, stream, modelName);
       return;
     }
   }
 
   if (behavior.mode === 'tool-fail' && tools.length > 0) {
-    sendReply(res, behavior, '这个请求看起来需要工具，但我不太确定怎么做。', estimate(allText), stream);
+    sendReply(res, behavior, '这个请求看起来需要工具，但我不太确定怎么做。', estimate(allText), stream, modelName);
     return;
   }
 
   const reply = solve(allText, behavior, userText, imageUrl, modelName, state.served);
-  sendReply(res, behavior, reply, estimate(allText), stream);
+  sendReply(res, behavior, reply, estimate(allText), stream, modelName);
 }
 
 function solve(
@@ -333,31 +446,59 @@ function estimate(text: string): number {
   return Math.max(1, Math.ceil(text.length / 3.2));
 }
 
-function sendReply(res: ServerResponse, behavior: MockBehavior, reply: string, estimatedTokens: number, stream: boolean): void {
+/** honest 端点回显请求模型；swap-model 返回 identityName（≠请求模型，guard 换模型告警用）。 */
+function responseModelOf(behavior: MockBehavior, modelName: string): string {
+  return behavior.mode === 'swap-model' ? behavior.identityName : modelName;
+}
+
+function sendReply(
+  res: ServerResponse,
+  behavior: MockBehavior,
+  reply: string,
+  estimatedTokens: number,
+  stream: boolean,
+  modelName: string,
+): void {
   const usage = computeUsage(behavior, estimatedTokens, reply);
+  const model = responseModelOf(behavior, modelName);
   if (reply.startsWith('__tool__')) {
-    sendToolCall(res, reply.slice('__tool__'.length), usage, stream);
+    sendToolCall(res, reply.slice('__tool__'.length), usage, stream, model);
     return;
   }
-  if (!stream) {
-    sendJson(res, 200, {
-      id: 'mock',
-      object: 'chat.completion',
-      model: 'mock',
-      choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
-      usage,
-    });
+  // sse-as-json：无论客户端是否请求流式，一律回真实 SSE 格式 body（data: 行 + usage 尾行 + [DONE]），
+  // 但 content-type 误标为 application/json（中转站误标场景，guard 须按行兜底恢复）。
+  const replyStream = stream || behavior.mode === 'sse-as-json';
+  const payload = {
+    id: 'mock',
+    object: 'chat.completion',
+    model,
+    choices: [{ index: 0, message: { role: 'assistant', content: reply }, finish_reason: 'stop' }],
+    usage,
+  };
+  if (!replyStream) {
+    if (behavior.mode === 'json-as-sse') {
+      // json-as-sse：与 honest 相同的单行 JSON body（含 usage、model 回显），但 content-type 误标为
+      // text/event-stream；单行无尾部换行、一次 write 后 end（无 chunked 分片），guard 须整体 JSON 兜底。
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.end(JSON.stringify(payload));
+      return;
+    }
+    sendJson(res, 200, payload);
     return;
   }
 
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  res.writeHead(200, {
+    'content-type': behavior.mode === 'sse-as-json' ? 'application/json' : 'text/event-stream',
+    'cache-control': 'no-cache',
+    connection: 'keep-alive',
+  });
   for (const piece of splitIntoPieces(reply)) {
     res.write(
-      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] })}\n\n`,
     );
   }
   res.write(
-    `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })}\n\n`,
+    `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage })}\n\n`,
   );
   res.write('data: [DONE]\n\n');
   res.end();
@@ -369,13 +510,57 @@ function splitIntoPieces(text: string): string[] {
   return pieces.length > 0 ? pieces : [''];
 }
 
-function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, number>, stream: boolean): void {
+/** thinking-starve 专用响应：预算全部耗尽（明文 reasoning_tokens 计入 completion），finish_reason=length。 */
+function sendStarvedReply(
+  res: ServerResponse,
+  behavior: MockBehavior,
+  content: string,
+  estimatedTokens: number,
+  stream: boolean,
+  modelName: string,
+  maxTokens: number,
+): void {
+  const prompt = Math.max(10, estimatedTokens);
+  // completion_tokens == 请求的 max_tokens：预算全部耗尽；reasoning_tokens 明文计入其中（OpenAI usage 扩展字段形状）
+  const completion = Math.max(1, maxTokens);
+  const usage = {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    completion_tokens_details: { reasoning_tokens: completion },
+  };
+  behavior.costAccumulated += (prompt * behavior.priceInput + completion * behavior.priceOutput) / 1e6;
+  const model = responseModelOf(behavior, modelName);
+  if (!stream) {
+    sendJson(res, 200, {
+      id: 'mock',
+      object: 'chat.completion',
+      model,
+      choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'length' }],
+      usage,
+    });
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  for (const piece of splitIntoPieces(content)) {
+    res.write(
+      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: { content: piece }, finish_reason: null }] })}\n\n`,
+    );
+  }
+  res.write(
+    `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model, choices: [{ index: 0, delta: {}, finish_reason: 'length' }], usage })}\n\n`,
+  );
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, number>, stream: boolean, model: string): void {
   const args = JSON.stringify({ nonce });
   if (!stream) {
     sendJson(res, 200, {
       id: 'mock',
       object: 'chat.completion',
-      model: 'mock',
+      model,
       choices: [
         {
           index: 0,
@@ -395,29 +580,39 @@ function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, 
   res.write(
     `data: ${JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'call_1', function: { name: 'echo_nonce', arguments: args } }] }, finish_reason: null }] })}\n\n`,
   );
-  res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage })}\n\n`);
+  res.write(`data: ${JSON.stringify({ model, choices: [{ index: 0, delta: {}, finish_reason: 'tool_calls' }], usage })}\n\n`);
   res.write('data: [DONE]\n\n');
   res.end();
 }
 
 function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string): Record<string, number> {
+  let prompt: number;
+  let completion: number;
+  let total: number;
   if (behavior.mode === 'const-usage') {
-    return { prompt_tokens: 500, completion_tokens: 50, total_tokens: 550 };
-  }
-  // badusage：奇数笔 total≠分项和（inconsistent）、偶数笔 prompt_tokens 为负（negative），交替注入
-  if (behavior.mode === 'badusage') {
+    prompt = 500;
+    completion = 50;
+    total = 550;
+  } else if (behavior.mode === 'badusage') {
+    // badusage：奇数笔 total≠分项和（inconsistent）、偶数笔 prompt_tokens 为负（negative），交替注入
     behavior.badUsageSeq += 1;
-    const completion = Math.max(1, Math.ceil(reply.length / 3.2));
-    const prompt = Math.max(10, estimatedTokens);
+    completion = Math.max(1, Math.ceil(reply.length / 3.2));
+    prompt = Math.max(10, estimatedTokens);
     if (behavior.badUsageSeq % 2 === 1) {
-      return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion + 7 };
+      total = prompt + completion + 7;
+    } else {
+      prompt = -prompt;
+      total = prompt + completion;
     }
-    return { prompt_tokens: -prompt, completion_tokens: completion, total_tokens: -prompt + completion };
+  } else {
+    completion = Math.max(1, Math.ceil(reply.length / 3.2));
+    prompt = Math.max(10, estimatedTokens);
+    if (behavior.mode === 'inflated') prompt = Math.round(prompt * behavior.inflateFactor);
+    total = prompt + completion;
   }
-  const completion = Math.max(1, Math.ceil(reply.length / 3.2));
-  let prompt = Math.max(10, estimatedTokens);
-  if (behavior.mode === 'inflated') prompt = Math.round(prompt * behavior.inflateFactor);
-  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: prompt + completion };
+  // 可编程余额模式：按本笔 usage 累加成本（$/M 价格核算，与 guard 侧 --price-* 同式）
+  behavior.costAccumulated += (prompt * behavior.priceInput + completion * behavior.priceOutput) / 1e6;
+  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
 }
 
 function textOf(message: Record<string, unknown>): string {

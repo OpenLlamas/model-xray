@@ -1,6 +1,7 @@
 import type { ChatMessage, ProbeCtx, ProbeOutcome, ChatResult, Finding } from '../types.js';
 import { IDENTITY_QUESTIONS, SCHEMA_PROBES } from '../assets.js';
 import { recordCall } from '../evidence.js';
+import { PROBE_BUDGETS, isStarved } from './starve.js';
 
 const REFUSAL_PATTERNS: readonly RegExp[] = [
   /无法(告知|回答|确认|提供)|不能(告知|透露|确认)|不便(告知|透露)/,
@@ -62,27 +63,45 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const metrics: Record<string, number | string | null> = {};
   const samples: IdentitySample[] = [];
   const questions = ctx.rng.shuffle(IDENTITY_QUESTIONS).slice(0, 3);
+  let starvedSelfId = 0;
 
   for (const question of questions) {
     const result = await ctx.client.chat({
       model: ctx.cfg.model,
       messages: [{ role: 'user', content: question } satisfies ChatMessage],
       temperature: 0.7,
-      max_tokens: 200,
+      max_tokens: PROBE_BUDGETS.identity,
     });
     const evidence = recordCall(ctx.evidence, {
       probe: 'identity',
       label: `self-id: ${question.slice(0, 24)}`,
-      request: { model: ctx.cfg.model, stream: false, temperature: 0.7, maxTokens: 200, messages: [{ content: question }] },
+      request: {
+        model: ctx.cfg.model,
+        stream: false,
+        temperature: 0.7,
+        maxTokens: PROBE_BUDGETS.identity,
+        messages: [{ content: question }],
+      },
       result,
     });
     if (!result.ok) {
       findings.push({ level: 'warn', message: `身份问答请求失败：${result.error ?? 'unknown'}`, evidenceIds: [evidence.id] });
       continue;
     }
+    if (isStarved(result)) {
+      starvedSelfId += 1;
+      findings.push({
+        level: 'info',
+        message: `自述样本「${question.slice(0, 24)}…」因推理占满预算未产出答案，视为无效样本（不计入指纹统计）。`,
+        evidenceIds: [evidence.id],
+      });
+      continue;
+    }
     samples.push({ question, result, evidenceId: evidence.id });
   }
 
+  // starved（推理占满预算，含非空截断）样本视为无效：不参与逐字一致/族指纹统计，
+  // 否则多份相同截断文本会被误判成「模板特判」，冤枉 thinking 模型。
   const texts = samples.map((s) => s.result.text);
   const normalized = texts.map(normalize);
   const answerable = normalized.filter((t) => t.length >= 3).length;
@@ -96,21 +115,36 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     model: ctx.cfg.model,
     messages: [{ role: 'user', content: schemaProbe.prompt } satisfies ChatMessage],
     temperature: 0,
-    max_tokens: 200,
+    max_tokens: PROBE_BUDGETS.identity,
   });
   const schemaEvidence = recordCall(ctx.evidence, {
     probe: 'identity',
     label: 'json-schema compliance',
-    request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 200, messages: [{ content: schemaProbe.prompt }] },
+    request: {
+      model: ctx.cfg.model,
+      stream: false,
+      temperature: 0,
+      maxTokens: PROBE_BUDGETS.identity,
+      messages: [{ content: schemaProbe.prompt }],
+    },
     result: schemaResult,
   });
-  const schemaParsed = parseJsonLoose(schemaResult.text);
+  const schemaStarved = isStarved(schemaResult);
+  const schemaParsed = schemaStarved ? null : parseJsonLoose(schemaResult.text);
   const schemaKeysOk = schemaParsed !== null && schemaProbe.keys.every((key) => key in schemaParsed);
   const schemaValuesOk = schemaKeysOk && schemaProbe.keys.every((key) => schemaParsed !== null && schemaParsed[key] !== undefined);
 
   metrics['samples'] = samples.length;
   metrics['identical_samples'] = identicalPairs;
-  metrics['schema_compliant'] = schemaResult.ok ? (schemaKeysOk && schemaValuesOk ? 1 : 0) : 'N/A';
+  metrics['schema_compliant'] = !schemaResult.ok || schemaStarved ? 'N/A' : (schemaKeysOk && schemaValuesOk ? 1 : 0);
+  if (starvedSelfId > 0) metrics['starved_samples'] = starvedSelfId;
+  if (schemaStarved) {
+    findings.push({
+      level: 'info',
+      message: '格式合规探针因推理占满预算未产出完整 JSON（预算不足无法判定格式合规），不扣分、不作异常指控。',
+      evidenceIds: [schemaEvidence.id],
+    });
+  }
 
   const refusalCount = texts.filter((t) => REFUSAL_PATTERNS.some((p) => p.test(t))).length;
   metrics['refusals'] = refusalCount;
@@ -128,7 +162,10 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: '身份探针无有效样本（自述请求全部失败），无法核验',
+      headline:
+        starvedSelfId > 0
+          ? '身份探针无有效样本（自述因推理占满预算或请求失败未产出答案），无法核验'
+          : '身份探针无有效样本（自述请求全部失败），无法核验',
       findings,
       metrics,
     };
@@ -176,12 +213,13 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     score = Math.min(score, 70);
     if (level === 'pass') level = 'warn';
   }
-  if (schemaResult.ok && !schemaKeysOk) {
+  if (!schemaStarved && schemaResult.ok && !schemaKeysOk) {
     findings.push({ level: 'warn', message: '严格 JSON 输出探针未按结构返回（弱指纹：网关可能重写响应）。', evidenceIds: [schemaEvidence.id] });
     score = Math.min(score, 90);
   }
 
-  findings.push({ level: 'info', message: `共采样 ${samples.length} 次自述 + 1 次格式合规探针。`, evidenceIds: [] });
+  const starvedNote = starvedSelfId > 0 ? `（另有 ${starvedSelfId} 次自述因推理占满预算按无效样本处理）` : '';
+  findings.push({ level: 'info', message: `共采样 ${samples.length} 次自述 + 1 次格式合规探针。${starvedNote}`, evidenceIds: [] });
   return { id: 'identity', status: 'ok', score, level, headline, findings, metrics };
 }
 

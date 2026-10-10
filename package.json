@@ -1,6 +1,6 @@
 {
   "name": "model-xray",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "X-ray your LLM endpoints. Audit OpenAI-compatible relays for fake or watered-down models.",
   "type": "module",
   "license": "MIT",

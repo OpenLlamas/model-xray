@@ -1,5 +1,5 @@
 import type { ChatMessage, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
-import { recordCall } from '../evidence.js';
+import { PROBE_BUDGETS, chatWithStarveRetry } from './starve.js';
 
 export interface Question {
   id: string;
@@ -168,6 +168,9 @@ export function checkAnswer(text: string, question: Question): boolean {
   return numbers.includes(question.answer);
 }
 
+/** 剔除后有效分母低于原主问题数的 80% → 不再出分（样本太少，比例无统计意义），判 insufficient。 */
+const MIN_USABLE_RATIO = 0.8;
+
 export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = {};
@@ -177,46 +180,67 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   let controlCorrect = 0;
   let mainCorrect = 0;
+  let excluded = 0;
+  let controlStarved = 0;
   const wrong: string[] = [];
 
   for (const question of questions) {
     const messages: ChatMessage[] = [{ role: 'user', content: question.prompt }];
-    const result = await ctx.client.chat({
-      model: ctx.cfg.model,
-      messages,
-      temperature: 0,
-      max_tokens: 64,
-    });
-    const evidence = recordCall(ctx.evidence, {
+    // 预算实测：thinking 模型在 64 tokens 下推理即占满预算（content 空/截断），256 基本可用，仍截断升 512 重试一次。
+    const call = await chatWithStarveRetry(ctx, {
       probe: 'quality',
       label: `${question.control ? 'control' : 'main'} ${question.id}`,
-      request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 64, messages },
-      result,
+      buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages, temperature: 0, max_tokens: maxTokens }),
+      budget: PROBE_BUDGETS.quality,
+      retryBudget: PROBE_BUDGETS.qualityRetry,
     });
-    const ok = result.ok && checkAnswer(result.text, question);
+    // 判定契约：
+    // ① starved（finish=length）但答案已出现在（截断）正文中 → 正常计对；
+    // ② 重试后仍 starved 且无答案 → 该题剔除分母 + warn（证据不足，不得按答错计 0）；
+    // ③ 非 starved 的答错/请求失败 → 维持原语义（主问题计错、控制题触发 insufficient）。
+    const starved = call.starved;
+    const hit = checkAnswer(call.result.text, question);
+    const label = `${question.control ? '控制题' : '题'} ${question.id}`;
     if (question.control) {
-      if (ok) controlCorrect += 1;
-      else {
+      if (hit) {
+        controlCorrect += 1;
+      } else if (starved) {
+        controlStarved += 1;
         findings.push({
           level: 'warn',
-          message: `控制题 ${question.id} 未通过（期望 ${question.answer}，响应：${preview(result.text)}）：端点当前不可用或严重异常，本次质量结论不可信。`,
-          evidenceIds: [evidence.id],
+          message: `控制题 ${question.id} 因推理占满预算未作答（升预算重试仍截断，期望 ${question.answer}）：证据不足，本次质量结论不可信。`,
+          evidenceIds: call.evidenceIds,
+        });
+      } else {
+        findings.push({
+          level: 'warn',
+          message: `控制题 ${question.id} 未通过（期望 ${question.answer}，响应：${preview(call.result.text)}）：端点当前不可用或严重异常，本次质量结论不可信。`,
+          evidenceIds: call.evidenceIds,
         });
       }
-    } else if (ok) {
+    } else if (hit) {
       mainCorrect += 1;
+    } else if (starved) {
+      excluded += 1;
+      findings.push({
+        level: 'warn',
+        message: `题 ${question.id} 因推理占满预算未作答（升预算重试仍截断）：该题剔除分母，不计入答错。`,
+        evidenceIds: call.evidenceIds,
+      });
     } else {
       wrong.push(question.id);
       findings.push({
         level: 'warn',
-        message: `题 ${question.id} 答错（期望 ${question.answer}，响应：${preview(result.text)}）`,
-        evidenceIds: [evidence.id],
+        message: `题 ${question.id} 答错（期望 ${question.answer}，响应：${preview(call.result.text)}）`,
+        evidenceIds: call.evidenceIds,
       });
     }
   }
 
-  metrics['main'] = `${mainCorrect}/${main.length}`;
+  const usable = main.length - excluded;
+  metrics['main'] = `${mainCorrect}/${usable}`;
   metrics['controls'] = `${controlCorrect}/${controls.length}`;
+  metrics['excluded'] = excluded;
 
   if (controlCorrect < controls.length) {
     return {
@@ -224,25 +248,51 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: `控制题未全对（${controlCorrect}/${controls.length}）：端点异常或拒答，质量评分不可信`,
+      headline:
+        controlStarved > 0
+          ? `控制题未产出答案（${controlStarved} 题推理占满预算未作答）：证据不足，质量评分不可信`
+          : `控制题未全对（${controlCorrect}/${controls.length}）：端点异常或拒答，质量评分不可信`,
+      findings,
+      metrics,
+    };
+  }
+  if (usable <= 0) {
+    return {
+      id: 'quality',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: `主问题全部因推理占满预算被剔除（0/${main.length} 有效）：证据不足，无法评分`,
+      findings,
+      metrics,
+    };
+  }
+  if (usable < main.length * MIN_USABLE_RATIO) {
+    return {
+      id: 'quality',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: `有效样本不足（${usable}/${main.length}，其余因推理占满预算剔除）：证据不足，无法评分`,
       findings,
       metrics,
     };
   }
 
-  const accuracy = main.length === 0 ? 0 : mainCorrect / main.length;
+  const accuracy = mainCorrect / usable;
   const score = Math.round(accuracy * 100);
   let level: ProbeOutcome['level'];
   if (accuracy >= 0.9) level = 'pass';
   else if (accuracy >= 0.6) level = 'warn';
   else level = 'fail';
 
+  const excludedNote = excluded > 0 ? `，另有 ${excluded} 题因推理占满预算剔除分母` : '';
   const headline =
     level === 'pass'
-      ? `质量题集通过：主题 ${mainCorrect}/${main.length}（控制题全对）`
+      ? `质量题集通过：主题 ${mainCorrect}/${usable}（控制题全对${excludedNote}）`
       : level === 'warn'
-        ? `质量可疑：主题 ${mainCorrect}/${main.length}，错误集中在 ${wrong.slice(0, 4).join('、')}`
-        : `疑似降智：主题仅 ${mainCorrect}/${main.length} 正确（控制题全对），已答错 ${wrong.length} 题`;
+        ? `质量可疑：主题 ${mainCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}`
+        : `疑似降智：主题仅 ${mainCorrect}/${usable} 正确（控制题全对），已答错 ${wrong.length} 题${excludedNote}`;
 
   findings.push({
     level: 'info',

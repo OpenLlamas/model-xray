@@ -56,6 +56,8 @@ export interface ChatRequest {
 export interface ChatResult {
   ok: boolean;
   status: number;
+  /** 首个 choice 的 finish_reason（缺失/传输失败为 null；'length' 提示输出被 max_tokens 截断） */
+  finishReason: string | null;
   text: string;
   reasoning: string | null;
   usage: Usage | null;
@@ -119,6 +121,8 @@ export interface EvidenceResponse {
   /** 实际尝试次数（≥1，重试后成功则 >1） */
   attempts: number;
   toolCallCount: number;
+  /** 首个 choice 的 finish_reason；报告 JSON 序列化为 snake_case finish_reason（见 report/json.ts） */
+  finishReason: string | null;
   error: string | null;
 }
 

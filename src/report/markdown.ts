@@ -1,5 +1,6 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
 import { levelLabel, statusTag } from '../scoring.js';
+import { collectAnomalies } from './summary.js';
 
 export function renderMarkdown(report: AuditReport): string {
   const lines: string[] = [];
@@ -7,6 +8,19 @@ export function renderMarkdown(report: AuditReport): string {
   lines.push(`# model-xray 报告 — ${meta.model}`);
   lines.push('');
   lines.push(`> 结论：**${levelLabel(report.overall)}** · 总分 **${report.total ?? '未判定'}${report.total === null ? '' : '/100'}**`);
+  lines.push('');
+
+  const anomalies = collectAnomalies(report);
+  lines.push('## 异常要点');
+  lines.push('');
+  if (anomalies.length === 0) {
+    lines.push('未发现异常');
+  } else {
+    for (const a of anomalies) {
+      const refs = a.evidenceIds.length > 0 ? `（证据：${a.evidenceIds.join(', ')}）` : '';
+      lines.push(`- **${a.level.toUpperCase()}** [${a.probe}] ${cell(a.message)}${refs}`);
+    }
+  }
   lines.push('');
 
   lines.push('## 元信息');
@@ -26,10 +40,10 @@ export function renderMarkdown(report: AuditReport): string {
 
   lines.push('## 分项得分');
   lines.push('');
-  lines.push('| 检测项 | 判定 | 得分 | 摘要 |');
-  lines.push('|---|---|---|---|');
+  lines.push('| 检测项 | 判定 | 得分 | 权重 | 摘要 |');
+  lines.push('|---|---|---|---|---|');
   for (const entry of report.scores) {
-    lines.push(`| ${entry.id} | ${statusTag(entry.level)} | ${entry.score ?? '-'} | ${cell(entry.headline)} |`);
+    lines.push(`| ${entry.id} | ${statusTag(entry.level)} | ${entry.score ?? '-'} | ${entry.weight === 0 ? '-' : entry.weight} | ${cell(entry.headline)} |`);
   }
   lines.push('');
   if (report.notes.length > 0) {

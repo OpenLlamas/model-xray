@@ -11,6 +11,7 @@ import { probeBilling } from './probes/billing.js';
 import { probeCapability } from './probes/capability.js';
 import { probeQuality } from './probes/quality.js';
 import { probeTtft } from './probes/ttft.js';
+import { isStarved } from './probes/starve.js';
 import type { AuditReport, Level, ProbeCtx, ProbeId, ProbeOutcome, RunConfig } from './types.js';
 
 export type ProgressFn = (id: string, outcome: ProbeOutcome) => void;
@@ -135,6 +136,8 @@ async function decoyProbe(ctx: ProbeCtx): Promise<ProbeOutcome> {
     request: { model: ctx.cfg.model, stream: false, temperature: 0.7, maxTokens: 120, messages: [{ content: question }] },
     result,
   });
+  // 诱饵是行为观测：响应为空/截断（推理占满预算）绝不是「成功抵御」之类的正面结论，文案必须如实。
+  const starved = isStarved(result);
   return {
     id: 'decoy',
     status: 'ok',
@@ -144,7 +147,9 @@ async function decoyProbe(ctx: ProbeCtx): Promise<ProbeOutcome> {
     findings: [
       {
         level: 'info',
-        message: `诱饵任务「${question.slice(0, 24)}…」响应 ${result.ok ? '正常' : '失败'}，记录用于对照端点对无关请求的行为。`,
+        message: `诱饵任务「${question.slice(0, 24)}…」响应 ${
+          starved ? '为空/截断（推理占满预算）' : result.ok ? '正常' : '失败'
+        }，记录用于对照端点对无关请求的行为。`,
         evidenceIds: [evidence.id],
       },
     ],

@@ -72,6 +72,13 @@ test('cli: --dry-run sends no requests', async () => {
   }
 });
 
+test('cli: remote endpoint without --yes on non-TTY exits 2 with --yes/--dry-run guidance', async () => {
+  const result = await runCli([...REMOTE_ARGS]);
+  assert.equal(result.status, 2, result.stderr);
+  assert.ok(result.stderr.includes('--yes'), result.stderr);
+  assert.ok(result.stderr.includes('--dry-run'), result.stderr);
+});
+
 test('cli: honest endpoint exits 0 and writes md/html/json reports', async () => {
   const mock = await createMockServer({ mode: 'honest' });
   const out = mkdtempSync(join(tmpdir(), 'model-xray-'));
@@ -163,6 +170,31 @@ test('cli: relabeled endpoint exits 1', async () => {
       '--yes',
     ]);
     assert.equal(result.status, 1, result.stderr);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('cli: invalid-key endpoint exits 2 (audit inconclusive)', async () => {
+  const mock = await createMockServer({ mode: 'auth-required' });
+  const out = mkdtempSync(join(tmpdir(), 'model-xray-'));
+  try {
+    const result = await runCli([
+      'test',
+      '--base-url',
+      mock.baseUrl,
+      '--key',
+      'k',
+      '--model',
+      'gpt-4o',
+      '--seed',
+      '17',
+      '--out',
+      out,
+      '--yes',
+    ]);
+    assert.equal(result.status, 2, result.stderr);
+    assert.ok(!result.stdout.includes('[FAIL] capability'), result.stdout);
   } finally {
     mock.server.close();
   }
