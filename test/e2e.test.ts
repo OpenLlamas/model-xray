@@ -161,6 +161,20 @@ test('e2e tool-fail endpoint fails capability', async () => {
   }
 });
 
+test('e2e invalid-key endpoint degrades capability to N/A instead of FAIL', async () => {
+  const mock = await createMockServer({ mode: 'auth-required' });
+  try {
+    const report = await audit(mock);
+    assert.equal(report.outcomes.find((o) => o.id === 'capability')?.status, 'insufficient');
+    assert.equal(levelOf(report, 'capability'), 'unknown');
+    assert.equal(report.overall, 'unknown');
+    assert.equal(report.total, null);
+    assert.ok(!report.outcomes.find((o) => o.id === 'capability')?.findings.some((f) => f.level === 'fail'));
+  } finally {
+    mock.server.close();
+  }
+});
+
 test('e2e dumb endpoint fails quality while controls pass', async () => {
   const mock = await createMockServer({ mode: 'dumb' });
   try {
@@ -304,6 +318,132 @@ test('e2e empty-content endpoint yields insufficient identity, not a template wa
     // 空响应没有指纹含义：不得出现「逐字一致」指控，也不得有 fail 级 finding
     assert.ok(!identity?.findings.some((f) => /逐字一致/.test(f.message)), JSON.stringify(identity?.findings));
     assert.ok(!identity?.findings.some((f) => f.level === 'fail'));
+  } finally {
+    mock.server.close();
+  }
+});
+
+// --- thinking-starve：推理占满 max_tokens 预算（thinking 模型假阴性修复）的端到端回归 ---
+
+test('e2e thinking-starve vision: first call starves, auto-retries at max_tokens=2048, ends non-fail with budget finding', async () => {
+  // 阈值 1536：首查 1024 被截断，重试 2048 通过
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 1536 });
+  try {
+    const report = await audit(mock, { expect: ['vision'] });
+    const capability = report.outcomes.find((o) => o.id === 'capability');
+    assert.ok(capability);
+    assert.equal(capability?.status, 'ok');
+    assert.equal(capability?.level, 'pass');
+    assert.ok(capability?.findings.some((f) => f.level === 'info' && /升预算/.test(f.message) && /2048/.test(f.message)));
+    // 第二次请求 max_tokens=2048（证据 request.maxTokens 断言）
+    const visionEvidence = report.evidence.filter((e) => e.label.startsWith('vision '));
+    assert.ok(visionEvidence.length >= 6, '3 色 × (首查+重试) 应有 6 条证据');
+    assert.ok(visionEvidence.some((e) => e.request.maxTokens === 1024));
+    assert.ok(visionEvidence.some((e) => e.request.maxTokens === 2048));
+    // 首查的 starved 响应（finish_reason=length）已透传进证据
+    assert.ok(visionEvidence.some((e) => e.response.finishReason === 'length'));
+    assert.ok(visionEvidence.some((e) => e.response.finishReason === 'stop'));
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e thinking-starve vision: fully starved → capability insufficient (not fail)', async () => {
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 4096 });
+  try {
+    const report = await audit(mock, { expect: ['vision'] });
+    const capability = report.outcomes.find((o) => o.id === 'capability');
+    assert.ok(capability);
+    assert.equal(capability?.status, 'insufficient');
+    assert.equal(capability?.level, 'unknown');
+    assert.ok(!capability?.findings.some((f) => f.level === 'fail'), JSON.stringify(capability?.findings));
+    assert.ok(capability?.findings.some((f) => /推理占满预算/.test(f.message)));
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e thinking-starve identity: non-empty truncation → schema no rewrite-warning, self-id insufficient', async () => {
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 600, starveTruncated: '{"a":' });
+  try {
+    const report = await audit(mock, { expect: [] });
+    const identity = report.outcomes.find((o) => o.id === 'identity');
+    assert.ok(identity);
+    assert.equal(identity?.status, 'insufficient');
+    // 非空截断也是 starvation：不得判「网关重写响应」，也不得判「逐字一致（模板特判）」
+    assert.ok(!identity?.findings.some((f) => /网关可能重写响应/.test(f.message)), JSON.stringify(identity?.findings));
+    assert.ok(!identity?.findings.some((f) => /逐字一致/.test(f.message)), JSON.stringify(identity?.findings));
+    assert.ok(!identity?.findings.some((f) => f.level === 'fail'));
+    assert.equal(identity?.metrics['schema_compliant'], 'N/A');
+    assert.ok(identity?.findings.some((f) => /预算/.test(f.message)));
+  } finally {
+    mock.server.close();
+  }
+});
+
+const CONTROL_EXEMPT = /一年有几个月|^\s*\d{1,2}\s*[+＋]\s*\d{1,2}\s*等于|^\s*\d{1,2}\s*[×x*]\s*\d{1,2}\s*等于/;
+
+test('e2e thinking-starve quality: control starved → insufficient with starvation-specific copy', async () => {
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 5000 });
+  try {
+    const report = await audit(mock, { expect: [] });
+    const quality = report.outcomes.find((o) => o.id === 'quality');
+    assert.ok(quality);
+    assert.equal(quality?.status, 'insufficient');
+    assert.match(quality?.headline ?? '', /推理占满预算/);
+    assert.ok(quality?.findings.some((f) => /控制题 .*推理占满预算未作答/.test(f.message)), JSON.stringify(quality?.findings));
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e thinking-starve quality: all mains excluded → insufficient (denominator 0)', async () => {
+  // 控制题豁免（平凡题小预算即可答），主问题 256/512 均截断 → 全部剔除
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 600, starveExempt: CONTROL_EXEMPT });
+  try {
+    const report = await audit(mock, { expect: [] });
+    const quality = report.outcomes.find((o) => o.id === 'quality');
+    assert.ok(quality);
+    assert.equal(quality?.status, 'insufficient');
+    assert.match(quality?.headline ?? '', /主问题全部/);
+    assert.equal(quality?.metrics['main'], '0/0');
+    assert.equal(quality?.metrics['excluded'], 12);
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e thinking-starve quality: partial exclusion keeps correct denominator and scores on usable samples', async () => {
+  // 仅「除以(余数)」与「days→hours」两题不豁免（256/512 均截断被剔除）→ 10/12 有效（≥80% 下限）
+  const exempt =
+    /一年有几个月|^\s*\d{1,2}\s*[+＋]\s*\d{1,2}\s*等于|^\s*\d{1,2}\s*[×x*]\s*\d{1,2}\s*等于|数列|包含几个|偶数|面积|哪一组更大|Multiply|JSON|%|计算|个苹果/;
+  const mock = await createMockServer({ mode: 'thinking-starve', starveBelow: 600, starveExempt: exempt });
+  try {
+    const report = await audit(mock, { expect: [], seed: 99 });
+    const quality = report.outcomes.find((o) => o.id === 'quality');
+    assert.ok(quality);
+    assert.equal(quality?.status, 'ok');
+    assert.equal(quality?.level, 'pass');
+    assert.equal(quality?.metrics['main'], '10/10');
+    assert.equal(quality?.metrics['excluded'], 2);
+    assert.equal(quality?.score, 100);
+    assert.ok(quality?.findings.some((f) => /剔除分母/.test(f.message)), JSON.stringify(quality?.findings));
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e thinking-starve: 401 endpoint makes no starvation retries (request-count anchor)', async () => {
+  const mock = await createMockServer({ mode: 'auth-required' });
+  try {
+    const report = await audit(mock, { expect: ['vision'] });
+    // 401 非 starvation：绝不触发升预算重试 → 每色/每题恰好一条证据，无 retry 标签，attempts 全为 1
+    const vision = report.evidence.filter((e) => e.label.startsWith('vision '));
+    assert.equal(vision.length, 3);
+    const quality = report.evidence.filter((e) => e.probe === 'quality');
+    assert.equal(quality.length, 15);
+    assert.ok(report.evidence.every((e) => e.response.attempts === 1));
+    assert.ok(!report.evidence.some((e) => /retry@/.test(e.label)), JSON.stringify(report.evidence.map((e) => e.label)));
   } finally {
     mock.server.close();
   }

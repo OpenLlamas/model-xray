@@ -1,6 +1,7 @@
 import type { ChatMessage, Finding, ProbeCtx, ProbeOutcome, ToolDef } from '../types.js';
 import { recordCall } from '../evidence.js';
 import { dataUrlPng, solidRgbPng } from '../png.js';
+import { PROBE_BUDGETS, chatWithStarveRetry } from './starve.js';
 
 const COLORS: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
   { name: 'red', rgb: [220, 30, 30] },
@@ -14,6 +15,14 @@ const COLORS: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
 ];
 
 const KNOWN = new Set(['vision', 'tool', 'thinking']);
+
+/** 明确「能力被拒绝」白名单：仅 400（服务端请求级明确拒绝，如内容/形态不受支持）。其余一切失败一律视为证据不足。 */
+const EXPLICIT_REJECT = new Set<number>([400]);
+
+/** 失败归因：仅白名单内的 4xx 构成「能力不存在」证据；0/5xx/鉴权/限流/路由/未知 status 一律 inconclusive（降 na）。 */
+function classifyFailure(status: number): 'reject' | 'inconclusive' {
+  return EXPLICIT_REJECT.has(status) ? 'reject' : 'inconclusive';
+}
 
 export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const claimed = ctx.cfg.expect.filter((c) => KNOWN.has(c));
@@ -43,6 +52,7 @@ export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (claimed.includes('tool')) {
     const tool = await runTool(ctx, findings);
     if (tool.state === 'pass') parts.push(1);
+    else if (tool.state === 'partial') parts.push(0.5);
     else if (tool.state === 'fail') parts.push(0);
     metrics['tool'] = tool.state;
   }
@@ -57,14 +67,16 @@ export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: '能力探针无法得出结论（请求全部失败）',
+      headline: '能力探针无法得出结论（请求全部失败或证据不足）',
       findings,
       metrics,
     };
   }
 
   const score = Math.round((parts.reduce((a, b) => a + b, 0) / parts.length) * 100);
-  const level: ProbeOutcome['level'] = score >= 100 ? 'pass' : score >= 60 ? 'warn' : 'fail';
+  let level: ProbeOutcome['level'] = score >= 100 ? 'pass' : score >= 60 ? 'warn' : 'fail';
+  // 全部为部分证据（0.5）时抬升为 warn：无法完整验证不应等同「能力不存在」。
+  if (level === 'fail' && parts.length > 0 && parts.every((p) => p >= 0.5)) level = 'warn';
   const headline =
     level === 'pass'
       ? '标称能力全部实测通过'
@@ -78,17 +90,20 @@ interface CheckState {
   state: 'pass' | 'partial' | 'fail' | 'na';
 }
 
-function isTransportFailure(status: number): boolean {
-  return status === 0 || status >= 500;
-}
+/** 纯色测试图边长。实测依据（2026-10-10 真机）：8px 图会被 vision 栈误判（brown→purple、orange→blue），
+ *  256px 同色全部识别正确——过小的图是识别伪影，不能作为能力判定依据。 */
+const VISION_IMAGE_SIZE = 256;
 
 async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> {
   const picks = ctx.rng.shuffle(COLORS).slice(0, 3);
   let correct = 0;
-  let attempted = 0;
-  let allHttp4xx = true;
-  let anyOk = false;
+  let okCount = 0;
+  let failCount = 0;
+  let starvedCount = 0;
+  const failStatuses: number[] = [];
   const evidenceIds: string[] = [];
+  const starvedEvidence: string[] = [];
+  const recoveredEvidence: string[] = [];
 
   for (const color of picks) {
     const png = solidRgbPng(8, color.rgb);
@@ -96,30 +111,57 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
       {
         role: 'user',
         content: [
-          { type: 'text', text: '图中是一个纯色方块。它是什么颜色？只回答一个英文颜色单词。' },
+          {
+            type: 'text',
+            text: '图中是一个纯色方块。它的颜色必须是以下之一：red, green, blue, purple, pink, orange, brown, gray。只回答一个英文颜色单词。',
+          },
           { type: 'image_url', image_url: { url: dataUrlPng(png) } },
         ],
       },
     ];
-    const result = await ctx.client.chat({ model: ctx.cfg.model, messages, temperature: 0, max_tokens: 16 });
-    const evidence = recordCall(ctx.evidence, {
+    // 预算实测：glm-5.3-flash 等 thinking 模型在 16 tokens 下推理即占满预算（content 恒空）；
+    // 1024 可产出答案，仍截断时升 2048 重试一次（详见 starve.ts PROBE_BUDGETS 注释）。
+    const call = await chatWithStarveRetry(ctx, {
       probe: 'capability',
       label: `vision color=${color.name}`,
-      request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 16, messages },
-      result,
+      buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages, temperature: 0, max_tokens: maxTokens }),
+      budget: PROBE_BUDGETS.vision,
+      retryBudget: PROBE_BUDGETS.visionRetry,
     });
-    evidenceIds.push(evidence.id);
-    attempted += 1;
-    if (!result.ok) {
-      if (!(result.status >= 400 && result.status < 500)) allHttp4xx = false;
+    evidenceIds.push(...call.evidenceIds);
+    if (call.starved) {
+      starvedCount += 1;
+      starvedEvidence.push(...call.evidenceIds);
       continue;
     }
-    anyOk = true;
-    if (result.text.toLowerCase().includes(color.name)) correct += 1;
+    if (call.retried) recoveredEvidence.push(...call.evidenceIds);
+    const { result } = call;
+    if (!result.ok) {
+      failCount += 1;
+      failStatuses.push(result.status);
+      continue;
+    }
+    okCount += 1;
+    if (containsColorWord(result.text, color.name)) correct += 1;
   }
 
-  if (!anyOk) {
-    if (allHttp4xx && attempted > 0) {
+  if (starvedCount > 0) {
+    findings.push({
+      level: 'warn',
+      message: `vision 有 ${starvedCount}/3 次因推理占满预算未产出答案（已升预算重试仍截断），按证据不足处理，不计入失败。`,
+      evidenceIds: starvedEvidence,
+    });
+  }
+  if (recoveredEvidence.length > 0) {
+    findings.push({
+      level: 'info',
+      message: `vision 有 ${recoveredEvidence.length} 次首查推理占满预算（max_tokens=${PROBE_BUDGETS.vision}），升预算至 ${PROBE_BUDGETS.visionRetry} 重试后成功。`,
+      evidenceIds: recoveredEvidence,
+    });
+  }
+
+  if (okCount === 0) {
+    if (failCount > 0 && failStatuses.every((s) => classifyFailure(s) === 'reject')) {
       findings.push({
         level: 'fail',
         message: '标称支持 vision，但端点对图像请求明确返回 4xx 拒绝：该能力不存在。',
@@ -127,20 +169,48 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
       });
       return { state: 'fail' };
     }
-    findings.push({ level: 'warn', message: 'vision 探针全部请求失败，无法判定。', evidenceIds });
+    if (failCount === 0 && starvedCount > 0) {
+      findings.push({
+        level: 'warn',
+        message: `vision 探针全部因推理占满预算未产出答案（升预算至 ${PROBE_BUDGETS.visionRetry} 重试仍截断），无法判定（证据不足，不代表能力缺失）。`,
+        evidenceIds,
+      });
+      return { state: 'na' };
+    }
+    const codes = [...new Set(failStatuses)].join('/');
+    findings.push({
+      level: 'warn',
+      message: `vision 探针全部请求失败（状态码 ${codes}），无法判定（鉴权/限流/传输故障不代表能力缺失）。`,
+      evidenceIds,
+    });
     return { state: 'na' };
   }
-
-  if (correct === attempted) {
-    findings.push({ level: 'info', message: `vision 通过：${correct}/${attempted} 次随机纯色图全部识别正确。`, evidenceIds });
+  if (failCount === 0 && starvedCount === 0 && correct === okCount) {
+    findings.push({ level: 'info', message: `vision 通过：${correct}/${okCount} 次随机纯色图全部识别正确。`, evidenceIds });
     return { state: 'pass' };
   }
+  if (failCount === 0 && correct === okCount) {
+    // 全部作答样本均正确，仅部分样本被推理截断：不构成失败证据，按部分证据处理（partial→warn 抬升）。
+    findings.push({
+      level: 'warn',
+      message: `vision ${correct}/${okCount} 次识别正确，另有 ${starvedCount} 次因推理占满预算未产出答案：按部分证据处理。`,
+      evidenceIds: starvedEvidence,
+    });
+    return { state: 'partial' };
+  }
+  const detail = failCount === 0 ? `仅 ${correct}/${okCount} 次识别正确` : `${correct}/${okCount} 次识别正确，另有 ${failCount} 次请求失败`;
   findings.push({
     level: 'fail',
-    message: `vision 可疑：仅 ${correct}/${attempted} 次识别正确（8 色随机，3/3 全对才通过）。`,
+    message: `vision 可疑：${detail}（8 色随机，全部正确且无失败才通过）。`,
     evidenceIds,
   });
   return { state: 'partial' };
+}
+
+/** 归一化词边界判色：小写后按非字母切词，整词等于基础色名才算命中；禁止 includes 子串（"reddish"/"crimson" 不得命中）。 */
+function containsColorWord(text: string, color: string): boolean {
+  const words = text.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 0);
+  return words.includes(color);
 }
 
 function echoTool(): ToolDef {
@@ -180,16 +250,20 @@ async function runTool(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> 
 
   const call = first.toolCalls.find((c) => c.function.name === 'echo_nonce');
   if (!first.ok) {
-    if (isTransportFailure(first.status)) {
-      findings.push({ level: 'warn', message: `tool 探针请求失败（${first.error ?? 'unknown'}），无法判定。`, evidenceIds: [firstEvidence.id] });
-      return { state: 'na' };
+    if (classifyFailure(first.status) === 'reject') {
+      findings.push({
+        level: 'fail',
+        message: `标称支持 tool calling，但首轮请求被明确拒绝（HTTP ${first.status}，${first.error ?? 'unknown'}）。`,
+        evidenceIds: [firstEvidence.id],
+      });
+      return { state: 'fail' };
     }
     findings.push({
-      level: 'fail',
-      message: `标称支持 tool calling，但首轮请求被拒绝（${first.error ?? 'unknown'}）。`,
+      level: 'warn',
+      message: `tool 探针首轮请求失败（HTTP ${first.status}，${first.error ?? 'unknown'}），无法判定（鉴权/限流/传输故障不代表能力缺失）。`,
       evidenceIds: [firstEvidence.id],
     });
-    return { state: 'fail' };
+    return { state: 'na' };
   }
   if (!call) {
     findings.push({
@@ -212,13 +286,14 @@ async function runTool(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> 
     { role: 'assistant', content: null, tool_calls: [call] },
     { role: 'tool', content: 'ok', tool_call_id: call.id },
   ];
-  const second = await ctx.client.chat({ model: ctx.cfg.model, messages: secondMessages, temperature: 0, max_tokens: 64 });
-  const secondEvidence = recordCall(ctx.evidence, {
+  const secondCall = await chatWithStarveRetry(ctx, {
     probe: 'capability',
     label: `tool roundtrip result nonce=${nonce}`,
-    request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 64, messages: secondMessages },
-    result: second,
+    buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages: secondMessages, temperature: 0, max_tokens: maxTokens }),
+    budget: PROBE_BUDGETS.toolSecond,
+    retryBudget: PROBE_BUDGETS.toolSecondRetry,
   });
+  const second = secondCall.result;
 
   if (argsNonce !== nonce) {
     findings.push({
@@ -228,27 +303,40 @@ async function runTool(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> 
     });
     return { state: 'fail' };
   }
+  if (secondCall.starved) {
+    // thinking 模型推理占满预算（升预算重试仍截断）：无正文可判定，证据不足——不得判 partial 或 fail。
+    findings.push({
+      level: 'warn',
+      message: `首轮工具调用与参数回填正确，但第二轮因推理占满预算未产出答案（升预算至 ${PROBE_BUDGETS.toolSecondRetry} 重试仍截断）：证据不足，无法判定。`,
+      evidenceIds: [firstEvidence.id, ...secondCall.evidenceIds],
+    });
+    return { state: 'na' };
+  }
   if (!second.ok) {
-    if (isTransportFailure(second.status)) {
-      findings.push({ level: 'warn', message: `tool 探针第二轮请求失败（${second.error ?? 'unknown'}），无法判定。`, evidenceIds: [secondEvidence.id] });
-      return { state: 'na' };
+    if (classifyFailure(second.status) === 'reject') {
+      findings.push({
+        level: 'fail',
+        message: `工具结果回传后第二轮请求被明确拒绝（HTTP ${second.status}，${second.error ?? 'unknown'}），往返调用不完整。`,
+        evidenceIds: secondCall.evidenceIds,
+      });
+      return { state: 'fail' };
     }
     findings.push({
-      level: 'fail',
-      message: `工具结果回传后第二轮请求被拒绝（${second.error ?? 'unknown'}），往返调用不完整。`,
-      evidenceIds: [secondEvidence.id],
+      level: 'warn',
+      message: `首轮工具调用与参数回填正确，但第二轮请求失败（HTTP ${second.status}，${second.error ?? 'unknown'}）：判定为部分通过，需人工复核。`,
+      evidenceIds: [firstEvidence.id, ...secondCall.evidenceIds],
     });
-    return { state: 'fail' };
+    return { state: 'partial' };
   }
   if (!second.text.includes(nonce)) {
     findings.push({
       level: 'fail',
       message: '工具结果回传后未能完成第二轮确认（响应中未包含 nonce），往返调用不完整。',
-      evidenceIds: [secondEvidence.id],
+      evidenceIds: secondCall.evidenceIds,
     });
     return { state: 'fail' };
   }
-  findings.push({ level: 'info', message: 'tool calling 通过：echo_nonce 参数回填与两轮往返均正确。', evidenceIds: [firstEvidence.id, secondEvidence.id] });
+  findings.push({ level: 'info', message: 'tool calling 通过：echo_nonce 参数回填与两轮往返均正确。', evidenceIds: [firstEvidence.id, ...secondCall.evidenceIds] });
   return { state: 'pass' };
 }
 

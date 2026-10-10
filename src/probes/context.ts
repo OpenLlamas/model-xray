@@ -1,6 +1,7 @@
 import type { ChatMessage, Finding, ProbeCtx, ProbeOutcome } from '../types.js';
 import { buildEchoQuestion, buildFiller, buildNeedle, buildNeedleQuestion } from '../assets.js';
 import { recordCall } from '../evidence.js';
+import { isStarved } from './starve.js';
 
 const DEPTHS = [0.25, 0.5, 0.75, 0.9];
 
@@ -23,6 +24,9 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const samplesPerDepth = ctx.cfg.deep ? 5 : 3;
   let explicitReject = false;
   let anySuccess = false;
+  let starvedCount = 0;
+  let validNeedleSamples = 0;
+  let echoStarved = false;
 
   const depthResults: Record<string, string> = {};
   const depthMiss: Record<string, boolean> = {};
@@ -57,6 +61,16 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 32, messages },
         result,
       });
+      if (isStarved(result)) {
+        // thinking 模型推理占满预算：无正文可判命中，该样本不计入截断判定（不得据此指控静默截断）。
+        starvedCount += 1;
+        findings.push({
+          level: 'info',
+          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${nonce}：响应为空/截断（推理占满预算），该样本不计入截断判定。`,
+          evidenceIds: [evidence.id],
+        });
+        continue;
+      }
       attempted += 1;
       const hit = result.ok && containsNonce(result.text, nonce);
       if (hit) {
@@ -72,6 +86,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         evidenceIds: [evidence.id],
       });
     }
+    validNeedleSamples += attempted;
     depthResults[String(depth)] = `${successAtDepth}/${attempted}`;
     depthMiss[String(depth)] = attempted > 0 && successAtDepth < attempted;
     if (attempted > 0 && successAtDepth === 0 && depth >= 0.5 && rejectedAtDepth === attempted) {
@@ -108,15 +123,18 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 64, messages: echoMessages },
     result: echoResult,
   });
-  const echoHit = echoResult.ok && containsNonce(echoResult.text, echoNonce);
-  metrics['tail_echo'] = echoHit ? 'hit' : 'miss';
+  echoStarved = isStarved(echoResult);
+  const echoHit = !echoStarved && echoResult.ok && containsNonce(echoResult.text, echoNonce);
+  metrics['tail_echo'] = echoStarved ? 'starved' : echoHit ? 'hit' : 'miss';
   findings.push({
-    level: echoHit ? 'info' : 'fail',
-    message: echoHit
-      ? '结尾回显控制通过：标称长度 90% 处的结尾内容可被读取与复述。'
-      : explicitReject
-        ? '结尾回显控制失败：标称长度 90% 处的请求被端点显式拒绝 —— 标称窗口与实际接受长度不符（显式拒绝，非静默截断）。'
-        : `结尾回显控制失败：标称长度 90% 处插入的结尾标记 ${echoNonce} 无法被复述（高深度 needle 失败=${highDepthMiss ? '是' : '否'}）。`,
+    level: echoStarved ? 'info' : echoHit ? 'info' : 'fail',
+    message: echoStarved
+      ? '结尾回显：响应为空/截断（推理占满预算），无法判定，不计入失败。'
+      : echoHit
+        ? '结尾回显控制通过：标称长度 90% 处的结尾内容可被读取与复述。'
+        : explicitReject
+          ? '结尾回显控制失败：标称长度 90% 处的请求被端点显式拒绝 —— 标称窗口与实际接受长度不符（显式拒绝，非静默截断）。'
+          : `结尾回显控制失败：标称长度 90% 处插入的结尾标记 ${echoNonce} 无法被复述（高深度 needle 失败=${highDepthMiss ? '是' : '否'}）。`,
     evidenceIds: [echoEvidence.id],
   });
 
@@ -137,12 +155,35 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (scan.explicitReject) {
       explicitReject = true;
     }
+    if (scan.starvedSeen) {
+      starvedCount += 1;
+      findings.push({
+        level: 'info',
+        message: '边界扫描存在推理占满预算样本：扫描提前终止，不据此判定截断。',
+        evidenceIds: scan.evidenceIds,
+      });
+    }
   }
   metrics['boundary_scanned'] = boundaryScanned ? 1 : 0;
+  if (starvedCount > 0 || echoStarved) metrics['starved_samples'] = starvedCount + (echoStarved ? 1 : 0);
+
+  // 全部样本被推理占满预算：没有任何可用证据，直接判无法判定（不得按「未获得任何命中」给 fail）。
+  if (validNeedleSamples === 0 && echoStarved) {
+    return {
+      id: 'context',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: '上下文探针全部样本因推理占满预算未产出答案，无法判定',
+      findings,
+      metrics,
+    };
+  }
 
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
   let headline = `上下文实测通过：标称 ${claimed} tokens 内 needle 全部命中`;
+  let verdictFromExplicitReject = false;
 
   if (!anySuccess) {
     score = 20;
@@ -151,6 +192,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   } else if (explicitReject) {
     score = 15;
     level = 'fail';
+    verdictFromExplicitReject = true;
     headline = `标称窗口不实：端点对 ${claimed} tokens 标称长度内的输入显式拒绝（非静默截断）`;
   } else if (lowDepthMiss && highDepthMiss) {
     score = 10;
@@ -202,18 +244,46 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     headline = '高深度 needle 部分未命中但结尾回显通过：疑似注意力衰减或代理改写，未构成截断定论';
   }
 
+  // 存在推理占满预算样本时，基于「正文未命中」的 fail/warn 结论不可信
+  // （无法区分「截断丢失」与「预算耗尽未作答」）→ 降为证据不足；
+  // 仅依赖 HTTP 400 的显式拒绝结论不受影响（不依赖正文）。
+  if ((starvedCount > 0 || echoStarved) && level !== 'pass' && !verdictFromExplicitReject) {
+    findings.push({
+      level: 'info',
+      message: `存在 ${starvedCount + (echoStarved ? 1 : 0)} 个样本因推理占满预算未产出答案，截断/不可读类结论证据不足，本探针降为无法判定。`,
+      evidenceIds: [],
+    });
+    return {
+      id: 'context',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: '上下文探针因推理占满预算存在不可判定样本，截断类结论证据不足',
+      findings,
+      metrics,
+    };
+  }
+
   return { id: 'context', status: 'ok', score, level, headline, findings, metrics };
 }
 
 async function scanBoundary(
   ctx: ProbeCtx,
   claimed: number,
-): Promise<{ found: boolean; foundAtTokens: number | null; explicitReject: boolean; detail: string; evidenceIds: string[] }> {
+): Promise<{
+  found: boolean;
+  foundAtTokens: number | null;
+  explicitReject: boolean;
+  starvedSeen: boolean;
+  detail: string;
+  evidenceIds: string[];
+}> {
   const evidenceIds: string[] = [];
   let lo = 0;
   let hi = claimed;
   let foundAtTokens: number | null = null;
   let explicitReject = false;
+  let starvedSeen = false;
   for (let step = 0; step < 3; step += 1) {
     const mid = Math.floor((lo + hi) / 2);
     if (mid <= 0) break;
@@ -232,6 +302,11 @@ async function scanBoundary(
       result,
     });
     evidenceIds.push(evidence.id);
+    if (isStarved(result)) {
+      // 推理占满预算：无正文可判命中，不能把该点记为「开始失败」；终止扫描避免假截断结论。
+      starvedSeen = true;
+      break;
+    }
     if (!result.ok && result.status === 400) {
       explicitReject = true;
       hi = mid;
@@ -249,7 +324,8 @@ async function scanBoundary(
     found,
     foundAtTokens,
     explicitReject,
-    detail: `lo=${lo} hi=${hi} found=${foundAtTokens ?? 'n/a'} explicitReject=${explicitReject}`,
+    starvedSeen,
+    detail: `lo=${lo} hi=${hi} found=${foundAtTokens ?? 'n/a'} explicitReject=${explicitReject} starved=${starvedSeen}`,
     evidenceIds,
   };
 }

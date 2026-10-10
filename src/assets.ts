@@ -1,7 +1,9 @@
 import type { Rng } from './types.js';
 import { estimateTokens } from './tokens.js';
 
-export const PROBESET_VERSION = 'v0.1.0';
+// v0.2.0：探针问答预算全面升级以适配 thinking 模型（vision 16→1024、quality 64→256、tool 次轮 64→256、
+// identity 200→512，均带 starvation 升预算重试/证据不足处理），题集内容与判定口径变化 → 基线不可比。
+export const PROBESET_VERSION = 'v0.2.0';
 export const ASSETS_VERSION = 'assets-v0.1.0';
 
 /** Base paragraphs used to construct long context probes. Deterministic given seed. */

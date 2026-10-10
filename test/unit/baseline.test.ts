@@ -11,6 +11,7 @@ import {
   DRIFT_QUALITY_FAIL,
   type BaselineFile,
 } from '../../src/baseline.js';
+import { PROBESET_VERSION } from '../../src/assets.js';
 import type { ProbeOutcome } from '../../src/types.js';
 
 function outcome(id: ProbeOutcome['id'], metrics: ProbeOutcome['metrics']): ProbeOutcome {
@@ -189,6 +190,21 @@ test('diffBaseline marks version/versions/model mismatches incomparable', () => 
     assert.ok(diff.skipReason);
     assert.deepEqual(diff.items, []);
   }
+});
+
+test('baseline: probeset_version bump v0.1.0 → current blocks comparison; same version stays comparable', () => {
+  // 当前版本应为 v0.2.0（thinking-starvation 预算升级后的题集契约变化）
+  assert.equal(PROBESET_VERSION, 'v0.2.0');
+  const current = baselineOf({ probesetVersion: PROBESET_VERSION });
+  const oldV1 = baselineOf({ probesetVersion: 'v0.1.0' });
+  const diff = diffBaseline(oldV1, current);
+  assert.equal(diff.comparable, false);
+  assert.match(diff.skipReason ?? '', /题集版本/);
+  assert.ok(diff.skipReason?.includes('v0.1.0'));
+  assert.ok(diff.skipReason?.includes('v0.2.0'));
+  // 同版本基线照常可比（不存在版本不可比跳过）
+  const same = diffBaseline(baselineOf({ probesetVersion: PROBESET_VERSION }), current);
+  assert.equal(same.comparable, true);
 });
 
 test('diffBaseline flags disjoint identity families as fail cap 0', () => {

@@ -78,10 +78,12 @@ async function readJson(response: Response, started: number): Promise<ChatResult
       : {};
     const text = extractText(message['content']);
     const reasoning = extractText(message['reasoning_content']) + extractText(message['reasoning']);
+    const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
     const { usage, reason } = validateUsage(parsed['usage']);
     return {
       ok: true,
       status: response.status,
+      finishReason,
       text,
       reasoning: reasoning.length > 0 ? reasoning : null,
       usage,
@@ -160,6 +162,7 @@ async function readStream(response: Response, started: number): Promise<ChatResu
   return {
     ok: true,
     status: response.status,
+    finishReason,
     text,
     reasoning: reasoning.length > 0 ? reasoning : null,
     usage,
@@ -168,7 +171,10 @@ async function readStream(response: Response, started: number): Promise<ChatResu
     toolCalls,
     ttftMs,
     durationMs: Date.now() - started,
-    error: finishReason === null && text.length === 0 && toolCalls.length === 0 ? 'empty stream' : null,
+    // 'empty stream' 仅在既无 finish_reason 也无任何内容/推理/工具调用时报——
+    // thinking 模型推理占满预算（content 空 + finish_reason='length'）是合法响应，不是空流；
+    // 纯 reasoning 增量（即使 finish_reason 缺失）说明端点有产出，同样不算空流。
+    error: finishReason === null && text.length === 0 && reasoning.length === 0 && toolCalls.length === 0 ? 'empty stream' : null,
     raw: rawParts.join('\n'),
   };
 }
@@ -213,6 +219,7 @@ function errorResult(message: string, status = 0, durationMs = 0): ChatResult {
   return {
     ok: false,
     status,
+    finishReason: null,
     text: '',
     reasoning: null,
     usage: null,

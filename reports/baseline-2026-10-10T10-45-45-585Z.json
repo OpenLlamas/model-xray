@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "model": "glm-5.3-flash",
+  "seed": 627638907,
+  "createdAt": "2026-10-10T10:43:19.679Z",
+  "probesetVersion": "v0.2.0",
+  "assetsVersion": "assets-v0.1.0",
+  "identity": {
+    "families": [
+      "glm"
+    ],
+    "schemaCompliant": true,
+    "refusalRate": 0
+  },
+  "quality": {
+    "accuracy": 1,
+    "mainCorrect": 11,
+    "mainTotal": 11
+  },
+  "capability": {
+    "vision": "partial",
+    "tool": "fail"
+  },
+  "billing": {
+    "slopeEn": 0.656,
+    "slopeZh": 0.528
+  }
+}

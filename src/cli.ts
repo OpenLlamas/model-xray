@@ -6,14 +6,20 @@ import { createRng } from './random.js';
 import { buildBaseline, loadBaseline } from './baseline.js';
 import { writeReports } from './report/files.js';
 import { renderConsole } from './report/console.js';
+import { supportsColor } from './color.js';
+import { runGuard } from './guard/cli.js';
 import type { AuditReport, RunConfig } from './types.js';
 
 const HELP = `model-xray — audit OpenAI-compatible endpoints for fake or watered-down models
 
 Usage:
-  model-xray test --base-url <url> --key <key> --model <model> [options]
+  model-xray test  --base-url <url> --key <key> --model <model> [options]
+      一次性审计：主动跑一轮探针（身份/上下文/计费/能力/质量/TTFT），产出评分报告后退出。
+  model-xray guard --base-url <url> [options]
+      常驻监控：本地透明转发代理，逐请求监听真实流量（模型一致性/token 统计/余额滚动对账），
+      异常即时告警并写 JSONL 审计日志；详见 model-xray guard --help。
 
-Options:
+test Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
   --key <key>               API key (or env MODEL_XRAY_KEY / OPENAI_API_KEY)
   --model <model>           Model name to audit, e.g. gpt-4o
@@ -38,11 +44,17 @@ Options:
 Notes:
   价格为「每百万 tokens 的宣称价格」，必须为正数；单位需与该站余额显示单位一致（美元/quota 均可），工具只算比值，不做单位换算。
   数值参数均按严格整数校验（不接受 "12abc"、前导空白等）；非法输入立即 exit 2 并给出正确示例。
+  guard 子命令只读环境变量 MODEL_XRAY_KEY 作为密钥，且不提供 --key 旗标。
 
 Exit codes: 0 pass/warn · 1 fail · 2 error
 `;
 
 async function main(argv: string[]): Promise<number> {
+  // guard 子命令顶层分流：guard 有专属参数集（--port 等），用独立 parseArgs，避免顶层严格解析误伤
+  if (argv[0] === 'guard') {
+    return runGuard(argv.slice(1));
+  }
+
   let parsed;
   try {
     parsed = parseArgs({
@@ -87,7 +99,9 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
   if (positionals[0] !== 'test') {
-    console.error(`未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..." 或 --help。`);
+    console.error(
+      `未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..."（一次性审计）或 "model-xray guard ..."（常驻监控），或 --help。`,
+    );
     return 2;
   }
 
@@ -262,7 +276,7 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  console.log(renderConsole(report));
+  console.log(renderConsole(report, { color: supportsColor(process.stdout) }));
   console.error('');
   console.error(`报告已写入：`);
   console.error(`  ${written.markdownPath}`);
@@ -271,6 +285,10 @@ async function main(argv: string[]): Promise<number> {
   if (written.baselinePath) console.error(`  ${written.baselinePath}`);
 
   if (report.overall === 'fail') return 1;
+  if (report.overall === 'unknown') {
+    console.error('审计未能得出结论（可评分项不足）。请核对 API key、端点可达性与模型名后重试；详见报告 notes。');
+    return 2;
+  }
   return 0;
 }
 
@@ -327,7 +345,7 @@ function readVersion(): string {
  * 非法时向 stderr 输出含范围、实际值与正确示例的中文错误，返回 null（调用方 return 2）。
  * 取代 Number.parseInt —— parseInt('12abc')===12 会静默吞掉尾部垃圾字符。
  */
-function strictInt(raw: string, min: number, max: number, name: string, example: string): number | null {
+export function strictInt(raw: string, min: number, max: number, name: string, example: string): number | null {
   const fail = (): null => {
     console.error(`--${name} 必须是 [${min}, ${max}] 的整数。收到：${JSON.stringify(raw)}。`);
     console.error(`示例：--${name} ${example}`);
@@ -340,7 +358,7 @@ function strictInt(raw: string, min: number, max: number, name: string, example:
 }
 
 /** 严格正数解析（价格）：必须形如数字、Number() 后有限且 > 0；空串/0/负数/非数字一律报错。 */
-function positiveNumber(raw: string, name: string): number | null {
+export function positiveNumber(raw: string, name: string): number | null {
   const fail = (): null => {
     console.error(`--${name} 必须为正数（每百万 tokens 宣称价格）。收到：${JSON.stringify(raw)}。`);
     console.error(`示例：--${name === 'price-input' ? 'price-input 2.5' : 'price-output 10'}（与另一价格 flag 成对使用）`);
