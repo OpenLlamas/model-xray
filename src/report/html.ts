@@ -1,6 +1,7 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
 import { levelLabel, PROBE_ORDER, statusTag } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
+import { CREDIBILITY_NOTE } from './markdown.js';
 
 /** 每维度一行静态说明：测什么 / 评分依据（纯展示，不参与评分）。 */
 const DIMENSION_DESC: Readonly<Record<string, string>> = {
@@ -56,7 +57,7 @@ body{background:#161616;color:#e8e8e8}table{background:#1f1f1f}th{background:#2a
 </head>
 <body><main>
 <h1>model-xray 报告 — ${esc(meta.model)}</h1>
-<p><span class="badge ${verdictClass}">${esc(levelLabel(report.overall))}</span><strong>总分 ${esc(totalText)}</strong></p>
+<p><span class="badge ${verdictClass}">${esc(levelLabel(report.overall))}</span><strong>可信度总分 ${esc(totalText)}</strong></p>
 <div class="anomaly ${boxLevel}">
 <div class="anomaly-title">异常要点${anomalies.length > 0 ? `（${anomalies.length} 项）` : ''}</div>
 ${
@@ -86,7 +87,7 @@ ${report.scores
   .join('\n')}
 </tbody></table>
 
-${report.notes.length > 0 ? `<h2>说明</h2><ul>${report.notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>` : ''}
+${`<h2>说明</h2><ul>${[...report.notes, CREDIBILITY_NOTE].map((n) => `<li>${esc(n)}</li>`).join('')}</ul>`}
 
 <h2>检测详情</h2>
 ${report.outcomes.map(renderOutcome).join('\n')}

@@ -4,7 +4,7 @@ import { parseArgs } from 'node:util';
 import { runAudit } from './runner.js';
 import { createRng } from './random.js';
 import { buildBaseline, loadBaseline } from './baseline.js';
-import { writeReports } from './report/files.js';
+import { writeReports, makeFileStamp } from './report/files.js';
 import { renderConsole } from './report/console.js';
 import { supportsColor } from './color.js';
 import { runGuard } from './guard/cli.js';
@@ -30,7 +30,7 @@ test Options:
   --retries <n>             Retries per request on 408/409/429/5xx, integer in [0, 3] (default: 0)
                             注意：每次重试都会真实计费，默认不重试；开了重试会令实测倍率判定作废（防重复计费污染）
   --baseline <path>         Compare fingerprints against a baseline file (seed is reused unless --seed)
-  --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<stamp>.json)
+  --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json)
   --deep                    More samples (slower, more tokens)
   --seed <n>                Random seed, integer in [1, 2147483646] (default: time-based; with --baseline defaults to baseline seed)
   --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 60)
@@ -175,7 +175,7 @@ async function main(argv: string[]): Promise<number> {
     }
     if (!readable) {
       console.error(`--baseline 文件不存在或不可读：${values.baseline}`);
-      console.error('下一步：先跑一次审计（--baseline-out 会生成基线文件），或核对路径拼写。示例：--baseline reports/baseline-2026-01-01T00-00-00-000Z.json');
+      console.error('下一步：先跑一次审计（--baseline-out 会生成基线文件），或核对路径拼写。示例：--baseline reports/baseline-gpt-4o-2026-01-01_00-00-00.json');
       return 2;
     }
     try {
@@ -258,7 +258,8 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
-  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  // 文件名主干 = <safeModel>-<本地时间戳>；report 与 baseline 共用同一 stamp（现状保持）
+  const stamp = makeFileStamp(new Date(), cfg.model);
   let written;
   try {
     // 每轮审计默认落盘指纹基线（可用 --baseline-out 指定路径），供后续 --baseline 复测对比
@@ -309,7 +310,8 @@ export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: numb
   const contextTokens = Math.round(contextCalls * claimed * 0.41);
   const calls =
     contextCalls +
-    (cfg.deep ? 7 : 5) +
+    // identity 自述 5 次（deep 8 次）+ 1 次格式合规 + 1 次诱饵
+    (cfg.deep ? 10 : 7) +
     10 +
     (cfg.expect.includes('vision') ? 3 : 0) +
     (cfg.expect.includes('tool') ? 2 : 0) +

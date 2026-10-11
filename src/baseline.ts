@@ -60,6 +60,9 @@ export function buildBaseline(outcomes: ProbeOutcome[], meta: BaselineMeta): Bas
 
 function buildIdentity(outcome: ProbeOutcome | undefined): BaselineFile['identity'] {
   if (!outcome) return null;
+  // 注意：identity.metrics 的 claimed_version / claimed 版本旁证不进基线——基线校验按已知字段路径
+  // 白名单校验，指纹对比只用 families/schema/refusalRate；新增旁证字段保持不落盘（保守方案），
+  // 避免「新基线写入 → 旧版本工具加载」出现未知字段兼容问题。
   const familiesRaw = outcome.metrics['families'];
   const families =
     typeof familiesRaw === 'string' && familiesRaw.length > 0 && familiesRaw !== 'none'

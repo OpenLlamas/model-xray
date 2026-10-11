@@ -23,7 +23,26 @@ const MODEL_ALIAS: readonly (readonly [string, RegExp])[] = [
   ['kimi', /kimi|moonshot|月之暗面/i],
   ['doubao', /doubao|豆包|字节|bytedance/i],
   ['ernie', /ernie|文心|baidu|百度/i],
+  // 以下为扩容族（模式保守，只认 distinctive 串，避免把通用词误收进指纹）：
+  ['minimax', /minimax|abab|海螺/i],
+  ['hunyuan', /hunyuan|混元/i],
+  ['step', /step[-\s]?\d|阶跃/i],
+  ['spark', /spark[-\s]?\d|星火|讯飞|iflytek/i],
+  ['yi', /\byi[-\s]?(large|lightning)|零一万物|01\.ai/i],
+  ['baichuan', /baichuan|百川/i],
+  ['internlm', /internlm|书生/i],
+  ['phi', /\bphi[-\s]?\d/i],
+  ['cohere', /\bcommand[-\s]?r\b|cohere/i],
 ];
+
+/** 固定追加的精确版本自述题：每次审计必问 1 道，用于提取 claimed_version 旁证。 */
+const EXACT_VERSION_QUESTION = '你的完整模型名称与精确版本号是什么？只回答名称与版本号。';
+
+// 自述中的具体版本号串（claimed_version 展示用）：family+数字（GLM-4、glm-5.3、gpt-4 前缀形态）
+// 或独立 X.Y(.Z)（4.5、5.3.1）。纯字母尾版本（如 gpt-4o 的 "o"）不匹配，属可接受的保守提取。
+const CLAIMED_VERSION_RE = /\b(?:[a-z][\w-]*-)?\d+\.\d+(?:\.\d+)?\b|\b[a-z][\w-]*-\d+\b/i;
+// X.Y(.Z) 形式的可比版本号（目标模型名与自述文本的交集比较用），lowercase 后比较。
+const COMPARABLE_VERSION_RE = /\d+\.\d+(?:\.\d+)?/g;
 
 interface IdentitySample {
   question: string;
@@ -39,15 +58,28 @@ function familiesIn(text: string): Set<string> {
   return declared;
 }
 
-function detectFalsified(samples: readonly IdentitySample[], expect: readonly string[]): boolean {
-  if (expect.length === 0) return false;
+/** 从目标模型名集合提取期望模型族别名（detectFalsified 与版本旁证共用）。 */
+function expectedFamiliesFor(targets: readonly string[]): Set<string> {
   const expectedAliases = new Set<string>();
-  for (const target of expect) {
+  for (const target of targets) {
     for (const [name, pattern] of MODEL_ALIAS) {
       if (pattern.test(target)) expectedAliases.add(name);
     }
   }
-  if (expectedAliases.size === 0) return false;
+  return expectedAliases;
+}
+
+/**
+ * 族失配统计（falsified 与多数不一致告警共用同一计数口径）：
+ * 统计「声明了模型族且与期望族无交集」的样本数。未声明族（declared 为空）的样本
+ * 不计入 mismatch；期望族为空（目标模型名不在别名表内）时 mismatch 恒为 0。
+ */
+function countFamilyMismatch(
+  samples: readonly IdentitySample[],
+  expect: readonly string[],
+): { mismatch: number; expectedAliases: Set<string> } {
+  const expectedAliases = expectedFamiliesFor(expect);
+  if (expectedAliases.size === 0) return { mismatch: 0, expectedAliases };
   let mismatch = 0;
   for (const sample of samples) {
     const declared = familiesIn(sample.result.text);
@@ -55,14 +87,43 @@ function detectFalsified(samples: readonly IdentitySample[], expect: readonly st
     const consistentWithExpect = [...declared].some((d) => expectedAliases.has(d));
     if (!consistentWithExpect) mismatch += 1;
   }
-  return mismatch >= 3;
+  return { mismatch, expectedAliases };
+}
+
+/**
+ * falsified 判定（全体一致语义）：所有有效样本都声明了模型族、且无一与期望族相交，
+ * 才判伪造。样本 5/8 个时与旧口径（3 样本 3 mismatch）同等严格度——个别样本空响应/
+ * 失败天然缩样本，未声明族（declared 为空）的样本不计入 mismatch。
+ */
+function detectFalsified(stats: { mismatch: number; expectedAliases: Set<string> }, sampleCount: number): boolean {
+  if (stats.expectedAliases.size === 0) return false;
+  if (sampleCount < 3) return false;
+  return stats.mismatch === sampleCount;
+}
+
+/** 去中转站厂商前缀（z-ai/、openai/、zhipu/ 等，可叠多层），只留模型本体，供版本号提取。 */
+function stripVendorPrefix(model: string): string {
+  return model.toLowerCase().replace(/^(?:[a-z0-9][\w.-]*\/)+/, '');
+}
+
+/** 提取文本中首个具体版本号串（展示用）；提取不到返回 null。 */
+function extractClaimedVersion(text: string): string | null {
+  const m = text.match(CLAIMED_VERSION_RE);
+  return m ? m[0] : null;
+}
+
+/** 提取文本中全部 X.Y(.Z) 版本号（lowercase 集合，交集比较用）。 */
+function extractComparableVersions(text: string): Set<string> {
+  return new Set((text.match(COMPARABLE_VERSION_RE) ?? []).map((v) => v.toLowerCase()));
 }
 
 export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = {};
   const samples: IdentitySample[] = [];
-  const questions = ctx.rng.shuffle(IDENTITY_QUESTIONS).slice(0, 3);
+  // 自述样本数：普通档 5、deep 档 8。构成 = 随机题（n-1）+ 固定追加 1 题精确版本自述。
+  const sampleTarget = ctx.cfg.deep ? 8 : 5;
+  const questions = [...ctx.rng.shuffle(IDENTITY_QUESTIONS).slice(0, sampleTarget - 1), EXACT_VERSION_QUESTION];
   let starvedSelfId = 0;
 
   for (const question of questions) {
@@ -156,6 +217,17 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   }
   metrics['families'] = familyUnion.size > 0 ? [...familyUnion].sort().join(',') : 'none';
 
+  // claimed_version：首个含具体版本号的自述串（如 GLM-4、glm-5.3、4.5）；提取不到记 'none'
+  let claimedVersion: string | null = null;
+  const claimedVersions = new Set<string>();
+  for (const sample of samples) {
+    if (claimedVersion === null) {
+      claimedVersion = extractClaimedVersion(sample.result.text);
+    }
+    for (const v of extractComparableVersions(sample.result.text)) claimedVersions.add(v);
+  }
+  metrics['claimed_version'] = claimedVersion ?? 'none';
+
   if (samples.length === 0) {
     return {
       id: 'identity',
@@ -171,7 +243,70 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     };
   }
 
-  const falsified = detectFalsified(samples, [ctx.cfg.model]);
+  // 与族判定无关的软信号（refusal / 逐字一致 / 格式合规）：诚实降级分支里也应披露，
+  // 不因降级而丢失；文案与下方主流程对应分支保持一致（主流程版本额外压分，降级分支无分可压）。
+  const attachSoftWarns = (): void => {
+    if (refusalCount >= 3) {
+      findings.push({ level: 'warn', message: '自述问题全部被回避，行为指纹结论置信度低。', evidenceIds: [] });
+    }
+    if (identicalPairs >= samples.length - 1 && samples.length >= 3) {
+      findings.push({ level: 'warn', message: '多次采样回答逐字一致，疑似模板特判或缓存。', evidenceIds: [] });
+    }
+    if (!schemaStarved && schemaResult.ok && !schemaKeysOk) {
+      findings.push({
+        level: 'warn',
+        message: '严格 JSON 输出探针未按结构返回（弱指纹：网关可能重写响应）。',
+        evidenceIds: [schemaEvidence.id],
+      });
+    }
+  };
+
+  const familyStats = countFamilyMismatch(samples, [ctx.cfg.model]);
+
+  // —— 诚实降级分支（真实事故：中转站全程自述他族，旧逻辑却输出 PASS「身份探针未见异常」）——
+  // a) 目标族未知：别名表认不出目标模型族 → 无法据自述核验身份，诚实降级，不出 PASS。
+  if (familyStats.expectedAliases.size === 0) {
+    const declaredNote =
+      familyUnion.size > 0
+        ? `自述声明族：${[...familyUnion].sort().join(', ')}。`
+        : '自述未声明任何可识别模型族。';
+    findings.push({
+      level: 'info',
+      message: `目标模型族（${ctx.cfg.model}）不在已知别名表内，无法据自述核验身份。${declaredNote}`,
+      evidenceIds: [],
+    });
+    attachSoftWarns();
+    return {
+      id: 'identity',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: '目标模型族不在已知别名表内，无法据自述核验身份',
+      findings,
+      metrics,
+    };
+  }
+  // b) 无族证据：有有效样本但均未声明可识别模型族 → 无法核验，诚实降级，不出 PASS。
+  //    （全部空响应走下方专用分支——其证据更弱、措辞更准确，故此处要求 answerable > 0。）
+  if (familyUnion.size === 0 && answerable > 0) {
+    findings.push({
+      level: 'info',
+      message: '自述未声明可识别模型族，无法核验身份（不作为异常指控）。',
+      evidenceIds: [],
+    });
+    attachSoftWarns();
+    return {
+      id: 'identity',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: '自述未声明可识别模型族，无法核验身份',
+      findings,
+      metrics,
+    };
+  }
+
+  const falsified = detectFalsified(familyStats, samples.length);
 
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
@@ -186,6 +321,31 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       message: `目标模型族为 ${ctx.cfg.model}，但每次自述都指向其他模型族。自述不可单独定罪，但与其余探针一致时构成换壳证据。`,
       evidenceIds: samples.map((s) => s.evidenceId),
     });
+  } else if (samples.length >= 3 && familyStats.mismatch >= Math.ceil(samples.length / 2) && familyStats.mismatch >= 2) {
+    // c) 多数不一致告警：未达全体一致定罪线，但多数自述指向其他模型族——疑似换壳，
+    //    压制可信度分并降为可疑，不再输出「未见异常」的假清白。
+    score = Math.min(score, 60);
+    level = 'warn';
+    headline = `多数自述（${familyStats.mismatch}/${samples.length}）指向其他模型族，疑似换壳（未达全体一致定罪线）`;
+    findings.push({
+      level: 'warn',
+      message: `多数自述（${familyStats.mismatch}/${samples.length}）指向其他模型族，疑似换壳（未达全体一致定罪线）。`,
+      evidenceIds: samples.map((s) => s.evidenceId),
+    });
+  } else if (claimedVersions.size > 0) {
+    // 版本矛盾旁证（仅 warn，不定罪）：前提是自述族与期望族有交集（falsified 不成立）。
+    // 双侧均有具体版本号且无交集才判；任一侧无版本（如 gpt-4o 无 X.Y 段）不判，metric 照记。
+    const targetVersions = extractComparableVersions(stripVendorPrefix(ctx.cfg.model));
+    const declaredOverlap = [...familyUnion].some((f) => expectedFamiliesFor([ctx.cfg.model]).has(f));
+    if (declaredOverlap && targetVersions.size > 0 && ![...claimedVersions].some((v) => targetVersions.has(v))) {
+      findings.push({
+        level: 'warn',
+        message: `自述版本（${[...claimedVersions].sort().join('/')}）与目标模型（${ctx.cfg.model}）不符。模型自述版本天然不可靠，仅作旁证，不构成换壳定罪。`,
+        evidenceIds: samples.map((s) => s.evidenceId),
+      });
+      score = Math.min(score, 90);
+      if (level === 'pass') level = 'warn';
+    }
   }
   if (answerable === 0 && samples.length > 0) {
     // 全部空响应：没有证据指控端点（可能是限流/截断/内容过滤），按证据不足处理，不碰 score/level
@@ -208,7 +368,9 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     score = Math.min(score, 85);
     if (level === 'pass') level = 'warn';
   }
-  if (identicalPairs >= 2 && samples.length === 3) {
+  // 全体逐字一致（相邻对 = 样本数-1 时即所有有效样本完全相同）才疑似模板特判：
+  // 旧口径为 3 样本 3 连同（pairs>=2），5/8 样本下按同强度换算，避免多样本随机重复误伤。
+  if (identicalPairs >= samples.length - 1 && samples.length >= 3) {
     findings.push({ level: 'warn', message: '多次采样回答逐字一致，疑似模板特判或缓存。', evidenceIds: [] });
     score = Math.min(score, 70);
     if (level === 'pass') level = 'warn';

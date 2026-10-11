@@ -193,18 +193,32 @@ test('diffBaseline marks version/versions/model mismatches incomparable', () => 
 });
 
 test('baseline: probeset_version bump v0.1.0 → current blocks comparison; same version stays comparable', () => {
-  // 当前版本应为 v0.2.0（thinking-starvation 预算升级后的题集契约变化）
-  assert.equal(PROBESET_VERSION, 'v0.2.0');
+  // 当前版本应为 v0.2.1（identity 探针加强：样本数 5/8、全体一致判定、claimed_version 旁证）
+  assert.equal(PROBESET_VERSION, 'v0.2.1');
   const current = baselineOf({ probesetVersion: PROBESET_VERSION });
   const oldV1 = baselineOf({ probesetVersion: 'v0.1.0' });
   const diff = diffBaseline(oldV1, current);
   assert.equal(diff.comparable, false);
   assert.match(diff.skipReason ?? '', /题集版本/);
   assert.ok(diff.skipReason?.includes('v0.1.0'));
-  assert.ok(diff.skipReason?.includes('v0.2.0'));
+  assert.ok(diff.skipReason?.includes('v0.2.1'));
   // 同版本基线照常可比（不存在版本不可比跳过）
   const same = diffBaseline(baselineOf({ probesetVersion: PROBESET_VERSION }), current);
   assert.equal(same.comparable, true);
+});
+
+test('baseline: old ISO-stamp filename format still loads (filename is irrelevant to loadBaseline)', () => {
+  // 文件名格式改造（<model>-<本地时间戳>）不得影响旧命名基线的加载——加载只看文件内容
+  const dir = mkdtempSync(join(tmpdir(), 'mx-baseline-oldname-'));
+  try {
+    const oldName = join(dir, 'baseline-2026-10-11T10-09-23-183Z.json');
+    writeFileSync(oldName, JSON.stringify({ ...buildBaseline([], META), createdAt: '2026-10-11T10:09:23Z' }));
+    const parsed = loadBaseline(oldName);
+    assert.equal(parsed.version, 1);
+    assert.equal(parsed.model, 'gpt-4o');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('diffBaseline flags disjoint identity families as fail cap 0', () => {

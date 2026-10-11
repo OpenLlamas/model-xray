@@ -243,6 +243,47 @@ test('console：color=false 零 ANSI 且含异常要点块；color=true 着色�
   assert.equal(colored.replace(/\u001b\[\d+m/g, ''), plain, '着色仅为装饰');
 });
 
+// ---------- 可信度框架（v0.2.1）：标签 + 固定注记 + 无基线提示 ----------
+
+test('markdown：总分标签为「可信度总分：」且结论后置，null 总分记 未判定', () => {
+  const md = renderMarkdown(sampleReport('x'));
+  assert.match(md, /> 可信度总分：\*\*88\/100\*\* · 结论：\*\*可疑\*\*/);
+  const unknown = { ...sampleReport('x'), total: null, overall: 'unknown' as const };
+  assert.match(renderMarkdown(unknown), /> 可信度总分：\*\*未判定\*\* · 结论：\*\*未判定\*\*/);
+});
+
+test('html/console：总分标签同步为「可信度总分」', () => {
+  const html = renderHtml(sampleReport('x'));
+  assert.ok(html.includes('<strong>可信度总分 88/100</strong>'), html.slice(0, 600));
+  assert.ok(!html.includes('<strong>总分 '));
+  const console_ = renderConsole(sampleReport('x'), { color: false });
+  assert.match(console_, /可信度总分 88\/100 — 可疑/);
+  const unknown = { ...sampleReport('x'), total: null, overall: 'unknown' as const };
+  assert.match(renderConsole(unknown, { color: false }), /可信度总分 未判定 — 证据不足，无法得出结论/);
+});
+
+test('markdown/html：说明段固定追加可信度框架注记（notes 为空也渲染）', () => {
+  const fixedNote = '本报告输出可信度评分与异常证据，不对模型真伪做二元断言；结论与退出码仅供 CI 门禁参考。';
+  const md = renderMarkdown(sampleReport('x'));
+  assert.ok(md.includes(fixedNote), md);
+  const emptyNotes = { ...sampleReport('x'), notes: [] };
+  assert.ok(renderMarkdown(emptyNotes).includes('## 说明'), 'notes 为空时说明段仍应渲染');
+  assert.ok(renderMarkdown(emptyNotes).includes(fixedNote));
+  const html = renderHtml(emptyNotes);
+  assert.ok(html.includes('<h2>说明</h2>'));
+  assert.ok(html.includes(fixedNote));
+});
+
+test('markdown/html/console/json：报告 notes（含无基线提示）在四处渲染器均输出', () => {
+  const hint = '未加载指纹基线：无法对比历史指纹，同族换壳/静默降级不可检测。建议固定基线后用 --baseline 复测。';
+  const report = { ...sampleReport('x'), notes: [hint] };
+  assert.ok(renderMarkdown(report).includes(hint), 'markdown 应渲染 notes');
+  assert.ok(renderHtml(report).includes(hint), 'html 应渲染 notes');
+  assert.ok(renderConsole(report, { color: false }).includes(hint), 'console 应渲染 notes');
+  const parsed = JSON.parse(renderJson(report)) as { notes: string[] };
+  assert.ok(parsed.notes.includes(hint), 'json 序列化整个 report.notes');
+});
+
 // ---------- 本次多模型审查修复的回归测试 ----------
 
 test('summary：pass 级 outcome 携带 warn finding 仍入异常要点（不做 outcome.level 门槛）', () => {

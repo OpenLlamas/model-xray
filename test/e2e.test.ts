@@ -247,8 +247,35 @@ test('e2e price flags produce measured-ratio metrics from balance delta', async 
   }
 });
 
-test('e2e baseline drift appends findings and caps identity before scoring', async () => {
+test('e2e no-baseline run appends 未加载指纹基线 note; with --baseline the note is absent', async () => {
   const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-no-baseline-'));
+  try {
+    // 无基线：notes 必须携带检测边界披露
+    const first = await audit(mock, { seed: 4321 });
+    assert.ok(
+      first.notes.some((n) => n.includes('未加载指纹基线') && n.includes('--baseline 复测')),
+      JSON.stringify(first.notes),
+    );
+    // 带基线：该提示不得出现，且基线对比 note 照常
+    const baseline = buildBaseline(first.outcomes, {
+      model: 'gpt-4o',
+      seed: 4321,
+      probesetVersion: PROBESET_VERSION,
+      assetsVersion: ASSETS_VERSION,
+    });
+    const baselinePath = join(dir, 'base.json');
+    writeFileSync(baselinePath, JSON.stringify(baseline));
+    const second = await audit(mock, { seed: 4321, baselineIn: baselinePath });
+    assert.ok(!second.notes.some((n) => n.includes('未加载指纹基线')), JSON.stringify(second.notes));
+    assert.ok(second.notes.some((n) => n.includes('基线对比')));
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('e2e baseline drift appends findings and caps identity before scoring', async () => {  const mock = await createMockServer({ mode: 'honest' });
   const dir = mkdtempSync(join(tmpdir(), 'mx-baseline-'));
   try {
     const first = await audit(mock, { seed: 4321 });

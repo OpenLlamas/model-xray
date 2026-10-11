@@ -104,10 +104,15 @@ test('cli: honest endpoint exits 0 and writes md/html/json reports', async () =>
     const files = readdirSync(out);
     assert.ok(files.some((f) => f.endsWith('.md')), files.join(','));
     assert.ok(files.some((f) => f.endsWith('.html')), files.join(','));
+    // 文件名新格式：report-<model>-<YYYY-MM-DD_HH-mm-ss>.<ext>（模型名 + 本地时间戳）
+    const nameShape = /^report-.+-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.(md|html|json)$/;
+    const reportFiles = files.filter((f) => nameShape.test(f));
+    assert.equal(reportFiles.length, 3, `报告三件套应为新命名格式：${files.join(',')}`);
     const reportJsonName = files.find((f) => f.startsWith('report-') && f.endsWith('.json'));
     assert.ok(reportJsonName, files.join(','));
     const baselineName = files.find((f) => f.startsWith('baseline-') && f.endsWith('.json'));
     assert.ok(baselineName, files.join(','));
+    assert.match(baselineName, /^baseline-.+-\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.json$/);
     const baseline = JSON.parse(readFileSync(join(out, baselineName), 'utf8')) as {
       version: number;
       model: string;

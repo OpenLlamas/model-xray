@@ -2,12 +2,17 @@ import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../t
 import { levelLabel, statusTag } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 
+/** 固定注记：报告输出可信度评分而非真伪断言（html.ts 同步使用）。 */
+export const CREDIBILITY_NOTE = '本报告输出可信度评分与异常证据，不对模型真伪做二元断言；结论与退出码仅供 CI 门禁参考。';
+
 export function renderMarkdown(report: AuditReport): string {
   const lines: string[] = [];
   const meta = report.meta;
   lines.push(`# model-xray 报告 — ${singleLine(meta.model)}`);
   lines.push('');
-  lines.push(`> 结论：**${levelLabel(report.overall)}** · 总分 **${report.total ?? '未判定'}${report.total === null ? '' : '/100'}**`);
+  lines.push(
+    `> 可信度总分：**${report.total ?? '未判定'}${report.total === null ? '' : '/100'}** · 结论：**${levelLabel(report.overall)}**`,
+  );
   lines.push('');
 
   const anomalies = collectAnomalies(report);
@@ -46,12 +51,12 @@ export function renderMarkdown(report: AuditReport): string {
     lines.push(`| ${entry.id} | ${statusTag(entry.level)} | ${entry.score ?? '-'} | ${weightText(entry)} | ${cell(entry.headline)} |`);
   }
   lines.push('');
-  if (report.notes.length > 0) {
-    lines.push('## 说明');
-    lines.push('');
-    for (const note of report.notes) lines.push(`- ${singleLine(note)}`);
-    lines.push('');
-  }
+  // 说明段固定渲染：无论 report.notes 是否为空，固定注记（CREDIBILITY_NOTE）总是追加在末尾
+  const notes = [...report.notes, CREDIBILITY_NOTE];
+  lines.push('## 说明');
+  lines.push('');
+  for (const note of notes) lines.push(`- ${singleLine(note)}`);
+  lines.push('');
 
   lines.push('## 检测详情');
   lines.push('');
