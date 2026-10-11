@@ -203,7 +203,14 @@ test('guard e2e：SSE usage 入账、本地鉴权 401、凭证注入/隔离、qu
     assert.equal(json.status, 200);
     const parsed = JSON.parse(json.raw) as { model: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } };
     assert.equal(parsed.model, 'gpt-4o');
-    assert.deepEqual(parsed.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 });
+    // guard 字节透传：客户端收到的是 mock 原始嵌套 usage（cached=0、reasoning=min(1,completion)=1）
+    assert.deepEqual(parsed.usage, {
+      prompt_tokens: 10,
+      completion_tokens: 2,
+      total_tokens: 12,
+      prompt_tokens_details: { cached_tokens: 0 },
+      completion_tokens_details: { reasoning_tokens: 1 },
+    });
 
     await delay(300); // 等 finalize/写入队列收尾
     const code = await guard.shutdown();
@@ -227,7 +234,10 @@ test('guard e2e：SSE usage 入账、本地鉴权 401、凭证注入/隔离、qu
     assert.equal(journal.requests.length, 4, `应有 4 条请求行（2×401 + 2×200），实际 ${journal.requests.length}`);
     const sseEntry = journal.requests.find((r) => r.stream === true);
     assert.ok(sseEntry, '应存在流式请求行');
-    assert.deepEqual(sseEntry?.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 });
+    // Usage 契约扩展：SSE 行内路径（honest stream）usage details 闭环——cached=0、reasoning=min(1,completion)=1
+    assert.equal(sseEntry?.usage?.cached_tokens, 0);
+    assert.equal(sseEntry?.usage?.reasoning_tokens, 1);
+    assert.deepEqual(sseEntry?.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, cached_tokens: 0, reasoning_tokens: 1 });
     assert.equal(sseEntry?.usageRejected, null);
     assert.equal(sseEntry?.modelReq, 'gpt-4o');
     assert.equal(sseEntry?.modelResp, 'gpt-4o');
@@ -550,7 +560,14 @@ test('guard e2e：content-type 误标（非流式 JSON 标成 event-stream）→
       // 客户端收到的 body 与 honest 完全一致：单行 JSON（含 usage、model 回显）
       const parsed = JSON.parse(res.raw) as { model: string; usage: { prompt_tokens: number; completion_tokens: number; total_tokens: number } };
       assert.equal(parsed.model, 'gpt-4o');
-      assert.deepEqual(parsed.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 });
+      // guard 字节透传（误标不修正）：客户端收到的是 mock 原始嵌套 usage
+      assert.deepEqual(parsed.usage, {
+        prompt_tokens: 10,
+        completion_tokens: 2,
+        total_tokens: 12,
+        prompt_tokens_details: { cached_tokens: 0 },
+        completion_tokens_details: { reasoning_tokens: 1 },
+      });
     }
 
     await delay(300);
@@ -563,7 +580,10 @@ test('guard e2e：content-type 误标（非流式 JSON 标成 event-stream）→
     assert.equal(journal.requests.length, 3, `应有 3 条请求行，实际 ${journal.requests.length}`);
     for (const entry of journal.requests) {
       assert.equal(entry.deepInspect, true, 'JSON 整体兜底成功 → deepInspect 不得降级为 false');
-      assert.deepEqual(entry.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }, '误标 JSON 的 usage 必须恢复');
+      // Usage 契约扩展：整体 JSON 路径（json-as-sse）usage details 闭环——cached=0、reasoning=min(1,completion)=1
+      assert.equal(entry.usage?.cached_tokens, 0);
+      assert.equal(entry.usage?.reasoning_tokens, 1);
+      assert.deepEqual(entry.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, cached_tokens: 0, reasoning_tokens: 1 }, '误标 JSON 的 usage 必须恢复');
       assert.equal(entry.usageRejected, null);
       assert.equal(entry.modelReq, 'gpt-4o');
       assert.equal(entry.modelResp, 'gpt-4o', 'modelResp 必须从误标 body 捕获');
@@ -633,7 +653,7 @@ test('guard e2e：content-type 误标（SSE body 标成 json）→ data 行兜�
     for (const entry of [streamed, unstreamed]) {
       assert.ok(entry);
       assert.equal(entry.deepInspect, true, 'data 行兜底生效 → deepInspect 保持 true');
-      assert.deepEqual(entry.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }, 'SSE body 的 usage 必须按行恢复');
+      assert.deepEqual(entry.usage, { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, cached_tokens: 0, reasoning_tokens: 1 }, 'SSE body 的 usage 必须按行恢复');
       assert.equal(entry.usageRejected, null);
       assert.equal(entry.modelResp, 'gpt-4o');
       assert.equal(entry.finishReason, 'stop');

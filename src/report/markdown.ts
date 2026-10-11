@@ -1,11 +1,11 @@
-import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
+import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
 import { levelLabel, statusTag } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 
 export function renderMarkdown(report: AuditReport): string {
   const lines: string[] = [];
   const meta = report.meta;
-  lines.push(`# model-xray 报告 — ${meta.model}`);
+  lines.push(`# model-xray 报告 — ${singleLine(meta.model)}`);
   lines.push('');
   lines.push(`> 结论：**${levelLabel(report.overall)}** · 总分 **${report.total ?? '未判定'}${report.total === null ? '' : '/100'}**`);
   lines.push('');
@@ -43,13 +43,13 @@ export function renderMarkdown(report: AuditReport): string {
   lines.push('| 检测项 | 判定 | 得分 | 权重 | 摘要 |');
   lines.push('|---|---|---|---|---|');
   for (const entry of report.scores) {
-    lines.push(`| ${entry.id} | ${statusTag(entry.level)} | ${entry.score ?? '-'} | ${entry.weight === 0 ? '-' : entry.weight} | ${cell(entry.headline)} |`);
+    lines.push(`| ${entry.id} | ${statusTag(entry.level)} | ${entry.score ?? '-'} | ${weightText(entry)} | ${cell(entry.headline)} |`);
   }
   lines.push('');
   if (report.notes.length > 0) {
     lines.push('## 说明');
     lines.push('');
-    for (const note of report.notes) lines.push(`- ${note}`);
+    for (const note of report.notes) lines.push(`- ${singleLine(note)}`);
     lines.push('');
   }
 
@@ -75,7 +75,8 @@ function renderOutcome(outcome: ProbeOutcome): string {
   const lines: string[] = [];
   lines.push(`### ${outcome.id} — ${statusTag(outcome.level)}（${outcome.score ?? '未判定'}）`);
   lines.push('');
-  lines.push(outcome.headline);
+  // headline 可能内嵌上游错误消息（可含换行），单行化避免破坏 Markdown 段落结构。
+  lines.push(singleLine(outcome.headline));
   lines.push('');
   if (outcome.findings.length > 0) {
     for (const finding of outcome.findings) {
@@ -116,10 +117,27 @@ function renderEvidence(record: EvidenceRecord): string {
   return lines.join('\n');
 }
 
+/** 未计入总分的行（status 非 ok / score 缺失）不展示配置权重，避免按表复算总分对不上（总分用归一化后权重）。 */
+function weightText(entry: ScoreEntry): string {
+  const counted = entry.status === 'ok' && typeof entry.score === 'number' && Number.isFinite(entry.score);
+  return counted && entry.weight > 0 ? String(entry.weight) : '-';
+}
+
+// C0（除 \t \n 外）与 C1 控制字符剥离：上游内容可能夹带终端转义序列/控制符，
+// Markdown 报告是渲染边界，剥离后避免查看器异常解析（\r\n 行尾归一在 singleLine 内一并处理）。
+const CONTROL_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g;
+
+function singleLine(text: string): string {
+  return text.replace(/\r\n|\n|\r/g, ' ').replace(CONTROL_RE, '');
+}
+
 function cell(text: string): string {
-  return text.replace(/\|/g, '\\|').replace(/\r?\n/g, ' ').replace(/```/g, '`` `');
+  // 先转义反斜杠再转义管道：原文 `a\|b` 否则会被转成 `a\\|b`，`\\` 渲染为字面反斜杠后管道重新破列。
+  return singleLine(text).replace(/\\/g, '\\\\').replace(/\|/g, '\\|').replace(/```/g, '`` `');
 }
 
 function quote(text: string): string {
-  return text.replace(/\r?\n/g, ' ').replace(/\|/g, '\\|').replace(/```/g, '`` `').slice(0, 500);
+  // quote 仅出现在列表项上下文（非表格行），转义管道只会制造 `\|` 字面噪声；
+  // 先截断再转义：避免转义序列被截断在中间，留下无法配对的半截转义。
+  return singleLine(text.slice(0, 500)).replace(/\\/g, '\\\\').replace(/```/g, '`` `');
 }

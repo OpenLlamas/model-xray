@@ -76,7 +76,7 @@ export async function probeTtft(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const headline =
     serialP50 === null && concurrentP50 === null
       ? 'TTFT 未观测到流式数据（仅观测项）'
-      : `TTFT 观测：串行 p50 ${serialP50}ms / 并发(4) p50 ${concurrentP50}ms（仅观测，不计分）`;
+      : `TTFT 观测：串行 p50 ${serialP50 ?? '-'}ms / 并发(4) p50 ${concurrentP50 ?? '-'}ms（仅观测，不计分）`;
 
   return { id: 'ttft', status: 'insufficient', score: null, level: 'unknown', headline, findings, metrics };
 }

@@ -225,7 +225,7 @@ async function main(argv: string[]): Promise<number> {
 
   const cost = estimateCost(cfg);
   console.error(
-    `预估：约 ${cost.calls} 次请求 / ~${cost.inputTokens.toLocaleString()} 输入 tokens（不含输出与重试；seed=${seed}）。`,
+    `预估：约 ${cost.calls} 次请求 / ~${cost.inputTokens.toLocaleString('en-US')} 输入 tokens（不含输出与重试；seed=${seed}）。`,
   );
 
   if (values['dry-run']) {
@@ -239,7 +239,7 @@ async function main(argv: string[]): Promise<number> {
       return 2;
     }
     const confirmed = await confirm(
-      `将对远程端点发起真实请求（预估 ~${cost.inputTokens.toLocaleString()} tokens 输入）。继续？[y/N] `,
+      `将对远程端点发起真实请求（预估 ~${cost.inputTokens.toLocaleString('en-US')} tokens 输入）。继续？[y/N] `,
     );
     if (!confirmed) {
       console.error('已取消。下一步：确认成本后重跑，加 --yes 可跳过确认；先 --dry-run 可预览请求量。');

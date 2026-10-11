@@ -54,6 +54,18 @@ test('e2e honest endpoint scores 100 with no failures', async () => {
     assert.equal(scoreOf(report, 'capability')?.score, 100);
     assert.equal(scoreOf(report, 'quality')?.score, 100);
     assert.equal(scoreOf(report, 'ttft')?.status ?? 'insufficient', 'insufficient');
+    // Usage 契约扩展：evidence[].response.usage 须携带缓存/推理明细（mock: cached=0、reasoning=min(1,completion)=1）
+    const billed = report.evidence.filter((e) => e.probe === 'billing');
+    assert.ok(billed.length > 0);
+    for (const e of billed) {
+      assert.equal(e.response.usage?.cached_tokens, 0);
+      assert.equal(e.response.usage?.reasoning_tokens, 1);
+    }
+    // billing metrics 三键（snake_case）：cached=0 全样本、reasoning=1/样本、details 全上报
+    const billing = report.outcomes.find((o) => o.id === 'billing');
+    assert.equal(billing?.metrics['cached_tokens_total'], 0);
+    assert.equal(billing?.metrics['reasoning_tokens_total'], billed.length);
+    assert.equal(billing?.metrics['details_reported_count'], billed.length);
   } finally {
     mock.server.close();
   }

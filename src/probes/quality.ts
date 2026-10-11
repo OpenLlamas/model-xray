@@ -159,7 +159,9 @@ export function generateQuestions(rng: Rng): Question[] {
 }
 
 export function checkAnswer(text: string, question: Question): boolean {
-  const numbers = [...text.matchAll(/-?\d+/g)].map((m) => Number(m[0]));
+  // 千分位逗号归一：模型常答 "7,718"，按 -?\d+ 切分会拆成 7 与 718 两个数，漏判正确答案。
+  const normalized = text.replace(/\d{1,3}(?:,\d{3})+/g, (m) => m.replace(/,/g, ''));
+  const numbers = [...normalized.matchAll(/-?\d+/g)].map((m) => Number(m[0]));
   if (question.exclusive && question.exclusive.length > 0) {
     const hasAnswer = numbers.includes(question.answer);
     const hasDistractor = question.exclusive.some((d) => numbers.includes(d));

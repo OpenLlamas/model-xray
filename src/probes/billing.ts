@@ -43,6 +43,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let usageInconsistent = 0;
   let usageInvalid = 0;
   let requests = 0;
+  // usage details 明细（增值观测，不参与回归与评分）：缓存/推理 token 拆分与上报样本数
+  let cachedTokensTotal = 0;
+  let reasoningTokensTotal = 0;
+  let detailsReported = 0;
   const failures: string[] = [];
 
   for (const lang of langs) {
@@ -112,6 +116,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       track.raws.push(result.usage.prompt_tokens);
       allResponses.push(result.usage.prompt_tokens);
       metrics[`prompt_tokens_${lang}_${targetTokens}`] = result.usage.prompt_tokens;
+      // details 明细累计：仅统计通过校验的样本；!= null 判定保证 cached=0 也计数
+      if (result.usage.cached_tokens != null) cachedTokensTotal += result.usage.cached_tokens;
+      if (result.usage.reasoning_tokens != null) reasoningTokensTotal += result.usage.reasoning_tokens;
+      if (result.usage.cached_tokens != null || result.usage.reasoning_tokens != null) detailsReported += 1;
     }
   }
 
@@ -133,11 +141,18 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   }
 
   const constantUsage = allResponses.length >= 3 && new Set(allResponses).size === 1;
+  // 回归是否真正运行过：合计样本 ≥3 但每条轨道都 <3 时，回归循环会整体跳过（track.xs.length<3 continue），
+  // 若不设此门槛会把「零回归证据」误报成 100/pass（线性正常）。constantUsage 分支不受影响（其本身即判据）。
+  const regressionRan = tracks.some((t) => t.xs.length >= 3);
   metrics['requests'] = requests;
   metrics['usage_missing'] = usageMissing;
   metrics['usage_inconsistent'] = usageInconsistent;
   metrics['usage_invalid'] = usageInvalid;
   metrics['constant_usage'] = constantUsage ? 1 : 0;
+  // 缓存/推理明细拆分（对账用：后台可能对缓存输入折价计费）；上游未上报时为 0，reported=0 即全未上报
+  metrics['cached_tokens_total'] = cachedTokensTotal;
+  metrics['reasoning_tokens_total'] = reasoningTokensTotal;
+  metrics['details_reported_count'] = detailsReported;
 
   if (failures.length > 0) {
     findings.push({ level: 'warn', message: `部分计费探针请求失败：${failures.slice(0, 4).join('；')}`, evidenceIds: [] });
@@ -186,7 +201,8 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (enTrack.xs.length >= 3 && zhTrack.xs.length >= 3) {
       const enRatio = linearRegression(enTrack.xs, enTrack.ys).slope;
       const zhRatio = linearRegression(zhTrack.xs, zhTrack.ys).slope;
-      metrics['zh_en_slope_ratio'] = round(zhRatio / Math.max(enRatio, 0.001));
+      // en 斜率非正时 Math.max 兜底会制造天文数字比值，属噪声而非证据：记 N/A 不参与判定
+      metrics['zh_en_slope_ratio'] = enRatio > 0 ? round(zhRatio / enRatio) : 'N/A';
       if (enRatio > 0 && zhRatio / enRatio > 2.5) {
         findings.push({ level: 'warn', message: '中文轨道计费斜率异常高于英文轨道，可能存在按字符数而非 token 计费的伪装。', evidenceIds: [] });
         score = Math.min(score, 55);
@@ -236,7 +252,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     level = 'fail';
     headline = '多数请求不返回 usage，计费不可核验';
     findings.push({ level: 'fail', message: `全部 ${requests} 次请求中 ${usageMissing} 次缺少 usage 字段。`, evidenceIds: [] });
-  } else if (allResponses.length < 3) {
+  } else if (allResponses.length < 3 || (!regressionRan && !constantUsage)) {
     // status=insufficient（score=null）：倍率只出独立 finding，不碰 score/status/level
     if (ratioDecision) findings.push(ratioDecision.finding);
     return {
@@ -244,7 +260,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: '计费探针样本不足（请求失败），无法运行回归',
+      headline: '计费探针有效样本不足（请求失败或单轨道样本 <3），无法运行回归',
       findings,
       metrics,
     };

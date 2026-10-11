@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { dirname, join, resolve } from 'node:path';
 import type { AuditReport } from '../types.js';
 import type { BaselineFile } from '../baseline.js';
@@ -20,7 +21,8 @@ export interface WrittenReports {
  * - finally 兜底：rename 失败时清理残留 tmp，不让 *.tmp 垃圾堆积。
  */
 export function atomicWrite(path: string, data: string): void {
-  const tmp = `${path}.${process.pid}.${Date.now()}.tmp`;
+  // randomUUID 消除同 pid 同毫秒（worker_threads/高并发写）的 tmp 名碰撞类。
+  const tmp = `${path}.${process.pid}.${randomUUID()}.tmp`;
   try {
     writeFileSync(tmp, data, 'utf8');
     renameSync(tmp, path);

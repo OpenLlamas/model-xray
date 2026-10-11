@@ -137,3 +137,35 @@ test('capability tool: second round recovers at 512 → pass', async () => {
   assert.equal(outcome.status, 'ok');
   assert.equal(outcome.level, 'pass');
 });
+
+// ---------- vision：测试图尺寸守卫（8px 图是识别伪影，必须发 256px） ----------
+
+test('capability vision: every request carries a 256x256 PNG (VISION_IMAGE_SIZE, not the 8px artifact)', async () => {
+  const requests: ChatRequest[] = [];
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      requests.push(req);
+      return textResult('red');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  await probeCapability(ctx);
+  // 3 个采样颜色，各 1 次请求（textResult 非截断，无重试）
+  assert.equal(requests.length, 3);
+  for (const req of requests) {
+    const content = req.messages[0]?.content;
+    assert.ok(Array.isArray(content), 'vision 请求应为多模态 content 数组');
+    const imagePart = content.find((part) => typeof part === 'object' && part !== null && (part as unknown as Record<string, unknown>)['type'] === 'image_url') as
+      | { image_url: { url: string } }
+      | undefined;
+    assert.ok(imagePart, 'vision 请求应携带 image_url');
+    const dataUrl = imagePart.image_url.url;
+    assert.ok(dataUrl.startsWith('data:image/png;base64,'));
+    const png = Buffer.from(dataUrl.slice('data:image/png;base64,'.length), 'base64');
+    // PNG IHDR：宽高分别位于第 16-19、20-23 字节（big-endian）
+    assert.equal(png.readUInt32BE(16), 256, `图片宽度应为 256，实际 ${png.readUInt32BE(16)}`);
+    assert.equal(png.readUInt32BE(20), 256, `图片高度应为 256，实际 ${png.readUInt32BE(20)}`);
+  }
+});

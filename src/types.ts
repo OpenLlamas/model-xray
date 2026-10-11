@@ -8,6 +8,16 @@ export interface Usage {
   prompt_tokens: number;
   completion_tokens: number;
   total_tokens: number;
+  /**
+   * prompt_tokens_details.cached_tokens：缓存命中的输入 token，是 prompt_tokens 的子集；
+   * null/缺省 = 上游未上报或未通过子集校验（见 sse.ts validateUsage）。
+   */
+  cached_tokens?: number | null;
+  /**
+   * completion_tokens_details.reasoning_tokens：推理 token，是 completion_tokens 的子集（已计入其中）；
+   * null/缺省 = 上游未上报或未通过子集校验（见 sse.ts validateUsage）。
+   */
+  reasoning_tokens?: number | null;
 }
 
 /** usage 被校验拒绝的原因：missing=缺字段/非数字，negative=负值，inconsistent=total≠分项和 */

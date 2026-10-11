@@ -56,7 +56,14 @@ test('parseStreamPayload: content, reasoning, usage, tool deltas', () => {
 
 test('validateUsage: accepts consistent non-negative usage', () => {
   const { usage, reason } = validateUsage({ prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
-  assert.deepEqual(usage, { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 });
+  // 缺省 details → 两明细字段为 null（上游未上报），核心三字段照常通过
+  assert.deepEqual(usage, {
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 15,
+    cached_tokens: null,
+    reasoning_tokens: null,
+  });
   assert.equal(reason, null);
 });
 
@@ -94,7 +101,13 @@ test('parseStreamPayload: valid usage passes, inconsistent usage is rejected wit
   const good = parseStreamPayload(
     JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }], usage: { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 } }),
   );
-  assert.deepEqual(good?.usage, { prompt_tokens: 2, completion_tokens: 3, total_tokens: 5 });
+  assert.deepEqual(good?.usage, {
+    prompt_tokens: 2,
+    completion_tokens: 3,
+    total_tokens: 5,
+    cached_tokens: null,
+    reasoning_tokens: null,
+  });
   assert.equal(good?.usageReason, null);
 
   const bad = parseStreamPayload(
@@ -106,4 +119,80 @@ test('parseStreamPayload: valid usage passes, inconsistent usage is rejected wit
   const none = parseStreamPayload(JSON.stringify({ choices: [{ index: 0, delta: { content: 'x' }, finish_reason: null }] }));
   assert.equal(none?.usage, null);
   assert.equal(none?.usageReason, null);
+});
+
+// --- Usage 契约扩展：prompt_tokens_details.cached_tokens / completion_tokens_details.reasoning_tokens ---
+
+test('validateUsage: 合法 details 透传（非负整数且为对应核心字段的子集）', () => {
+  const { usage, reason } = validateUsage({
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 15,
+    prompt_tokens_details: { cached_tokens: 4 },
+    completion_tokens_details: { reasoning_tokens: 5 },
+  });
+  assert.equal(reason, null);
+  assert.deepEqual(usage, {
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 15,
+    cached_tokens: 4,
+    reasoning_tokens: 5,
+  });
+});
+
+test('validateUsage: details 边界值（0 与恰等于核心字段）透传', () => {
+  const { usage, reason } = validateUsage({
+    prompt_tokens: 10,
+    completion_tokens: 5,
+    total_tokens: 15,
+    prompt_tokens_details: { cached_tokens: 10 },
+    completion_tokens_details: { reasoning_tokens: 0 },
+  });
+  assert.equal(reason, null);
+  assert.equal(usage?.cached_tokens, 10);
+  assert.equal(usage?.reasoning_tokens, 0);
+});
+
+test('validateUsage: 垃圾 details 形状 → 对应字段 null，绝不抛错且核心字段照常通过', () => {
+  const good = { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 };
+  const cases: Array<{ label: string; extra: Record<string, unknown>; field: 'cached_tokens' | 'reasoning_tokens' }> = [
+    { label: 'details 为字符串', extra: { prompt_tokens_details: 'oops' }, field: 'cached_tokens' },
+    { label: 'details 为数组', extra: { completion_tokens_details: [1] }, field: 'reasoning_tokens' },
+    { label: 'details 为 null', extra: { prompt_tokens_details: null }, field: 'cached_tokens' },
+    { label: '字段为字符串数字', extra: { completion_tokens_details: { reasoning_tokens: '3' } }, field: 'reasoning_tokens' },
+    { label: '负数', extra: { prompt_tokens_details: { cached_tokens: -1 } }, field: 'cached_tokens' },
+    { label: 'NaN', extra: { completion_tokens_details: { reasoning_tokens: Number.NaN } }, field: 'reasoning_tokens' },
+    { label: 'Infinity', extra: { prompt_tokens_details: { cached_tokens: Number.POSITIVE_INFINITY } }, field: 'cached_tokens' },
+    { label: '小数', extra: { completion_tokens_details: { reasoning_tokens: 1.5 } }, field: 'reasoning_tokens' },
+    { label: '超过 prompt_tokens', extra: { prompt_tokens_details: { cached_tokens: 11 } }, field: 'cached_tokens' },
+    { label: '超过 completion_tokens', extra: { completion_tokens_details: { reasoning_tokens: 6 } }, field: 'reasoning_tokens' },
+  ];
+  for (const { label, extra, field } of cases) {
+    const { usage, reason } = validateUsage({ ...good, ...extra });
+    assert.equal(reason, null, label);
+    assert.ok(usage, label);
+    assert.equal(usage[field], null, `${label} → ${field} 应为 null`);
+    assert.equal(usage.prompt_tokens, 10, label);
+    assert.equal(usage.completion_tokens, 5, label);
+    assert.equal(usage.total_tokens, 15, label);
+  }
+});
+
+test('parseStreamPayload: SSE usage 尾行携带 details 时照常透传', () => {
+  const chunk = parseStreamPayload(
+    JSON.stringify({
+      choices: [{ index: 0, delta: {}, finish_reason: 'stop' }],
+      usage: {
+        prompt_tokens: 7,
+        completion_tokens: 4,
+        total_tokens: 11,
+        prompt_tokens_details: { cached_tokens: 2 },
+        completion_tokens_details: { reasoning_tokens: 1 },
+      },
+    }),
+  );
+  assert.equal(chunk?.usageReason, null);
+  assert.equal(chunk?.usage?.cached_tokens, 2);
+  assert.equal(chunk?.usage?.reasoning_tokens, 1);
 });

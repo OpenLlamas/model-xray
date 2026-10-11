@@ -41,13 +41,16 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
     });
   }
 
-  const scorable = scores.filter((s) => s.status === 'ok' && typeof s.score === 'number');
-  const unscorable = scores.filter((s) => !(s.status === 'ok' && typeof s.score === 'number'));
+  // Number.isFinite 守卫：NaN/Infinity 一旦混入按未判定处理（入 unscorable note），
+  // 绝不让其进入对数聚合后被 clampScore 洗成总分 0 的静默错误。
+  const scorable = scores.filter((s) => s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score));
+  const unscorable = scores.filter((s) => !(s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score)));
 
   if (scorable.length < 2) {
     notes.push('可评分项不足（<2），总分未判定，仅展示分项结论。');
     const anyFail = scores.some((s) => s.level === 'fail');
-    return { total: null, overall: anyFail ? 'fail' : 'unknown', scores, notes };
+    const anyWarn = scores.some((s) => s.level === 'warn');
+    return { total: null, overall: anyFail ? 'fail' : anyWarn ? 'warn' : 'unknown', scores, notes };
   }
 
   if (unscorable.length > 0) {

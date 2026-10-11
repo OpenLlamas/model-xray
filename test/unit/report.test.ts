@@ -91,11 +91,20 @@ test('html escapes single quotes and ampersands', () => {
   assert.ok(html.includes('it&#39;s a &amp; b'));
 });
 
-test('markdown escapes pipes and fences, keeps evidence ids', () => {
+test('markdown: quote()（列表上下文）不再转义管道，仍转义反引号围栏', () => {
   const md = renderMarkdown(sampleReport('a|b ``` c'));
   assert.ok(md.includes('ev-001'));
-  assert.ok(md.includes('\\|'));
-  assert.ok(md.includes('`` `'));
+  assert.ok(md.includes('a|b `` ` c'), 'quote 保留字面管道、仍转义围栏');
+  assert.ok(!md.includes('\\|'), '列表上下文的 \\| 是字面噪声，不应出现');
+});
+
+test('markdown: cell()（表格上下文）保持管道转义，破列仍被防住', () => {
+  const report = reportWith(
+    [{ id: 'identity', weight: 15, score: 100, level: 'pass', headline: 'a|b', status: 'ok' }],
+    [],
+  );
+  const md = renderMarkdown(report);
+  assert.ok(md.includes('| identity | PASS | 100 | 15 | a\\|b |'));
 });
 
 test('report json serializes evidence finish_reason in snake_case (explicit mapping, no camelCase key)', () => {
@@ -232,4 +241,97 @@ test('console：color=false 零 ANSI 且含异常要点块；color=true 着色�
   assert.ok(colored.includes('\u001b[31m'), 'fail 项应红');
   assert.ok(colored.includes('\u001b[33m'), 'warn 项应黄');
   assert.equal(colored.replace(/\u001b\[\d+m/g, ''), plain, '着色仅为装饰');
+});
+
+// ---------- 本次多模型审查修复的回归测试 ----------
+
+test('summary：pass 级 outcome 携带 warn finding 仍入异常要点（不做 outcome.level 门槛）', () => {
+  const billingPassWithWarn: ProbeOutcome = {
+    id: 'billing',
+    status: 'ok',
+    score: 95,
+    level: 'pass',
+    headline: 'Token 计数与长度线性关系正常',
+    findings: [{ level: 'warn', message: '端点自报 total_tokens 与 prompt+completion 不一致（第 3 笔）', evidenceIds: ['ev-001'] }],
+    metrics: {},
+  };
+  const report = reportWith(
+    [{ id: 'billing', weight: 25, score: 95, level: 'pass', headline: 'Token 计数与长度线性关系正常', status: 'ok' }],
+    [billingPassWithWarn],
+  );
+  const md = renderMarkdown(report);
+  assert.match(md, /- \*\*WARN\*\* \[billing\] 端点自报 total_tokens/);
+  const html = renderHtml(report);
+  assert.ok(html.includes('<div class="anomaly warn">'), 'pass 级 outcome 的 warn finding 不再漏报「未发现异常」');
+  assert.match(html, /WARN<\/span> <span class="dim">billing<\/span> 端点自报 total_tokens/);
+  assert.match(renderConsole(report), /\[WARN\] *billing: 端点自报 total_tokens/);
+});
+
+test('summary：fail 级 outcome 的 fail/warn findings 只有 warn 时补 headline 合成 FAIL 行（quality 场景）', () => {
+  const qualityFail: ProbeOutcome = {
+    id: 'quality',
+    status: 'ok',
+    score: 55,
+    level: 'fail',
+    headline: '程序化题集正确率过低',
+    findings: [{ level: 'warn', message: '控制题 q1 因推理占满预算未作答', evidenceIds: ['ev-001'] }],
+    metrics: {},
+  };
+  const report = reportWith(
+    [{ id: 'quality', weight: 25, score: 55, level: 'fail', headline: '程序化题集正确率过低', status: 'ok' }],
+    [qualityFail],
+  );
+  const md = renderMarkdown(report);
+  assert.match(md, /- \*\*WARN\*\* \[quality\] 控制题 q1/);
+  assert.match(md, /- \*\*FAIL\*\* \[quality\] 程序化题集正确率过低/, '异常要点区必须有 FAIL 行与分项表口径一致');
+  assert.ok(md.indexOf('- **FAIL** [quality]') < md.indexOf('- **WARN** [quality]'), 'fail 优先排序');
+});
+
+test('report json：顶层为显式契约键序，文件以换行结尾', () => {
+  const json = renderJson(sampleReport('x'));
+  assert.ok(json.endsWith('\n'), 'JSON 文件以 POSIX 换行结尾');
+  const parsed = JSON.parse(json) as Record<string, unknown>;
+  assert.deepEqual(
+    Object.keys(parsed),
+    ['meta', 'total', 'overall', 'scores', 'outcomes', 'evidence', 'notes'],
+    '顶层键为显式版本化契约，防止静默直出漂移',
+  );
+});
+
+test('html：0 条证据时输出明示空态，不再渲染「原始证据（0 条）」悬空标题', () => {
+  const report = { ...sampleReport('x'), evidence: [] };
+  const html = renderHtml(report);
+  assert.ok(!html.includes('原始证据（'));
+  assert.ok(html.includes('本次审计未产生原始证据记录'));
+});
+
+test('console：unknown 行 [N/A] 补齐 6 列、未评分得分列为对齐的 -', () => {
+  const report = reportWith(
+    [
+      failScore,
+      { id: 'ttft', weight: 10, score: null, level: 'unknown', headline: '未判定', status: 'insufficient' },
+    ],
+    [],
+  );
+  const out = renderConsole(report, { color: false });
+  assert.match(out, /\[N\/A\]\s+ttft\s+-/, '[N/A] 5 字符须补齐到 6 列，得分列 - 与其他行对齐');
+});
+
+test('console/markdown：C0/C1 控制字符（终端转义注入）在渲染边界被剥离', () => {
+  const dirtyOutcome: ProbeOutcome = {
+    id: 'identity',
+    status: 'ok',
+    score: 40,
+    level: 'fail',
+    headline: '被注入\u001b[31m红色\u0007',
+    findings: [{ level: 'fail', message: '消息\u0002带控制符', evidenceIds: [] }],
+    metrics: {},
+  };
+  const report = reportWith([failScore], [dirtyOutcome]);
+  const out = renderConsole(report, { color: false });
+  assert.ok(!out.includes('\u001b[31m') && !out.includes('\u0007') && !out.includes('\u0002'), JSON.stringify(out.slice(0, 300)));
+  const md = renderMarkdown(report);
+  assert.ok(!md.includes('\u001b') && !md.includes('\u0007') && !md.includes('\u0002'), 'Markdown 报告同样剥离控制符');
+  // 正文内容保留（只剥控制字节；残留的 "[31m" 是惰性文本，无 ESC 前缀不会被终端解释）
+  assert.ok(md.includes('被注入[31m红色'), JSON.stringify(md.slice(md.indexOf('被注入') - 20, md.indexOf('被注入') + 20)));
 });

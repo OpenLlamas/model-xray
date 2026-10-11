@@ -94,6 +94,8 @@ function renderContent(content: unknown): string {
 }
 
 function truncate(text: string, max: number): string {
-  if (text.length <= max) return text;
-  return `${text.slice(0, max)}…`;
+  // 按 code point 截断：slice 按 UTF-16 code unit 切会把代理对劈成两半，留下孤立代理（渲染为乱码）。
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `${chars.slice(0, max).join('')}…`;
 }

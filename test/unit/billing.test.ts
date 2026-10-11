@@ -1,7 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { applyRatioDecision, decideRatio, type RatioArgs, type RatioDecision } from '../../src/probes/billing.js';
+import { applyRatioDecision, decideRatio, probeBilling, type RatioArgs, type RatioDecision } from '../../src/probes/billing.js';
 import type { BalanceReading, } from '../../src/balance.js';
+import { createEvidenceRecorder } from '../../src/evidence.js';
+import { createRng } from '../../src/random.js';
+import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
 
 function reading(patch: Partial<BalanceReading> = {}): BalanceReading {
   return {
@@ -233,4 +236,110 @@ test('applyRatioDecision guards: non-finite score/cap bypass cap math', () => {
   const keptInfinity = applyRatioDecision(100, 'pass', capInfinity);
   assert.equal(keptInfinity.score, 100);
   assert.equal(keptInfinity.level, 'fail');
+});
+
+// ---------- probeBilling 端到端（mock client，无价格 → 不触发余额查询） ----------
+
+function usageResult(promptTokens: number): ChatResult {
+  return {
+    ok: true,
+    status: 200,
+    finishReason: 'stop',
+    text: 'ok',
+    reasoning: null,
+    usage: { prompt_tokens: promptTokens, completion_tokens: 16, total_tokens: promptTokens + 16 },
+    usageRejected: null,
+    attempts: 1,
+    toolCalls: [],
+    ttftMs: null,
+    durationMs: 1,
+    error: null,
+    raw: '',
+  };
+}
+
+function errorResult(): ChatResult {
+  return {
+    ok: false,
+    status: 500,
+    finishReason: null,
+    text: '',
+    reasoning: null,
+    usage: null,
+    usageRejected: null,
+    attempts: 1,
+    toolCalls: [],
+    ttftMs: null,
+    durationMs: 1,
+    error: 'boom',
+    raw: '',
+  };
+}
+
+function billingCtx(client: OpenAIClient): ProbeCtx {
+  const cfg: RunConfig = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    apiKey: 'k',
+    model: 'gpt-4o',
+    claimedContext: null,
+    expect: [],
+    deep: false,
+    seed: 1,
+    timeoutMs: 1000,
+    retries: 0,
+    outDir: 'reports',
+    html: false,
+    yes: true,
+    quiet: true,
+  };
+  return { client, cfg, rng: createRng(1), evidence: createEvidenceRecorder() };
+}
+
+/** en 请求含英文正文（quick brown fox），zh 请求含中文正文；按轨道与序号给 usage。 */
+function billingClient(onCall: (track: 'en' | 'zh', index: number) => ChatResult): { client: OpenAIClient; requests: ChatRequest[] } {
+  const requests: ChatRequest[] = [];
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  return {
+    requests,
+    client: {
+      baseUrl: 'http://127.0.0.1:0/v1',
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        requests.push(req);
+        const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+        const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+        const index = counters[track];
+        counters[track] += 1;
+        return onCall(track, index);
+      },
+    },
+  };
+}
+
+test('probeBilling: total samples >=3 but every track <3 → insufficient (zero-regression evidence is not a 100/pass)', async () => {
+  // en 5 档中前 2 档成功，zh 仅第 1 档成功：合计 3 个有效样本，但无任何轨道 ≥3
+  const { client } = billingClient((track, index) => {
+    if (track === 'en') return index < 2 ? usageResult(100 + 100 * index) : errorResult();
+    return index === 0 ? usageResult(300) : errorResult();
+  });
+  const ctx = billingCtx(client);
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.match(outcome.headline, /有效样本不足/);
+  assert.equal(outcome.metrics['requests'], 10);
+  // 不应携带「线性关系正常」的满分结论
+  assert.ok(!outcome.findings.some((f) => /线性关系正常/.test(f.message)));
+});
+
+test('probeBilling: non-positive english slope → zh_en_slope_ratio is N/A (no astronomical fake ratio)', async () => {
+  // en 斜率为负（usage 随长度递减）：旧实现 Math.max(enRatio,0.001) 会造出天文数字比值
+  const { client } = billingClient((track, index) =>
+    track === 'en' ? usageResult(900 - 100 * index) : usageResult(1000 + 1000 * index),
+  );
+  const ctx = billingCtx(client);
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.metrics['zh_en_slope_ratio'], 'N/A');
+  // en 斜率异常本身仍出 fail finding（<0.05 区间），不被 ratio 修复吞掉
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /斜率/.test(f.message)), JSON.stringify(outcome.findings));
 });

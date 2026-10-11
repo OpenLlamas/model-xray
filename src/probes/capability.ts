@@ -106,7 +106,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   const recoveredEvidence: string[] = [];
 
   for (const color of picks) {
-    const png = solidRgbPng(8, color.rgb);
+    const png = solidRgbPng(VISION_IMAGE_SIZE, color.rgb);
     const messages: ChatMessage[] = [
       {
         role: 'user',
