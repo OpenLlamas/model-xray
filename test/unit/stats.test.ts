@@ -48,3 +48,11 @@ test('stdev and wilson', () => {
   assert.ok(wilsonLowerBound(-3, 10) >= 0);
   assert.ok(wilsonLowerBound(99, 10) <= 1);
 });
+
+test('wilson guard: non-finite or non-positive totals return 0 (no >1 pseudo-lower-bound, no NaN propagation)', () => {
+  assert.equal(wilsonLowerBound(Number.NaN, 10), 0);
+  assert.equal(wilsonLowerBound(5, Number.NaN), 0);
+  assert.equal(wilsonLowerBound(5, Number.POSITIVE_INFINITY), 0);
+  assert.equal(wilsonLowerBound(5, -1), 0);
+  assert.equal(wilsonLowerBound(5, 0), 0);
+});

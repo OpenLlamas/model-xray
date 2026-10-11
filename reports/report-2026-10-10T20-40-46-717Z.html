@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>model-xray report - glm-5.3-flash</title>
+<style>
+:root{color-scheme:light dark;--ok:#0a7d32;--bad:#c01c28;--warn:#a05a00;--muted:#777;--line:#d8d8d8}
+body{font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;padding:32px;background:#fafafa;color:#1a1a1a}
+main{max-width:960px;margin:0 auto}
+h1{font-size:22px} h2{margin-top:32px;border-bottom:1px solid var(--line);padding-bottom:6px}
+table{border-collapse:collapse;width:100%;background:#fff} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
+th{background:#f0f0f0}
+.badge{display:inline-block;padding:6px 14px;border-radius:6px;font-weight:700;color:#fff;margin-right:8px}
+.badge.ok{background:var(--ok)} .badge.bad{background:var(--bad)} .badge.warn{background:var(--warn)}
+.tag{font-weight:700;white-space:nowrap}.tag.pass{color:var(--ok)} .tag.fail{color:var(--bad)} .tag.warn{color:var(--warn)} .tag.unknown{color:var(--muted)}
+.ev{margin:8px 0;border:1px solid var(--line);background:#fff;border-radius:4px;padding:8px 12px}
+.ev summary{cursor:pointer;font-weight:600}
+.ev pre{white-space:pre-wrap;word-break:break-all;background:#f6f6f6;padding:8px;border-radius:4px;font-size:13px}
+.muted{color:var(--muted);font-size:13px}
+.anomaly{margin:16px 0;padding:10px 14px;border-radius:6px;border:1px solid}
+.anomaly.fail{background:#fdecea;border-color:#e6a5a0;color:#7a1218}
+.anomaly.warn{background:#fff4e0;border-color:#e0b25a;color:#6b4400}
+.anomaly.ok{background:#e8f6ec;border-color:#9ccfae;color:#0a5c26}
+.anomaly-title{font-weight:700;margin-bottom:6px}
+.anomaly ul{margin:0;padding-left:20px}
+.anomaly .dim{font-weight:700}
+@media (prefers-color-scheme:dark){
+body{background:#161616;color:#e8e8e8}table{background:#1f1f1f}th{background:#2a2a2a}.ev{background:#1f1f1f}.ev pre{background:#2a2a2a}:root{--line:#3a3a3a;--muted:#999}
+.anomaly.fail{background:#3a1214;color:#ffb4ae;border-color:#6e2a2e}
+.anomaly.warn{background:#33260d;color:#ffd48a;border-color:#6e5522}
+.anomaly.ok{background:#0f2a18;color:#8fdca8;border-color:#2c5a3c}
+}
+</style>
+</head>
+<body><main>
+<h1>model-xray 报告 — glm-5.3-flash</h1>
+<p><span class="badge bad">不通过</span><strong>总分 45/100</strong></p>
+<div class="anomaly fail">
+<div class="anomaly-title">异常要点（2 项）</div>
+<ul><li><span class="tag fail">FAIL</span> <span class="dim">capability</span> vision 可疑：仅 1/3 次识别正确（8 色随机，全部正确且无失败才通过）。 <span class="muted">(ev-015, ev-016, ev-017)</span></li>
+<li><span class="tag fail">FAIL</span> <span class="dim">capability</span> 工具结果回传后未能完成第二轮确认（响应中未包含 nonce），往返调用不完整。 <span class="muted">(ev-019)</span></li></ul>
+</div>
+<p class="muted">端点 http://llamas.nat100.top/v1 · seed 663338421 · 题集 v0.2.0 · 2026-10-10T20:38:19.194Z · 耗时 147.5s · model-xray 0.2.0</p>
+
+<h2>分项得分</h2>
+<table><thead><tr><th>检测项</th><th>判定</th><th>得分</th><th>权重</th><th>摘要</th></tr></thead><tbody>
+<tr><td>identity<div class="muted">身份与指纹：多角度自述问答与行为指纹比对，识破换标签/套皮；评分依据：自述一致性与指纹命中</div></td><td class="tag pass">PASS</td><td>100</td><td>15</td><td>身份探针未见异常</td></tr>
+<tr><td>context<div class="muted">长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率</div></td><td class="tag unknown">N/A</td><td>-</td><td>15</td><td>未提供 --claimed-context，跳过上下文实测</td></tr>
+<tr><td>billing<div class="muted">token 计量与线性：端点自报 usage 对比本地 tokenizer 实算；评分依据：偏差幅度与线性度</div></td><td class="tag pass">PASS</td><td>100</td><td>25</td><td>Token 计数与长度线性关系正常</td></tr>
+<tr><td>capability<div class="muted">标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率</div></td><td class="tag fail">FAIL</td><td>25</td><td>10</td><td>标称能力实测失败：存在宣称但不可用的能力</td></tr>
+<tr><td>quality<div class="muted">程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率</div></td><td class="tag pass">PASS</td><td>100</td><td>25</td><td>质量题集通过：主题 12/12（控制题全对）</td></tr>
+<tr><td>ttft<div class="muted">流式首字延迟：采样 TTFT 分位数；评分依据：p50/p95 分段阈值</div></td><td class="tag unknown">N/A</td><td>-</td><td>10</td><td>TTFT 观测：串行 p50 1865ms / 并发(4) p50 2211ms（仅观测，不计分）</td></tr>
+</tbody></table>
+
+<h2>说明</h2><ul><li>seed=663338421：同一 seed 与同一端点可复现探针内容；真实模型输出仍可能因服务端非确定性略有波动。</li><li>TTFT 为观测项，不计入总分。</li><li>诱饵请求仅记录行为供人工复核。</li><li>未判定项（不参与总分，权重已重新归一化）：context(未提供 --claimed-context，跳过上下文实测)、ttft(TTFT 观测：串行 p50 1865ms / 并发(4) p50 2211ms（仅观测，不计分）)</li><li>硬红线触发（capability &lt; 40），总分上限 45。</li></ul>
+
+<h2>检测详情</h2>
+<h3>identity — <span class="tag pass">PASS</span> (100)</h3>
+<p>身份探针未见异常</p>
+<ul><li><span class="tag unknown">INFO</span> 共采样 3 次自述 + 1 次格式合规探针。</li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>samples</td><td>3</td></tr><tr><td>identical_samples</td><td>0</td></tr><tr><td>schema_compliant</td><td>1</td></tr><tr><td>refusals</td><td>0</td></tr><tr><td>families</td><td>glm</td></tr></tbody></table>
+<h3>context — <span class="tag unknown">N/A</span> (未判定)</h3>
+<p>未提供 --claimed-context，跳过上下文实测</p>
+<ul><li><span class="tag unknown">INFO</span> 提供标称上下文窗口后本项才会执行。</li></ul>
+
+<h3>billing — <span class="tag pass">PASS</span> (100)</h3>
+<p>Token 计数与长度线性关系正常</p>
+<ul><li><span class="tag unknown">INFO</span> 余额端点不可用：未命中任何已知余额查询接口，实测倍率无法验证（中转站可通过禁用余额接口规避此项，建议在其后台人工核对）。</li>
+<li><span class="tag unknown">INFO</span> token 估计为保守估算（非精确 tokenizer），判据使用回归一致性而非绝对相等。</li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>prompt_tokens_en_2000</td><td>1358</td></tr><tr><td>prompt_tokens_en_4000</td><td>2678</td></tr><tr><td>prompt_tokens_en_8000</td><td>5299</td></tr><tr><td>prompt_tokens_en_16000</td><td>10540</td></tr><tr><td>prompt_tokens_en_24000</td><td>15780</td></tr><tr><td>prompt_tokens_zh_2000</td><td>1102</td></tr><tr><td>prompt_tokens_zh_4000</td><td>2167</td></tr><tr><td>prompt_tokens_zh_8000</td><td>4267</td></tr><tr><td>prompt_tokens_zh_16000</td><td>8494</td></tr><tr><td>prompt_tokens_zh_24000</td><td>12723</td></tr><tr><td>expected_cost</td><td>0.013</td></tr><tr><td>ratio_samples</td><td>10</td></tr><tr><td>ratio_dropped</td><td>0</td></tr><tr><td>requests</td><td>10</td></tr><tr><td>usage_missing</td><td>0</td></tr><tr><td>usage_inconsistent</td><td>0</td></tr><tr><td>usage_invalid</td><td>0</td></tr><tr><td>constant_usage</td><td>0</td></tr><tr><td>slope_en</td><td>0.656</td></tr><tr><td>r2_en</td><td>1</td></tr><tr><td>intercept_en</td><td>12.307</td></tr><tr><td>slope_zh</td><td>0.528</td></tr><tr><td>r2_zh</td><td>1</td></tr><tr><td>intercept_zh</td><td>17.879</td></tr><tr><td>zh_en_slope_ratio</td><td>0.806</td></tr><tr><td>measured_ratio</td><td>N/A</td></tr></tbody></table>
+<h3>capability — <span class="tag fail">FAIL</span> (25)</h3>
+<p>标称能力实测失败：存在宣称但不可用的能力</p>
+<ul><li><span class="tag fail">FAIL</span> vision 可疑：仅 1/3 次识别正确（8 色随机，全部正确且无失败才通过）。 <span class="muted">(ev-015, ev-016, ev-017)</span></li>
+<li><span class="tag fail">FAIL</span> 工具结果回传后未能完成第二轮确认（响应中未包含 nonce），往返调用不完整。 <span class="muted">(ev-019)</span></li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>claimed</td><td>vision,tool</td></tr><tr><td>vision</td><td>partial</td></tr><tr><td>tool</td><td>fail</td></tr></tbody></table>
+<h3>decoy — <span class="tag unknown">N/A</span> (未判定)</h3>
+<p>诱饵请求已记录（不计分，供人工复核）</p>
+<ul><li><span class="tag unknown">INFO</span> 诱饵任务「把这句话翻译成英文：今天天气很好。…」响应 为空/截断（推理占满预算），记录用于对照端点对无关请求的行为。 <span class="muted">(ev-020)</span></li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>response_chars</td><td>0</td></tr></tbody></table>
+<h3>quality — <span class="tag pass">PASS</span> (100)</h3>
+<p>质量题集通过：主题 12/12（控制题全对）</p>
+<ul><li><span class="tag unknown">INFO</span> 题集为程序化生成（seed=663338421），答案可在报告中复算；控制题全对用于排除端点整体故障。</li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>main</td><td>12/12</td></tr><tr><td>controls</td><td>3/3</td></tr><tr><td>excluded</td><td>0</td></tr></tbody></table>
+<h3>ttft — <span class="tag unknown">N/A</span> (未判定)</h3>
+<p>TTFT 观测：串行 p50 1865ms / 并发(4) p50 2211ms（仅观测，不计分）</p>
+<ul><li><span class="tag unknown">INFO</span> TTFT 观测：串行 p50 1865ms，并发(c=4) p50 2211ms。仅采样不计分；绝对延迟受网络与地域影响，不可单独定罪。</li></ul>
+<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody><tr><td>serial_samples</td><td>5</td></tr><tr><td>concurrent_samples</td><td>12</td></tr><tr><td>serial_p50_ms</td><td>1865</td></tr><tr><td>serial_p95_ms</td><td>2791</td></tr><tr><td>concurrent_c4_p50_ms</td><td>2211</td></tr><tr><td>concurrent_c4_p95_ms</td><td>4352</td></tr></tbody></table>
+
+<h2>原始证据（53 条）</h2>
+<details class="ev"><summary>ev-001 · identity · self-id: 你是什么模型？你的训练机构是谁？请直接回答，不要</summary>
+<p class="muted">HTTP 200 · 4993ms · usage: prompt=28 completion=264 total=292</p>
+
+<pre>请求: 你是什么模型？你的训练机构是谁？请直接回答，不要回避。</pre>
+<pre>响应: 我是由Z.ai训练的GLM大语言模型。我的训练过程涉及大规模文本数据学习和持续优化，旨在提供有用、安全的AI助手服务。
+
+Z.ai是我的开发机构，他们基于GLM架构对我进行了训练和改进。我的设计目标是帮助用户解决问题、提供信息和创意支持，同时尊重用户隐私，不会存储您的个人数据。
+
+有什么特定问题或任务我可以帮您解决吗？</pre>
+</details>
+<details class="ev"><summary>ev-002 · identity · self-id: Which AI model are you? </summary>
+<p class="muted">HTTP 200 · 5766ms · usage: prompt=25 completion=124 total=149</p>
+
+<pre>请求: Which AI model are you? Answer with your model name only.</pre>
+<pre>响应: I&#39;m GLM, a large language model developed by Z.ai. 
+
+I&#39;m designed to be helpful, harmless, and honest in my interactions while maintaining your privacy. Is there something specific I can help you with today?</pre>
+</details>
+<details class="ev"><summary>ev-003 · identity · self-id: State your exact model n</summary>
+<p class="muted">HTTP 200 · 1661ms · usage: prompt=29 completion=45 total=74</p>
+
+<pre>请求: State your exact model name and the organization that created you, in one short sentence.</pre>
+<pre>响应: I am GLM, a large language model developed and trained by Z.ai.</pre>
+</details>
+<details class="ev"><summary>ev-004 · identity · json-schema compliance</summary>
+<p class="muted">HTTP 200 · 10113ms · usage: prompt=49 completion=410 total=459</p>
+
+<pre>请求: Return a JSON object with exactly these keys: &quot;self_name&quot; (your model name) and &quot;context_window&quot; (your advertised context window in tokens, integer). Output JSON only.</pre>
+<pre>响应: ```json
+{&quot;self_name&quot;: &quot;Kimi&quot;, &quot;context_window&quot;: 128000}
+```</pre>
+</details>
+<details class="ev"><summary>ev-005 · billing · billing en target=2000</summary>
+<p class="muted">HTTP 200 · 1285ms · usage: prompt=1358 completion=16 total=1374</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-006 · billing · billing en target=4000</summary>
+<p class="muted">HTTP 200 · 2198ms · usage: prompt=2678 completion=16 total=2694</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-007 · billing · billing en target=8000</summary>
+<p class="muted">HTTP 200 · 2136ms · usage: prompt=5299 completion=16 total=5315</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-008 · billing · billing en target=16000</summary>
+<p class="muted">HTTP 200 · 3321ms · usage: prompt=10540 completion=16 total=10556</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-009 · billing · billing en target=24000</summary>
+<p class="muted">HTTP 200 · 3223ms · usage: prompt=15780 completion=16 total=15796</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. The quick brown fox jumps over the lazy dog…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-010 · billing · billing zh target=2000</summary>
+<p class="muted">HTTP 200 · 1372ms · usage: prompt=1102 completion=16 total=1118</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-011 · billing · billing zh target=4000</summary>
+<p class="muted">HTTP 200 · 2514ms · usage: prompt=2167 completion=16 total=2183</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-012 · billing · billing zh target=8000</summary>
+<p class="muted">HTTP 200 · 1492ms · usage: prompt=4267 completion=16 total=4283</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-013 · billing · billing zh target=16000</summary>
+<p class="muted">HTTP 200 · 2968ms · usage: prompt=8494 completion=16 total=8510</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-014 · billing · billing zh target=24000</summary>
+<p class="muted">HTTP 200 · 1534ms · usage: prompt=12723 completion=16 total=12739</p>
+
+<pre>请求: 请逐字复述下面这段文本，不要添加任何其他内容。
+
+工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，…</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-015 · capability · vision color=purple</summary>
+<p class="muted">HTTP 200 · 3141ms · usage: prompt=65 completion=78 total=143</p>
+
+<pre>请求: 图中是一个纯色方块。它的颜色必须是以下之一：red, green, blue, purple, pink, orange, brown, gray。只回答一个英文颜色单词。[image]</pre>
+<pre>响应: purple</pre>
+</details>
+<details class="ev"><summary>ev-016 · capability · vision color=gray</summary>
+<p class="muted">HTTP 200 · 3403ms · usage: prompt=65 completion=82 total=147</p>
+
+<pre>请求: 图中是一个纯色方块。它的颜色必须是以下之一：red, green, blue, purple, pink, orange, brown, gray。只回答一个英文颜色单词。[image]</pre>
+<pre>响应: blue</pre>
+</details>
+<details class="ev"><summary>ev-017 · capability · vision color=pink</summary>
+<p class="muted">HTTP 200 · 2766ms · usage: prompt=65 completion=82 total=147</p>
+
+<pre>请求: 图中是一个纯色方块。它的颜色必须是以下之一：red, green, blue, purple, pink, orange, brown, gray。只回答一个英文颜色单词。[image]</pre>
+<pre>响应: purple</pre>
+</details>
+<details class="ev"><summary>ev-018 · capability · tool roundtrip call nonce=VPPQ8F</summary>
+<p class="muted">HTTP 200 · 7395ms · usage: prompt=187 completion=72 total=259</p>
+
+<pre>请求: 你必须调用 echo_nonce 工具，把参数 nonce 设为 &quot;VPPQ8F&quot;。不要直接回复文字。</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-019 · capability · tool roundtrip result nonce=VPPQ8F</summary>
+<p class="muted">HTTP 200 · 3171ms · usage: prompt=58 completion=88 total=146</p>
+
+<pre>请求: ok</pre>
+<pre>响应: 已完成。</pre>
+</details>
+<details class="ev"><summary>ev-020 · decoy · decoy task</summary>
+<p class="muted">HTTP 200 · 5211ms · usage: prompt=22 completion=120 total=142</p>
+
+<pre>请求: 把这句话翻译成英文：今天天气很好。</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-021 · quality · main double</summary>
+<p class="muted">HTTP 200 · 1347ms · usage: prompt=30 completion=18 total=48</p>
+
+<pre>请求: Multiply 52 by 2 and then subtract 7. Answer with the number only.</pre>
+<pre>响应: 97</pre>
+</details>
+<details class="ev"><summary>ev-022 · quality · main seq</summary>
+<p class="muted">HTTP 200 · 4102ms · usage: prompt=34 completion=44 total=78</p>
+
+<pre>请求: 数列 20, 33, 46, 59 的下一项是多少？只回答数字。</pre>
+<pre>响应: 72</pre>
+</details>
+<details class="ev"><summary>ev-023 · quality · main mod</summary>
+<p class="muted">HTTP 200 · 4539ms · usage: prompt=27 completion=108 total=135</p>
+
+<pre>请求: 371 除以 13 的余数是多少？只回答数字。</pre>
+<pre>响应: 7</pre>
+</details>
+<details class="ev"><summary>ev-024 · quality · control control-months</summary>
+<p class="muted">HTTP 200 · 1858ms · usage: prompt=20 completion=60 total=80</p>
+
+<pre>请求: 一年有几个月？只回答数字。</pre>
+<pre>响应: 12</pre>
+</details>
+<details class="ev"><summary>ev-025 · quality · main days</summary>
+<p class="muted">HTTP 200 · 2995ms · usage: prompt=25 completion=14 total=39</p>
+
+<pre>请求: 4 days equal how many hours? Answer with the number only.</pre>
+<pre>响应: 96</pre>
+</details>
+<details class="ev"><summary>ev-026 · quality · main compare</summary>
+<p class="muted">HTTP 200 · 2166ms · usage: prompt=39 completion=65 total=104</p>
+
+<pre>请求: 比较这两组数的和：39 + 73 与 67 + 32，哪一组更大？只回答较大的那个和。</pre>
+<pre>响应: **112**（即 39 + 73 = 112，大于 67 + 32 = 99）</pre>
+</details>
+<details class="ev"><summary>ev-027 · quality · main count</summary>
+<p class="muted">HTTP 200 · 5098ms · usage: prompt=54 completion=256 total=310</p>
+
+<pre>请求: 字符串 &quot;pxaghbxlxonyfkpgnckxsnxdjtcxdxwvusxrpwdd&quot; 中包含几个字符 x（小写字母 x）？只回答数字。</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-028 · quality · main count (retry@512)</summary>
+<p class="muted">HTTP 200 · 5647ms · usage: prompt=54 completion=452 total=506</p>
+
+<pre>请求: 字符串 &quot;pxaghbxlxonyfkpgnckxsnxdjtcxdxwvusxrpwdd&quot; 中包含几个字符 x（小写字母 x）？只回答数字。</pre>
+<pre>响应: 8</pre>
+</details>
+<details class="ev"><summary>ev-029 · quality · main percent</summary>
+<p class="muted">HTTP 200 · 2795ms · usage: prompt=24 completion=51 total=75</p>
+
+<pre>请求: 200 的 35% 是多少？只回答数字。</pre>
+<pre>响应: 70</pre>
+</details>
+<details class="ev"><summary>ev-030 · quality · main json-sub</summary>
+<p class="muted">HTTP 200 · 3156ms · usage: prompt=40 completion=44 total=84</p>
+
+<pre>请求: Given the JSON {&quot;a&quot;: 518, &quot;b&quot;: 51}, what is a minus b? Answer with the number only.</pre>
+<pre>响应: 467</pre>
+</details>
+<details class="ev"><summary>ev-031 · quality · control control-mul</summary>
+<p class="muted">HTTP 200 · 1460ms · usage: prompt=26 completion=27 total=53</p>
+
+<pre>请求: 6 × 5 等于多少？只回答数字。</pre>
+<pre>响应: 30</pre>
+</details>
+<details class="ev"><summary>ev-032 · quality · main even</summary>
+<p class="muted">HTTP 200 · 2988ms · usage: prompt=33 completion=54 total=87</p>
+
+<pre>请求: 以下哪个数是偶数：153, 70, 137？只回答那一个数字。</pre>
+<pre>响应: 70</pre>
+</details>
+<details class="ev"><summary>ev-033 · quality · main area</summary>
+<p class="muted">HTTP 200 · 6040ms · usage: prompt=30 completion=45 total=75</p>
+
+<pre>请求: 一个长方形长 70 宽 16，面积是多少？只回答数字。</pre>
+<pre>响应: 1120</pre>
+</details>
+<details class="ev"><summary>ev-034 · quality · control control-add</summary>
+<p class="muted">HTTP 200 · 2452ms · usage: prompt=26 completion=38 total=64</p>
+
+<pre>请求: 6 + 8 等于多少？只回答数字。</pre>
+<pre>响应: 14</pre>
+</details>
+<details class="ev"><summary>ev-035 · quality · main mul-add</summary>
+<p class="muted">HTTP 200 · 6263ms · usage: prompt=29 completion=25 total=54</p>
+
+<pre>请求: 计算 77 × 77 + 23 的值。只回答最终数字。</pre>
+<pre>响应: 5952</pre>
+</details>
+<details class="ev"><summary>ev-036 · quality · main mul</summary>
+<p class="muted">HTTP 200 · 3421ms · usage: prompt=32 completion=56 total=88</p>
+
+<pre>请求: 一箱有 86 个苹果，22 箱共有多少个？只回答数字。</pre>
+<pre>响应: 1892</pre>
+</details>
+<details class="ev"><summary>ev-037 · ttft · ttft serial #1</summary>
+<p class="muted">HTTP 200 · 2953ms · TTFT 2945ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-038 · ttft · ttft serial #2</summary>
+<p class="muted">HTTP 200 · 1163ms · TTFT 964ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-039 · ttft · ttft serial #3</summary>
+<p class="muted">HTTP 200 · 1867ms · TTFT 1865ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-040 · ttft · ttft serial #4</summary>
+<p class="muted">HTTP 200 · 1030ms · TTFT 884ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-041 · ttft · ttft serial #5</summary>
+<p class="muted">HTTP 200 · 2176ms · TTFT 2175ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-042 · ttft · ttft concurrent r1 #1</summary>
+<p class="muted">HTTP 200 · 1979ms · TTFT 1398ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-043 · ttft · ttft concurrent r1 #4</summary>
+<p class="muted">HTTP 200 · 2142ms · TTFT 1991ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-044 · ttft · ttft concurrent r1 #2</summary>
+<p class="muted">HTTP 200 · 2870ms · TTFT 2838ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-045 · ttft · ttft concurrent r1 #3</summary>
+<p class="muted">HTTP 200 · 3380ms · TTFT 3350ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-046 · ttft · ttft concurrent r2 #1</summary>
+<p class="muted">HTTP 200 · 1176ms · TTFT 970ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-047 · ttft · ttft concurrent r2 #3</summary>
+<p class="muted">HTTP 200 · 2176ms · TTFT 2174ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-048 · ttft · ttft concurrent r2 #4</summary>
+<p class="muted">HTTP 200 · 2463ms · TTFT 2431ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-049 · ttft · ttft concurrent r2 #2</summary>
+<p class="muted">HTTP 200 · 5743ms · TTFT 5577ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-050 · ttft · ttft concurrent r3 #1</summary>
+<p class="muted">HTTP 200 · 1254ms · TTFT 1097ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-051 · ttft · ttft concurrent r3 #4</summary>
+<p class="muted">HTTP 200 · 2081ms · TTFT 2078ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-052 · ttft · ttft concurrent r3 #2</summary>
+<p class="muted">HTTP 200 · 2275ms · TTFT 2248ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+<details class="ev"><summary>ev-053 · ttft · ttft concurrent r3 #3</summary>
+<p class="muted">HTTP 200 · 2773ms · TTFT 2741ms · usage: prompt=19 completion=8 total=27</p>
+
+<pre>请求: 请只回复一个词：pong</pre>
+<pre>响应: </pre>
+</details>
+</main></body></html>

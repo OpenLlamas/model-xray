@@ -15,18 +15,22 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
   const color = opts?.color ?? false;
   const lines: string[] = [];
   const meta = report.meta;
-  lines.push(`model-xray ${meta.tool} · model: ${meta.model} · endpoint: ${meta.baseUrl}`);
+  lines.push(`model-xray ${meta.tool} · model: ${stripControl(meta.model)} · endpoint: ${stripControl(meta.baseUrl)}`);
   lines.push(`seed ${meta.seed} · probeset ${meta.probesetVersion} · assets ${meta.assetsVersion}`);
-  if (meta.claimedContext) lines.push(`claimed context: ${meta.claimedContext.toLocaleString()} tokens`);
+  // 固定 en-US 分组：toLocaleString() 默认随机器 locale 变化，跨机器输出不可比
+  if (meta.claimedContext) lines.push(`claimed context: ${meta.claimedContext.toLocaleString('en-US')} tokens`);
   lines.push('');
 
   for (const entry of report.scores) {
     const score = entry.score === null ? '  -' : String(entry.score).padStart(3, ' ');
-    lines.push(`${colorize(`[${statusTag(entry.level)}]`, entry.level, color)} ${entry.id.padEnd(10)} ${score}  ${entry.headline}`);
+    const tag = colorize(`[${statusTag(entry.level)}]`.padEnd(6), entry.level, color);
+    lines.push(`${tag} ${entry.id.padEnd(10)} ${score}  ${stripControl(entry.headline)}`);
   }
   for (const outcome of report.outcomes) {
     if (report.scores.some((s) => s.id === outcome.id)) continue;
-    lines.push(`${colorize(`[${statusTag(outcome.level)}]`, outcome.level, color)} ${outcome.id.padEnd(10)}  -   ${outcome.headline}`);
+    // 分值列占位与评分行完全一致（`  -` 三字符），保证 - 与数字同列。
+    const tag = colorize(`[${statusTag(outcome.level)}]`.padEnd(6), outcome.level, color);
+    lines.push(`${tag} ${outcome.id.padEnd(10)}   -  ${stripControl(outcome.headline)}`);
   }
 
   lines.push('');
@@ -37,14 +41,20 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
   } else {
     for (const a of anomalies) {
       const refs = a.evidenceIds.length > 0 ? ` (${a.evidenceIds.join(', ')})` : '';
-      lines.push(`  ${colorize(`[${a.level.toUpperCase()}]`, a.level, color)} ${a.probe}: ${a.message}${refs}`);
+      lines.push(`  ${colorize(`[${a.level.toUpperCase()}]`, a.level, color)} ${a.probe}: ${stripControl(a.message)}${refs}`);
     }
   }
 
   lines.push('');
   lines.push('='.repeat(56));
   if (report.total === null) {
-    lines.push(report.overall === 'fail' ? '总分 未判定 — 存在失败项，结论：不通过' : '总分 未判定 — 证据不足，无法得出结论');
+    const reason =
+      report.overall === 'fail'
+        ? '存在失败项，结论：不通过'
+        : report.overall === 'warn'
+          ? '存在可疑项，结论：可疑'
+          : '证据不足，无法得出结论';
+    lines.push(`总分 未判定 — ${reason}`);
   } else {
     lines.push(colorize(`总分 ${report.total}/100 — ${levelLabel(report.overall)}`, report.overall, color));
   }
@@ -62,4 +72,13 @@ export function summarizeEvidence(records: readonly EvidenceRecord[], probe: str
 
 export function renderOutcomeHeadline(outcome: ProbeOutcome): string {
   return `${outcome.headline}${outcome.status === 'insufficient' ? '（证据不足）' : ''}`;
+}
+
+/**
+ * 剥离 C0/C1 控制字符（含 ESC/CSI/OSC 序列头与 \t）。
+ * 被审端点天然不可信：其错误体/生成文本可能携带终端转义序列，经 findings/headline
+ * 进入控制台输出即可清屏、改写剪贴板（OSC 52）等。渲染边界统一剥离；报告 JSON 保留原文。
+ */
+function stripControl(text: string): string {
+  return text.replace(/[\r\n\t]/g, ' ').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/g, '');
 }

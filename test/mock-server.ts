@@ -554,7 +554,7 @@ function sendStarvedReply(
   res.end();
 }
 
-function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, number>, stream: boolean, model: string): void {
+function sendToolCall(res: ServerResponse, nonce: string, usage: MockUsage, stream: boolean, model: string): void {
   const args = JSON.stringify({ nonce });
   if (!stream) {
     sendJson(res, 200, {
@@ -585,7 +585,15 @@ function sendToolCall(res: ServerResponse, nonce: string, usage: Record<string, 
   res.end();
 }
 
-function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string): Record<string, number> {
+interface MockUsage {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  prompt_tokens_details: { cached_tokens: number };
+  completion_tokens_details: { reasoning_tokens: number };
+}
+
+function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string): MockUsage {
   let prompt: number;
   let completion: number;
   let total: number;
@@ -612,7 +620,15 @@ function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: st
   }
   // 可编程余额模式：按本笔 usage 累加成本（$/M 价格核算，与 guard 侧 --price-* 同式）
   behavior.costAccumulated += (prompt * behavior.priceInput + completion * behavior.priceOutput) / 1e6;
-  return { prompt_tokens: prompt, completion_tokens: completion, total_tokens: total };
+  // 真机实证（glm-5.3-flash）：中转会上报缓存/推理明细（completion_tokens 含推理）。
+  // cached=0（未命中缓存）；reasoning=min(1, completion) 防止 completion=0 时 reasoning>completion 违反子集不变量。
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: total,
+    prompt_tokens_details: { cached_tokens: 0 },
+    completion_tokens_details: { reasoning_tokens: Math.min(1, completion) },
+  };
 }
 
 function textOf(message: Record<string, unknown>): string {

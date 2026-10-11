@@ -97,6 +97,8 @@ export interface StreamChunk {
  * - 任一字段缺失/非有限数字 → usage null + 'missing'；
  * - 任一字段为负 → usage null + 'negative'；
  * - total_tokens !== prompt_tokens + completion_tokens → usage null + 'inconsistent'（疑似计费字段篡改）。
+ * 核心三字段通过后安全透传 details 明细（cached/reasoning）：形状错位或违反子集不变量时对应字段为 null，
+ * 绝不抛错、绝不影响拒收判定（拒收判据仍仅：缺核心字段/负值/total≠分项和）。
  */
 export function validateUsage(value: unknown): { usage: Usage | null; reason: UsageRejection | null } {
   if (typeof value !== 'object' || value === null) return { usage: null, reason: 'missing' };
@@ -115,9 +117,30 @@ export function validateUsage(value: unknown): { usage: Usage | null; reason: Us
     return { usage: null, reason: 'inconsistent' };
   }
   return {
-    usage: { prompt_tokens: prompt as number, completion_tokens: completion as number, total_tokens: total as number },
+    usage: {
+      prompt_tokens: prompt as number,
+      completion_tokens: completion as number,
+      total_tokens: total as number,
+      cached_tokens: extractDetailTokens(u['prompt_tokens_details'], 'cached_tokens', prompt as number),
+      reasoning_tokens: extractDetailTokens(u['completion_tokens_details'], 'reasoning_tokens', completion as number),
+    },
     reason: null,
   };
+}
+
+/**
+ * 安全抽取 usage details 子字段（cached_tokens/reasoning_tokens）：
+ * - details 嵌套形状错位（字符串/数组/null/缺省）→ null；
+ * - 字段值不是非负整数、或超过对应核心字段总量（违反子集不变量）→ null；
+ * - 任何异常形状都只降级为 null，绝不抛错。
+ */
+function extractDetailTokens(details: unknown, key: string, bound: number): number | null {
+  if (typeof details !== 'object' || details === null || Array.isArray(details)) return null;
+  const value = (details as Record<string, unknown>)[key];
+  if (typeof value !== 'number' || !Number.isFinite(value) || !Number.isInteger(value) || value < 0 || value > bound) {
+    return null;
+  }
+  return value;
 }
 
 /** Parse one SSE data payload into a normalized chunk. Returns null for non-JSON or [DONE]. */

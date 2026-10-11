@@ -13,6 +13,9 @@ export function stdev(xs: readonly number[]): number {
   return Math.sqrt(variance(xs));
 }
 
+// 以下 quantile/median/mad/variance/stdev 为保留导出：当前评分主链路仅用 mean/linearRegression/
+// wilsonLowerBound/clampScore，统计族为未来评分升级预留（如 TTFT 分位已用 quantile，波动度可接 stdev/mad）。
+// 修改判定语义前先 grep 调用方，勿凭「看起来没人用」直接删除。
 export function quantile(xs: readonly number[], q: number): number {
   if (xs.length === 0) return 0;
   const sorted = [...xs].sort((a, b) => a - b);
@@ -67,7 +70,9 @@ export function linearRegression(xs: readonly number[], ys: readonly number[]): 
 }
 
 export function wilsonLowerBound(successes: number, total: number, z = 1.64): number {
-  if (total === 0) return 0;
+  // 入口守卫：total 非正/非有限、successes 非有限一律返回 0（下界 0 恒安全），
+  // 防止 total<0 产生 >1 的伪下界、NaN 全程污染公式。
+  if (!Number.isFinite(successes) || !Number.isFinite(total) || total <= 0) return 0;
   const clampedSuccesses = Math.max(0, Math.min(total, successes));
   const p = clampedSuccesses / total;
   const denom = 1 + (z * z) / total;

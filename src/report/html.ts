@@ -1,4 +1,4 @@
-import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
+import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
 import { levelLabel, PROBE_ORDER, statusTag } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 
@@ -81,7 +81,7 @@ ${report.scores
     (entry) =>
       `<tr><td>${esc(entry.id)}<div class="muted">${esc(DIMENSION_DESC[entry.id] ?? '')}</div></td><td class="tag ${entry.level}">${esc(
         statusTag(entry.level),
-      )}</td><td>${entry.score ?? '-'}</td><td>${entry.weight === 0 ? '-' : entry.weight}</td><td>${esc(entry.headline)}</td></tr>`,
+      )}</td><td>${entry.score ?? '-'}</td><td>${weightText(entry)}</td><td>${esc(entry.headline)}</td></tr>`,
   )
   .join('\n')}
 </tbody></table>
@@ -91,8 +91,11 @@ ${report.notes.length > 0 ? `<h2>说明</h2><ul>${report.notes.map((n) => `<li>$
 <h2>检测详情</h2>
 ${report.outcomes.map(renderOutcome).join('\n')}
 
-<h2>原始证据（${report.evidence.length} 条）</h2>
-${report.evidence.map(renderEvidence).join('\n')}
+${
+  report.evidence.length > 0
+    ? `<h2>原始证据（${report.evidence.length} 条）</h2>\n${report.evidence.map(renderEvidence).join('\n')}`
+    : '<p class="muted">本次审计未产生原始证据记录。</p>'
+}
 </main></body></html>
 `;
 }
@@ -136,4 +139,10 @@ function esc(text: string): string {
     .replace(/>/g, '&gt;')
     .replace(/"/g, '&quot;')
     .replace(/'/g, '&#39;');
+}
+
+/** 与 markdown.ts 同口径：未计入总分的行不展示配置权重（总分用归一化后权重，避免按表复算对不上）。 */
+function weightText(entry: ScoreEntry): string {
+  const counted = entry.status === 'ok' && typeof entry.score === 'number' && Number.isFinite(entry.score);
+  return counted && entry.weight > 0 ? String(entry.weight) : '-';
 }

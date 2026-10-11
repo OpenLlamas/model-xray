@@ -83,3 +83,34 @@ test('geometric mean penalizes a single low score', () => {
   ]);
   assert.ok(result.total !== null && result.total < 85);
 });
+
+// ---------- 非有限分数守卫 + 可评分项不足分支 ----------
+
+test('non-finite scores (NaN/Infinity) are unscorable, never washed into the log aggregate', () => {
+  const result = computeTotal([
+    outcome('identity', Number.NaN),
+    outcome('context', Number.POSITIVE_INFINITY),
+    outcome('billing', 90),
+    outcome('capability', 90),
+    outcome('quality', 90),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  // 3 个有限项归一化聚合出分；NaN/Infinity 记入未判定项而非把总分洗成 0
+  assert.ok(result.total !== null && result.total > 0 && result.total <= 100);
+  assert.ok(result.notes.some((n) => n.includes('identity') && n.includes('context')), JSON.stringify(result.notes));
+});
+
+test('fewer than 2 scorable entries: total stays null, overall follows worst observed level', () => {
+  const singlePass = computeTotal([outcome('identity', 100)]);
+  assert.equal(singlePass.total, null);
+  assert.equal(singlePass.overall, 'unknown');
+
+  const singleWarn = computeTotal([outcome('identity', 70)]);
+  assert.equal(singleWarn.total, null);
+  assert.equal(singleWarn.overall, 'warn');
+
+  const singleFail = computeTotal([outcome('identity', 10)]);
+  assert.equal(singleFail.total, null);
+  assert.equal(singleFail.overall, 'fail');
+  assert.ok(singleFail.notes.some((n) => n.includes('可评分项不足')));
+});
