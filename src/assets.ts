@@ -1,9 +1,10 @@
 import type { Rng } from './types.js';
 import { estimateTokens } from './tokens.js';
 
-// v0.2.0：探针问答预算全面升级以适配 thinking 模型（vision 16→1024、quality 64→256、tool 次轮 64→256、
-// identity 200→512，均带 starvation 升预算重试/证据不足处理），题集内容与判定口径变化 → 基线不可比。
-export const PROBESET_VERSION = 'v0.2.0';
+// v0.2.1：identity 探针加强——自述样本 3→5（deep 8）、falsified 改全体一致判定、新增 claimed_version
+// 旁证；为此 IDENTITY_QUESTIONS 题池 5→7（deep 档需 7 道随机题 + 1 道固定版本自述题）。
+// 题集内容与判定口径变化 → 基线不可比。
+export const PROBESET_VERSION = 'v0.2.1';
 export const ASSETS_VERSION = 'assets-v0.1.0';
 
 /** Base paragraphs used to construct long context probes. Deterministic given seed. */
@@ -33,13 +34,15 @@ export const SENTENCE_POOL: readonly string[] = [
   'The cheapest way to fake a model is to route it to a smaller one.',
 ];
 
-/** Identity probes: neutral, no hint of expected answer. */
+/** Identity probes: neutral, no hint of expected answer. v0.2.1：题池 7 道（deep 档需 7 随机 + 1 固定版本题）。 */
 export const IDENTITY_QUESTIONS: readonly string[] = [
   '请用一句话回答：你是什么AI模型？给出你的名称和所属机构。',
   'State your exact model name and the organization that created you, in one short sentence.',
   '你是什么模型？你的训练机构是谁？请直接回答，不要回避。',
   'Which AI model are you? Answer with your model name only.',
   '请告诉我你的真实身份：模型名称、版本号（如有）、开发机构。',
+  '请报出你的模型标识与开发方，越具体越好。',
+  'What model are you, exactly? Include the name and version if you have one.',
 ];
 
 /** Probes that require strict JSON output; format compliance is a weak fingerprint. */

@@ -3,33 +3,46 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'">
-<title>model-xray web 壳</title>
+<title>model-xray 控制台</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body { margin: 0; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f1115; color: #d7dae0; }
-  main { max-width: 900px; margin: 0 auto; padding: 24px 16px 64px; }
+  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
   h1 { font-size: 20px; margin: 0 0 6px; }
   h4 { margin: 18px 0 6px; font-size: 14px; color: #aab2bf; }
   .privacy { color: #8b93a1; font-size: 13px; margin: 4px 0 0; }
+  .banner { border-radius: 8px; padding: 10px 14px; margin: 12px 0; font-size: 14px; }
+  .banner-offline { background: #4a3a12; color: #ffd66b; border: 1px solid #6b5417; }
+  .banner-fail { background: #4d1f1f; color: #ff8585; border: 1px solid #7a2e2e; font-weight: 600; }
+  .banner-pass { background: #1e4620; color: #7ddf87; border: 1px solid #2f6b31; font-weight: 600; }
+  .note { background: #141a22; border: 1px solid #24405e; color: #9fc0e8; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }
+  .keybar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: #14171d; border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px 12px; margin: 12px 0; }
+  .keybar .state { font-size: 13px; color: #aab2bf; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 5px; background: #8b93a1; vertical-align: middle; }
+  .dot.on { background: #7ddf87; }
   .tabs { display: flex; gap: 8px; margin: 18px 0; }
   .tabs button { padding: 8px 16px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
   .tabs button[aria-selected="true"] { background: #2b6cb0; border-color: #2b6cb0; color: #fff; }
   .panel { background: #14171d; border: 1px solid #2a2f3a; border-radius: 8px; padding: 16px; }
   label { display: block; margin: 10px 0 4px; font-size: 13px; color: #aab2bf; }
-  input[type="text"], textarea { width: 100%; padding: 8px; background: #0f1115; color: #e6e9ee; border: 1px solid #2a2f3a; border-radius: 6px; font: inherit; }
-  textarea { min-height: 150px; }
+  input[type="text"], input[type="password"], textarea { width: 100%; padding: 8px; background: #0f1115; color: #e6e9ee; border: 1px solid #2a2f3a; border-radius: 6px; font: inherit; }
+  textarea { min-height: 120px; }
   .row { display: flex; gap: 12px; flex-wrap: wrap; }
   .row > div { flex: 1 1 220px; }
   .checks { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; }
   .checks label { display: flex; align-items: center; gap: 6px; margin: 0; }
   button.primary { margin-top: 12px; padding: 8px 18px; background: #2b6cb0; border: none; color: #fff; border-radius: 6px; cursor: pointer; font: inherit; }
-  button.secondary { padding: 6px 14px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
+  button.primary:disabled { background: #24445e; color: #8aa4bd; cursor: not-allowed; }
+  button.secondary { margin-top: 12px; padding: 8px 16px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
   .error { color: #ff6b6b; margin-top: 10px; white-space: pre-wrap; }
-  pre.command { background: #0b0d11; border: 1px solid #2a2f3a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  pre.command, pre.log { background: #0b0d11; border: 1px solid #2a2f3a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 13px; }
+  pre.log { min-height: 60px; max-height: 340px; overflow-y: auto; }
+  .log-line-warn { color: #ffd66b; }
+  .log-line-fail { color: #ff8585; }
   .hints { color: #9fb3c8; font-size: 13px; }
   .placeholder { color: #8b93a1; }
+  details summary { cursor: pointer; color: #9fb3c8; font-size: 13px; margin-top: 10px; }
   table.probes { width: 100%; border-collapse: collapse; margin-top: 12px; }
   table.probes th, table.probes td { border: 1px solid #2a2f3a; padding: 6px 10px; text-align: left; font-size: 14px; }
   .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
@@ -37,48 +50,58 @@
   .badge-warn { background: #4a3a12; color: #ffd66b; }
   .badge-fail { background: #4d1f1f; color: #ff8585; }
   .badge-unknown { background: #262b34; color: #9aa3b2; }
-  .dropzone { border: 2px dashed #2a2f3a; border-radius: 8px; padding: 18px; text-align: center; color: #8b93a1; margin: 10px 0; }
-  .dropzone.over { border-color: #2b6cb0; }
-  #file-status { font-size: 13px; color: #9fb3c8; min-height: 1.2em; }
   .scorecard-head { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
   .scorecard-head .total { font-size: 18px; }
   ul.findings, ul.notes { margin: 6px 0; padding-left: 20px; }
   ul.findings li, ul.notes li { margin: 4px 0; }
+  .report-links a { color: #6cb2ff; margin-right: 14px; font-size: 13px; }
+  #report-list { list-style: none; margin: 10px 0; padding: 0; }
+  #report-list li { display: flex; gap: 10px; align-items: baseline; padding: 6px 8px; border-bottom: 1px solid #1d222b; }
+  #report-list .name { color: #6cb2ff; cursor: pointer; word-break: break-all; }
+  #report-list .name:hover { text-decoration: underline; }
+  #report-list .meta { color: #8b93a1; font-size: 12px; white-space: nowrap; }
+  fieldset.optional { border: 1px dashed #3a4150; border-radius: 8px; margin-top: 12px; padding: 8px 12px 12px; }
+  fieldset.optional legend { color: #9fb3c8; font-size: 13px; padding: 0 6px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>model-xray <span class="privacy">web 壳（纯静态）</span></h1>
-  <p class="privacy">所有数据仅在浏览器本地处理，key 不会经过本页面；页面不发任何网络请求、不做任何存储。key 通过终端环境变量进入 CLI。</p>
+  <h1>model-xray <span class="privacy">本地控制台（仅 127.0.0.1）</span></h1>
+  <p class="privacy">所有数据在本机处理：key 仅存于本地服务进程内存，报告与日志都留在本机，不经任何第三方。默认开启模型检测（身份/质量/能力/上下文/时延）；计费核价为可选（需录入价格）。</p>
+  <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测与监控不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
 
-  <div class="tabs">
-    <button id="tab-cmd" type="button" aria-selected="true">① 生成命令</button>
-    <button id="tab-report" type="button" aria-selected="false">② 渲染报告</button>
+  <div class="keybar">
+    <span class="state"><span id="key-dot" class="dot"></span>API key：<span id="key-state">检测中…</span></span>
+    <input id="f-key" type="password" placeholder="sk-xxx（回车或点保存；仅存本机内存）" style="flex:1 1 260px" autocomplete="off">
+    <button id="btn-key-save" class="secondary" type="button" style="margin-top:0">保存</button>
+    <button id="btn-key-clear" class="secondary" type="button" style="margin-top:0">清除</button>
   </div>
 
-  <section id="panel-cmd" class="panel">
-    <label>目标终端（决定引号风格；key 永远不进命令，用环境变量设置）</label>
-    <div class="checks">
-      <label><input type="radio" name="shell-mode" value="posix" checked> PowerShell / bash / zsh（单引号）</label>
-      <label><input type="radio" name="shell-mode" value="cmd"> cmd.exe（双引号，参数不能含双引号或 %）</label>
-    </div>
+  <div class="tabs">
+    <button id="tab-test" type="button" aria-selected="true">① 一次性检测</button>
+    <button id="tab-guard" type="button" aria-selected="false">② 常驻监控</button>
+    <button id="tab-reports" type="button" aria-selected="false">③ 历史报告</button>
+  </div>
+
+  <section id="panel-test" class="panel">
+    <div class="note">默认开启模型检测：身份真伪 / 输出质量 / 能力矩阵 / 上下文长度 / 首字时延全部默认执行，异常会以红色警告置顶提示。计费核价为可选——需要录入该站宣称价格才启用。</div>
     <div class="row">
       <div>
-        <label for="f-base-url">--base-url *（如 https://relay.example.com/v1）</label>
+        <label for="f-base-url">base-url *（如 https://relay.example.com/v1）</label>
         <input id="f-base-url" type="text" placeholder="https://relay.example.com/v1">
       </div>
       <div>
-        <label for="f-model">--model *（如 gpt-4o）</label>
+        <label for="f-model">model *（如 gpt-4o）</label>
         <input id="f-model" type="text" placeholder="gpt-4o">
       </div>
     </div>
     <div class="row">
       <div>
-        <label for="f-claimed-context">--claimed-context（标称上下文，正整数，非空才输出）</label>
+        <label for="f-claimed-context">claimed-context（标称上下文，正整数，选填）</label>
         <input id="f-claimed-context" type="text" inputmode="numeric" placeholder="32000">
       </div>
       <div>
-        <label>--expect（宣称能力，全不选 → none）</label>
+        <label>expect（该站宣称的能力，全不选 → none）</label>
         <div class="checks">
           <label><input id="f-expect-vision" type="checkbox"> vision</label>
           <label><input id="f-expect-tool" type="checkbox"> tool</label>
@@ -86,70 +109,103 @@
         </div>
       </div>
     </div>
+    <fieldset class="optional">
+      <legend>计费核价（可选）：需录入该站宣称价格（每百万 tokens），不填则跳过金额对账，不影响其他检测</legend>
+      <div class="row">
+        <div>
+          <label for="f-price-input">price-input（$/M tokens，正数）</label>
+          <input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5">
+        </div>
+        <div>
+          <label for="f-price-output">price-output（须与 price-input 成对）</label>
+          <input id="f-price-output" type="text" inputmode="decimal" placeholder="10">
+        </div>
+      </div>
+    </fieldset>
     <div class="row">
       <div>
-        <label for="f-price-input">--price-input（每百万 tokens，正数）</label>
-        <input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5">
-      </div>
-      <div>
-        <label for="f-price-output">--price-output（须与 price-input 成对）</label>
-        <input id="f-price-output" type="text" inputmode="decimal" placeholder="10">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="f-seed">--seed（正整数）</label>
+        <label for="f-seed">seed（正整数，选填；复测建议固定）</label>
         <input id="f-seed" type="text" inputmode="numeric" placeholder="12345">
       </div>
       <div>
-        <label for="f-timeout">--timeout（秒，正整数）</label>
+        <label for="f-timeout">timeout（秒，正整数，选填）</label>
         <input id="f-timeout" type="text" inputmode="numeric" placeholder="60">
       </div>
     </div>
     <div class="row">
       <div>
-        <label for="f-out">--out（报告输出目录，缺省 reports）</label>
+        <label for="f-out">out（报告输出目录，缺省 reports）</label>
         <input id="f-out" type="text" placeholder="reports">
       </div>
       <div>
-        <label for="f-baseline">--baseline（基线文件路径）</label>
+        <label for="f-baseline">baseline（基线文件路径，选填；复测对比用）</label>
         <input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json">
       </div>
     </div>
     <div class="checks">
-      <label><input id="f-deep" type="checkbox"> --deep（更多样本，更慢）</label>
-      <label><input id="f-dry-run" type="checkbox"> --dry-run（只打印计划，不发请求）</label>
-      <label><input id="f-yes" type="checkbox"> --yes（跳过成本确认）</label>
+      <label><input id="f-deep" type="checkbox"> deep（更多样本，更慢更准）</label>
+      <label><input id="f-dry-run" type="checkbox"> dry-run（只打印计划，不发请求）</label>
     </div>
 
-    <button id="btn-generate" class="primary" type="button">生成命令</button>
-    <div id="cmd-error" class="error" hidden></div>
-
-    <div id="cmd-result" hidden>
-      <label>复制到终端执行（命令里没有 key；key 用环境变量设置，见下方提示。请在 PowerShell 或 bash/zsh 中执行，cmd.exe 不支持）</label>
+    <button id="btn-run" class="primary" type="button">开始检测</button>
+    <div id="run-error" class="error" hidden></div>
+    <div id="run-banner" hidden></div>
+    <h4>运行日志</h4>
+    <pre id="run-log" class="log placeholder">尚未开始。点击「开始检测」后这里会实时滚动显示 CLI 输出。</pre>
+    <div id="report-result" hidden>
+      <h4>评分卡</h4>
+      <div id="report-links" class="report-links"></div>
+      <div id="report-out"></div>
+    </div>
+    <details>
+      <summary>等价 CLI 命令（透明起见；也可复制到终端直接执行）</summary>
       <pre id="command-out" class="command"></pre>
-      <button id="btn-copy" class="secondary" type="button">复制命令</button>
-      <div id="copy-status" class="hints" hidden></div>
-      <div id="copy-fallback" hidden>
-        <textarea id="copy-fallback-text" readonly></textarea>
-        <p class="hints">请手动复制：点击文本框 → Ctrl+A 全选 → Ctrl+C。</p>
-      </div>
       <pre id="hints-out" class="hints"></pre>
-    </div>
+    </details>
   </section>
 
-  <section id="panel-report" class="panel" hidden>
-    <label for="report-json">粘贴 report-*.json 的完整内容</label>
-    <textarea id="report-json" placeholder='{"meta": …, "total": …, "outcomes": […] }'></textarea>
-    <div id="drop-zone" class="dropzone">把 .json 文件拖到这里，或用下方选择文件（仅读取本地文件，不上传）</div>
-    <input id="report-file" type="file" accept=".json,application/json">
-    <div id="file-status"></div>
+  <section id="panel-guard" class="panel" hidden>
+    <div class="note">常驻监控：本地透明转发代理逐请求审计真实流量——模型一致性、token 计量、余额对账；每 20 个请求输出一次多维实时评分卡，异常即时告警。启动后把客户端 base-url 指向 <code>http://127.0.0.1:&lt;port&gt;/v1</code>，key 用与上方录入相同的值。</div>
+    <div class="row">
+      <div>
+        <label for="f-guard-base-url">base-url *（真实中转站地址）</label>
+        <input id="f-guard-base-url" type="text" placeholder="https://relay.example.com/v1">
+      </div>
+      <div>
+        <label for="f-guard-port">本地监听端口（[1, 65535]，默认 8621）</label>
+        <input id="f-guard-port" type="text" inputmode="numeric" placeholder="8621">
+      </div>
+    </div>
+    <fieldset class="optional">
+      <legend>计费对账（可选）：需录入宣称价格对，且站点提供余额查询端点</legend>
+      <div class="row">
+        <div>
+          <label for="f-guard-price-in">price-input（$/M tokens）</label>
+          <input id="f-guard-price-in" type="text" inputmode="decimal" placeholder="2.5">
+        </div>
+        <div>
+          <label for="f-guard-price-out">price-output（$/M tokens）</label>
+          <input id="f-guard-price-out" type="text" inputmode="decimal" placeholder="10">
+        </div>
+      </div>
+    </fieldset>
+    <button id="btn-guard-start" class="primary" type="button">启动监控</button>
+    <button id="btn-guard-stop" class="secondary" type="button">停止监控</button>
+    <div id="guard-error" class="error" hidden></div>
+    <div class="state" id="guard-state" style="margin-top:10px; font-size:13px; color:#aab2bf">状态：未启动</div>
+    <h4>监控输出</h4>
+    <pre id="guard-log" class="log placeholder">尚未启动。</pre>
+  </section>
 
-    <button id="btn-render" class="primary" type="button">渲染评分卡</button>
-    <div id="report-error" class="error" hidden></div>
-    <div id="report-out"></div>
+  <section id="panel-reports" class="panel" hidden>
+    <button id="btn-reports-refresh" class="secondary" type="button" style="margin-top:0">刷新列表</button>
+    <span class="hints">点击 .json 在页内渲染评分卡；.html / .md 在新标签打开。</span>
+    <ul id="report-list"></ul>
+    <div id="history-error" class="error" hidden></div>
+    <div id="history-out"></div>
   </section>
 </main>
+<script>window.MX_TOKEN = '__MX_TOKEN__';</script>
 <script type="module" src="./app.js"></script>
 </body>
 </html>

@@ -20,7 +20,7 @@ export interface FingerprintOptions {
 /**
  * 主动指纹复核（--fingerprint-minutes>0 时启用）：
  * - 每周期从已观测的请求模型中取出现最多者，复用 src/probes/identity.ts 的身份探针直连上游；
- * - 注意：探针每轮会真实发起 3 次自述 + 1 次格式合规对话请求（会真实计费），README 已注明；
+ * - 注意：探针每轮会真实发起 5 次自述（--deep 档 8 次）+ 1 次格式合规对话请求（会真实计费），README 已注明；
  * - 模型族指纹与上次复核完全不相交时出 warn（journal + stderr）。
  */
 export class FingerprintMonitor implements FingerprintObserver {

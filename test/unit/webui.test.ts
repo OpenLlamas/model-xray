@@ -285,7 +285,7 @@ test('漂移锚：buildCommand 输出的 flag 全集 ⊆ ALLOWED_FLAGS（清单�
 // renderScorecard
 // ---------------------------------------------------------------------------
 
-test('renderScorecard：合法报告渲染总分 / overall / 探针 / findings / notes', () => {
+test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / findings / notes', () => {
   const report = sampleReport({
     outcomes: [
       sampleOutcome('identity', { findings: [{ level: 'warn', message: 'warn 线索', evidenceIds: [] }] }),
@@ -299,7 +299,7 @@ test('renderScorecard：合法报告渲染总分 / overall / 探针 / findings /
   });
   const result = renderScorecard(JSON.stringify(report));
   assert.equal(result.error, null);
-  assert.ok(result.html.includes('总分：87'), result.html);
+  assert.ok(result.html.includes('可信度总分：87'), result.html);
   assert.ok(result.html.includes('通过'));
   for (const id of ['identity', 'context', 'billing', 'capability', 'quality', 'ttft', 'extra']) {
     assert.ok(result.html.includes(id), `缺少探针 ${id}`);

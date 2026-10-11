@@ -74,6 +74,9 @@ export async function runAudit(cfg: RunConfig, onProgress?: ProgressFn): Promise
     } catch (error) {
       notes.push(`基线加载失败，已跳过指纹对比：${error instanceof Error ? error.message : String(error)}`);
     }
+  } else {
+    // 无基线提示：如实披露本次审计的检测边界（同族换壳/静默降级不可检测）
+    notes.push('未加载指纹基线：无法对比历史指纹，同族换壳/静默降级不可检测。建议固定基线后用 --baseline 复测。');
   }
 
   const decided = computeTotal(outcomes);

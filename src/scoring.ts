@@ -17,6 +17,9 @@ export const HARD_RED: ReadonlySet<ProbeId> = new Set<ProbeId>(['billing', 'capa
 
 const HARD_RED_CAP = 45;
 
+/** capability 被证伪（存在 fail 级异常）时的可信度总分上限：标称能力实测答错/被明确拒绝，一票压制。 */
+export const CAPABILITY_FALSIFIED_CAP = 60;
+
 export interface ScoreResult {
   total: number | null;
   overall: Level;
@@ -46,11 +49,22 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
   const scorable = scores.filter((s) => s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score));
   const unscorable = scores.filter((s) => !(s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score)));
 
+  // 标称能力被证伪：capability findings 存在 fail 级异常（真实答错或端点明确拒绝）。
+  // fail 只由实测证据产生（429/超时/5xx/starved 全走 warn/na），故此条件足以定「证伪」。
+  const capabilityFalsified = outcomes.some(
+    (o) => o.id === 'capability' && o.findings.some((f) => f.level === 'fail'),
+  );
+
   if (scorable.length < 2) {
     notes.push('可评分项不足（<2），总分未判定，仅展示分项结论。');
     const anyFail = scores.some((s) => s.level === 'fail');
     const anyWarn = scores.some((s) => s.level === 'warn');
-    return { total: null, overall: anyFail ? 'fail' : anyWarn ? 'warn' : 'unknown', scores, notes };
+    return {
+      total: null,
+      overall: anyFail || capabilityFalsified ? 'fail' : anyWarn ? 'warn' : 'unknown',
+      scores,
+      notes,
+    };
   }
 
   if (unscorable.length > 0) {
@@ -74,10 +88,16 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
     notes.push(`硬红线触发（${hardRed.map((s) => s.id).join('、')} < 40），总分上限 ${HARD_RED_CAP}。`);
   }
 
+  // capability 被证伪罚：与硬红线并列生效（取 min，不抬分），并把 overall 强制为 fail。
+  if (capabilityFalsified) {
+    total = Math.min(total, CAPABILITY_FALSIFIED_CAP);
+    notes.push('标称能力被证伪（capability 存在 fail 级异常），可信度总分上限 60。');
+  }
+
   const rounded = clampScore(total);
   const anyFail = scores.some((s) => s.level === 'fail');
   let overall: Level;
-  if (anyFail || rounded < 40) overall = 'fail';
+  if (anyFail || capabilityFalsified || rounded < 40) overall = 'fail';
   else if (rounded < 75 || scores.some((s) => s.level === 'warn')) overall = 'warn';
   else overall = 'pass';
 

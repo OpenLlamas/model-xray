@@ -1,10 +1,9 @@
-// web/app.js — model-xray 纯静态 Web 壳（P1.5）
-// 约束（cli-first 决策）：
+// web/app.js — model-xray 控制台前端
+// 约束（沿袭 P1.5）：
 //   ① 纯函数（escapeHtml / buildCommand / renderScorecard）供 Node 测试直接 import；
 //   ② DOM 接线全部收在 `typeof document !== 'undefined'` 守卫内；
-//   ③ 零网络请求、零存储（无 localStorage / IndexedDB / cookie）；
-//   ④ key 绝不出现在生成的命令里 —— CLI 原生读环境变量 MODEL_XRAY_KEY，
-//      页面只在 hints 里给出两行 export / $env 提示。
+//   ③ 仅与本地回环服务（scripts/serve.mjs）通信，不访问任何外部地址；
+//   ④ key 只提交给本地服务（keySource=page），命令预览里绝不出现 key。
 
 const EXPECT_ALLOWED = ['vision', 'tool', 'thinking'];
 
@@ -249,7 +248,7 @@ export function renderScorecard(jsonText) {
 
   const html = [
     '<section class="scorecard">',
-    `  <div class="scorecard-head"><span class="total">总分：${escapeHtml(total)}</span><span class="badge badge-${badgeClass(overall)}">${escapeHtml(overallLabel)}</span></div>`,
+    `  <div class="scorecard-head"><span class="total">可信度总分：${escapeHtml(total)}</span><span class="badge badge-${badgeClass(overall)}">${escapeHtml(overallLabel)}</span></div>`,
     '  <table class="probes">',
     '    <thead><tr><th>探针</th><th>结论</th><th>得分</th><th>摘要</th></tr></thead>',
     '    <tbody>',
@@ -276,31 +275,99 @@ if (typeof document !== 'undefined') {
     return el instanceof HTMLInputElement && el.type === 'checkbox' ? el.checked : false;
   };
 
-  // —— 双 tab 切换 ——
-  const tabs = { cmd: byId('tab-cmd'), report: byId('tab-report') };
-  const panels = { cmd: byId('panel-cmd'), report: byId('panel-report') };
+  // —— token / 在线状态：serve.mjs 注入 window.MX_TOKEN；占位符未替换 = 未连上本地服务 ——
+  const TOKEN =
+    typeof window !== 'undefined' &&
+    typeof window.MX_TOKEN === 'string' &&
+    window.MX_TOKEN !== '' &&
+    !window.MX_TOKEN.includes('__MX_TOKEN__')
+      ? window.MX_TOKEN
+      : null;
+  if (TOKEN === null) byId('offline-banner')?.removeAttribute('hidden');
+
+  async function api(path, options = {}) {
+    const headers = { ...(options.headers ?? {}) };
+    if (options.body !== undefined) headers['content-type'] = 'application/json';
+    if (TOKEN !== null) headers['x-model-xray-token'] = TOKEN;
+    const res = await fetch(path, { method: options.method ?? 'GET', headers, body: options.body });
+    let data = null;
+    try {
+      data = await res.json();
+    } catch {
+      data = null;
+    }
+    return { status: res.status, ok: res.ok, data };
+  }
+  const isOffline = () => TOKEN === null;
+
+  // —— 三 tab 切换 ——
+  const tabs = { test: byId('tab-test'), guard: byId('tab-guard'), reports: byId('tab-reports') };
+  const panels = { test: byId('panel-test'), guard: byId('panel-guard'), reports: byId('panel-reports') };
   function selectTab(which) {
-    for (const key of ['cmd', 'report']) {
+    for (const key of ['test', 'guard', 'reports']) {
       tabs[key]?.setAttribute('aria-selected', key === which ? 'true' : 'false');
       if (panels[key]) panels[key].hidden = key !== which;
     }
   }
-  tabs.cmd?.addEventListener('click', () => selectTab('cmd'));
-  tabs.report?.addEventListener('click', () => selectTab('report'));
+  tabs.test?.addEventListener('click', () => selectTab('test'));
+  tabs.guard?.addEventListener('click', () => selectTab('guard'));
+  tabs.reports?.addEventListener('click', () => {
+    selectTab('reports');
+    void refreshReports();
+  });
 
-  // —— Tab ①：生成命令 ——
-  const cmdError = byId('cmd-error');
-  const cmdResult = byId('cmd-result');
-  const commandOut = byId('command-out');
-  const hintsOut = byId('hints-out');
-  const copyStatus = byId('copy-status');
-  const copyFallback = byId('copy-fallback');
-  const copyFallbackText = byId('copy-fallback-text');
+  // —— key 条：状态读取 / 保存 / 清除（key 只提交给本地服务，响应不含 key 值） ——
+  const keyDot = byId('key-dot');
+  const keyState = byId('key-state');
+  function renderKeyStatus(info) {
+    const source = info?.keySource ?? null;
+    if (keyDot) keyDot.classList.toggle('on', source !== null);
+    if (keyState) {
+      keyState.textContent =
+        source === 'page'
+          ? '已录入（保存在本机服务内存）'
+          : source === 'env'
+            ? '来自环境变量 MODEL_XRAY_KEY'
+            : '未设置（检测前需要录入）';
+    }
+  }
+  async function loadKeyStatus() {
+    if (isOffline()) {
+      renderKeyStatus({ keySource: null });
+      return;
+    }
+    const res = await api('/api/status');
+    renderKeyStatus(res.ok ? res.data : { keySource: null });
+  }
+  async function saveKey() {
+    if (isOffline()) return;
+    const key = inputValue('f-key').trim();
+    if (key === '') {
+      renderKeyStatus({ keySource: null });
+      return;
+    }
+    const res = await api('/api/key', { method: 'POST', body: JSON.stringify({ key }) });
+    if (!res.ok) {
+      if (keyState) keyState.textContent = `保存失败：${String(res.data?.error ?? res.status)}`;
+      return;
+    }
+    if (byId('f-key')) byId('f-key').value = '';
+    renderKeyStatus(res.data);
+  }
+  byId('btn-key-save')?.addEventListener('click', () => void saveKey());
+  byId('f-key')?.addEventListener('keydown', (event) => {
+    if (event instanceof KeyboardEvent && event.key === 'Enter') void saveKey();
+  });
+  byId('btn-key-clear')?.addEventListener('click', async () => {
+    if (isOffline()) return;
+    const res = await api('/api/key/clear', { method: 'POST', body: '{}' });
+    if (res.ok) renderKeyStatus(res.data);
+  });
+  void loadKeyStatus();
 
+  // —— Tab ①：一次性检测 ——
   function collectForm() {
-    const shellMode = document.querySelector('input[name="shell-mode"]:checked');
     return {
-      shell: shellMode instanceof HTMLInputElement && shellMode.value === 'cmd' ? 'cmd' : 'posix',
       baseUrl: inputValue('f-base-url'),
       model: inputValue('f-model'),
       claimedContext: inputValue('f-claimed-context'),
@@ -313,131 +380,303 @@ if (typeof document !== 'undefined') {
       baseline: inputValue('f-baseline'),
       deep: checkedValue('f-deep'),
       dryRun: checkedValue('f-dry-run'),
-      yes: checkedValue('f-yes'),
     };
   }
-
-  byId('btn-generate')?.addEventListener('click', () => {
-    if (!cmdError || !cmdResult || !commandOut || !hintsOut) return;
-    const result = buildCommand(collectForm());
-    if (result.error !== null) {
-      // 就地错误提示：红字显示且不给命令串
-      cmdError.textContent = result.error;
-      cmdError.hidden = false;
-      cmdResult.hidden = true;
-      commandOut.textContent = '';
-      return;
-    }
-    cmdError.hidden = true;
-    commandOut.textContent = result.command;
-    hintsOut.textContent = ['', ...result.hints].join('\n');
-    if (copyStatus) {
-      copyStatus.hidden = true;
-      copyStatus.textContent = '';
-    }
-    if (copyFallback) copyFallback.hidden = true;
-    cmdResult.hidden = false;
-  });
-
-  // 复制：优先 clipboard API，失败降级为可全选 textarea（不用已弃用的 execCommand）
-  byId('btn-copy')?.addEventListener('click', async () => {
-    const text = commandOut?.textContent ?? '';
-    if (text === '') return;
-    try {
-      await navigator.clipboard.writeText(text);
-      if (copyStatus) {
-        copyStatus.textContent = '已复制到剪贴板。';
-        copyStatus.hidden = false;
-      }
-      if (copyFallback) copyFallback.hidden = true;
-    } catch {
-      if (copyFallback && copyFallbackText) {
-        copyFallbackText.value = text;
-        copyFallback.hidden = false;
-      }
-      if (copyStatus) {
-        copyStatus.textContent = '自动复制失败：请点击文本框后手动复制（Ctrl+A 全选 → Ctrl+C）。';
-        copyStatus.hidden = false;
-      }
-    }
-  });
-
-  // —— Tab ②：渲染报告 ——
-  const reportJson = byId('report-json');
-  const reportError = byId('report-error');
-  const reportOut = byId('report-out');
-  const fileStatus = byId('file-status');
-
-  byId('btn-render')?.addEventListener('click', () => {
-    if (!reportError || !reportOut || !reportJson) return;
-    const result = renderScorecard(reportJson.value);
-    if (result.error !== null) {
-      reportError.textContent = result.error;
-      reportError.hidden = false;
-      reportOut.innerHTML = '';
-      return;
-    }
-    reportError.hidden = true;
-    // html 内所有插值都经过 escapeHtml，innerHTML 是安全的
-    reportOut.innerHTML = result.html;
-  });
-
-  // —— 文件拖拽 / 选择：全程 try/catch，拒非 .json 与 >5MB，多文件取首个并提示 ——
-  const MAX_FILE_BYTES = 5 * 1024 * 1024;
-  const dropZone = byId('drop-zone');
-
-  function note(message) {
-    if (fileStatus) fileStatus.textContent = message;
+  function updateCommandPreview() {
+    const form = collectForm();
+    // Web 运行时服务端自动附带 --yes（跳过交互确认），预览与实际参数保持一致
+    const result = buildCommand({ ...form, yes: !form.dryRun });
+    const commandOut = byId('command-out');
+    const hintsOut = byId('hints-out');
+    if (commandOut) commandOut.textContent = result.error !== null ? `（参数尚未合法）${result.error}` : result.command;
+    if (hintsOut) hintsOut.textContent = result.error !== null ? '' : ['', ...result.hints].join('\n');
+    return result;
   }
+  for (const id of [
+    'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
+    'f-seed', 'f-timeout', 'f-out', 'f-baseline',
+  ]) {
+    byId(id)?.addEventListener('input', updateCommandPreview);
+  }
+  for (const id of ['f-expect-vision', 'f-expect-tool', 'f-expect-thinking', 'f-deep', 'f-dry-run']) {
+    byId(id)?.addEventListener('change', updateCommandPreview);
+  }
+  updateCommandPreview();
 
-  function readReportFile(file) {
-    try {
-      if (!file.name.toLowerCase().endsWith('.json')) {
-        note(`已跳过「${file.name}」：仅支持 .json 文件（report-*.json）。`);
-        return;
+  const runError = byId('run-error');
+  const runBanner = byId('run-banner');
+  const runLog = byId('run-log');
+  const btnRun = byId('btn-run');
+  let logPollTimer = null;
+
+  function appendLogLines(pre, lines) {
+    if (pre === null || !Array.isArray(lines)) return;
+    if (pre.classList.contains('placeholder')) {
+      pre.classList.remove('placeholder');
+      pre.textContent = '';
+    }
+    for (const line of lines) {
+      const div = document.createElement('div');
+      const text = typeof line === 'object' && line !== null ? String(line.text ?? '') : String(line);
+      if (/\[(FAIL|ERROR)\]|异常|告警/i.test(text)) div.className = 'log-line-fail';
+      else if (/\[WARN\]|可疑/i.test(text)) div.className = 'log-line-warn';
+      div.textContent = text;
+      pre.appendChild(div);
+    }
+    pre.scrollTop = pre.scrollHeight;
+  }
+  function showRunBanner(kind, title, detail = '') {
+    if (runBanner === null) return;
+    runBanner.className = `banner ${kind === 'fail' ? 'banner-fail' : kind === 'pass' ? 'banner-pass' : 'banner-offline'}`;
+    runBanner.textContent = detail === '' ? title : `${title} — ${detail}`;
+    runBanner.removeAttribute('hidden');
+  }
+  async function renderReportResult(reportPaths, overall) {
+    const wrap = byId('report-result');
+    const links = byId('report-links');
+    const out = byId('report-out');
+    if (wrap === null) return;
+    if (reportPaths === null) {
+      wrap.setAttribute('hidden', '');
+      return;
+    }
+    if (links !== null) {
+      links.textContent = '';
+      const items = [
+        reportPaths.markdownPath && ['Markdown 报告', reportPaths.markdownPath],
+        reportPaths.htmlPath && ['HTML 报告', reportPaths.htmlPath],
+        reportPaths.jsonPath && ['JSON 原始数据', reportPaths.jsonPath],
+        reportPaths.baselinePath && ['基线文件', reportPaths.baselinePath],
+      ].filter(Boolean);
+      for (const [label, path] of items) {
+        const a = document.createElement('a');
+        a.href = `/api/reports/file?name=${encodeURIComponent(path)}`;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = `${label} ↗`;
+        links.appendChild(a);
       }
-      if (file.size > MAX_FILE_BYTES) {
-        note(`已跳过「${file.name}」：文件超过 5MB（实际 ${(file.size / 1024 / 1024).toFixed(1)}MB）。`);
-        return;
+    }
+    if (out !== null && reportPaths.jsonPath !== null) {
+      const res = await fetch(`/api/reports/file?name=${encodeURIComponent(reportPaths.jsonPath)}`);
+      if (res.ok) {
+        const result = renderScorecard(await res.text());
+        out.innerHTML = result.error !== null ? `<p class="error">${escapeHtml(result.error)}</p>` : result.html;
       }
-      const reader = new FileReader();
-      reader.onload = () => {
-        try {
-          if (reportJson) reportJson.value = String(reader.result ?? '');
-          note(`已读取「${file.name}」，点击「渲染评分卡」查看结果。`);
-        } catch (error) {
-          note(`读取结果处理失败：${error instanceof Error ? error.message : String(error)}`);
+    }
+    wrap.removeAttribute('hidden');
+    if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：存在异常，请查看下方评分卡与 findings');
+    else if (overall === 'pass') showRunBanner('pass', '✔ 检测通过：本轮未发现掺假/缩水证据');
+  }
+  function stopLogPoll() {
+    if (logPollTimer !== null) {
+      clearInterval(logPollTimer);
+      logPollTimer = null;
+    }
+    if (btnRun) btnRun.disabled = false;
+  }
+  function pollJob(id) {
+    let after = 0;
+    let overall = null;
+    logPollTimer = setInterval(async () => {
+      try {
+        const res = await api(`/api/jobs/${id}/log?after=${after}`);
+        if (!res.ok) {
+          stopLogPoll();
+          showRunBanner('fail', '日志读取失败', String(res.data?.error ?? res.status));
+          return;
         }
-      };
-      reader.onerror = () => note(`读取「${file.name}」失败：${String(reader.error ?? '未知错误')}`);
-      reader.readAsText(file);
-    } catch (error) {
-      note(`读取文件失败：${error instanceof Error ? error.message : String(error)}`);
+        const log = res.data;
+        appendLogLines(runLog, log.lines);
+        after = log.next;
+        if (log.status === 'running') return;
+        stopLogPoll();
+        const detail = await api(`/api/jobs/${id}`);
+        const exitCode = detail.ok ? detail.data.exitCode : null;
+        const reportPaths = detail.ok ? detail.data.reportPaths : null;
+        // 退出码语义：0 pass/warn · 1 fail · 2 error
+        if (exitCode === 2) showRunBanner('fail', '任务出错（参数或端点问题）：exit 2，请查看日志');
+        else if (exitCode === 1) overall = 'fail';
+        if (log.status === 'error') showRunBanner('fail', '任务异常终止（子进程失败）');
+        await renderReportResult(reportPaths, overall);
+      } catch (error) {
+        stopLogPoll();
+        showRunBanner('fail', '轮询中断', error instanceof Error ? error.message : String(error));
+      }
+    }, 800);
+  }
+  btnRun?.addEventListener('click', async () => {
+    if (isOffline()) {
+      if (runError) {
+        runError.textContent = '未连接本地服务：请在仓库目录运行 npm run ui，并使用打开的页面。';
+        runError.removeAttribute('hidden');
+      }
+      return;
+    }
+    const form = collectForm();
+    const check = buildCommand({ ...form, yes: !form.dryRun });
+    if (check.error !== null) {
+      if (runError) {
+        runError.textContent = check.error;
+        runError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (runError) runError.setAttribute('hidden', '');
+    if (runBanner) runBanner.setAttribute('hidden', '');
+    if (runLog) {
+      runLog.classList.remove('placeholder');
+      runLog.textContent = '';
+    }
+    byId('report-result')?.setAttribute('hidden', '');
+    btnRun.disabled = true;
+    const res = await api('/api/test', { method: 'POST', body: JSON.stringify(form) });
+    if (!res.ok) {
+      btnRun.disabled = false;
+      if (runError) {
+        runError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
+        runError.removeAttribute('hidden');
+      }
+      return;
+    }
+    pollJob(res.data.id);
+  });
+
+  // —— Tab ②：常驻监控 ——
+  const guardError = byId('guard-error');
+  const guardStateEl = byId('guard-state');
+  const guardLog = byId('guard-log');
+  let guardPollTimer = null;
+  let guardLogNext = 0;
+  function renderGuardStatus(st) {
+    if (guardStateEl === null) return;
+    if (st?.running === true) {
+      guardStateEl.textContent = `状态：运行中（本地代理 http://127.0.0.1:${String(st.port)}/v1 → ${String(st.baseUrl)}）`;
+    } else if (st?.status === 'exited') {
+      guardStateEl.textContent = `状态：已退出（exit ${String(st.exitCode)}）；输出见下方日志。`;
+    } else {
+      guardStateEl.textContent = '状态：未启动';
     }
   }
-
-  function handleFileList(fileList) {
+  async function pollGuardOnce() {
     try {
-      if (!fileList || fileList.length === 0) return;
-      if (fileList.length > 1) note('已选择多个文件，仅读取第一个。');
-      readReportFile(fileList[0]);
-    } catch (error) {
-      note(`读取文件失败：${error instanceof Error ? error.message : String(error)}`);
+      const [statusRes, logRes] = await Promise.all([
+        api('/api/guard/status'),
+        api(`/api/guard/log?after=${guardLogNext}`),
+      ]);
+      if (statusRes.ok) renderGuardStatus(statusRes.data);
+      if (logRes.ok) {
+        appendLogLines(guardLog, logRes.data.lines);
+        guardLogNext = logRes.data.next;
+      }
+    } catch {
+      /* 轮询失败静默重试 */
     }
   }
+  function ensureGuardPoll() {
+    if (guardPollTimer === null) guardPollTimer = setInterval(() => void pollGuardOnce(), 1000);
+  }
+  byId('btn-guard-start')?.addEventListener('click', async () => {
+    if (isOffline()) {
+      if (guardError) {
+        guardError.textContent = '未连接本地服务：请在仓库目录运行 npm run ui。';
+        guardError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (guardError) guardError.setAttribute('hidden', '');
+    const body = {
+      baseUrl: inputValue('f-guard-base-url'),
+      port: inputValue('f-guard-port'),
+      priceInput: inputValue('f-guard-price-in'),
+      priceOutput: inputValue('f-guard-price-out'),
+    };
+    const res = await api('/api/guard/start', { method: 'POST', body: JSON.stringify(body) });
+    if (!res.ok) {
+      if (guardError) {
+        guardError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
+        guardError.removeAttribute('hidden');
+      }
+      return;
+    }
+    guardLogNext = 0;
+    if (guardLog) {
+      guardLog.classList.remove('placeholder');
+      guardLog.textContent = '';
+    }
+    void pollGuardOnce();
+    ensureGuardPoll();
+  });
+  byId('btn-guard-stop')?.addEventListener('click', async () => {
+    if (isOffline()) return;
+    await api('/api/guard/stop', { method: 'POST', body: '{}' });
+    await pollGuardOnce();
+  });
 
-  dropZone?.addEventListener('dragover', (event) => {
-    event.preventDefault();
-    dropZone.classList.add('over');
-  });
-  dropZone?.addEventListener('dragleave', () => dropZone.classList.remove('over'));
-  dropZone?.addEventListener('drop', (event) => {
-    event.preventDefault();
-    dropZone.classList.remove('over');
-    handleFileList(event.dataTransfer?.files ?? null);
-  });
-  byId('report-file')?.addEventListener('change', (event) => {
-    const input = event.target;
-    if (input instanceof HTMLInputElement) handleFileList(input.files);
-  });
+  // —— Tab ③：历史报告 ——
+  const historyError = byId('history-error');
+  const historyOut = byId('history-out');
+  async function refreshReports() {
+    if (isOffline()) {
+      if (historyError) {
+        historyError.textContent = '未连接本地服务：历史报告列表需要 npm run ui 启动的本地服务。';
+        historyError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (historyError) historyError.setAttribute('hidden', '');
+    const res = await api('/api/reports');
+    if (!res.ok) {
+      if (historyError) {
+        historyError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
+        historyError.removeAttribute('hidden');
+      }
+      return;
+    }
+    const list = byId('report-list');
+    if (list === null) return;
+    list.textContent = '';
+    const reports = Array.isArray(res.data?.reports) ? res.data.reports : [];
+    if (reports.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'placeholder';
+      li.textContent = 'reports/ 下暂无报告文件。';
+      list.appendChild(li);
+      return;
+    }
+    for (const item of reports) {
+      const li = document.createElement('li');
+      const name = document.createElement('span');
+      name.className = 'name';
+      name.textContent = String(item.name);
+      name.title = '点击查看';
+      const meta = document.createElement('span');
+      meta.className = 'meta';
+      meta.textContent = `${new Date(Number(item.mtimeMs)).toLocaleString()} · ${(Number(item.size) / 1024).toFixed(1)} KB`;
+      li.appendChild(name);
+      li.appendChild(meta);
+      if (String(item.name).endsWith('.json')) {
+        name.addEventListener('click', async () => {
+          const fileRes = await fetch(`/api/reports/file?name=${encodeURIComponent(String(item.name))}`);
+          if (!fileRes.ok || historyOut === null) return;
+          const result = renderScorecard(await fileRes.text());
+          historyOut.innerHTML =
+            result.error !== null
+              ? `<p class="error">${escapeHtml(result.error)}</p>`
+              : `<h4>${escapeHtml(String(item.name))}</h4>${result.html}`;
+        });
+      } else {
+        const a = document.createElement('a');
+        a.href = `/api/reports/file?name=${encodeURIComponent(String(item.name))}`;
+        a.target = '_blank';
+        a.rel = 'noopener';
+        a.textContent = '打开 ↗';
+        a.style.color = '#6cb2ff';
+        a.style.fontSize = '12px';
+        li.appendChild(a);
+      }
+      list.appendChild(li);
+    }
+  }
+  byId('btn-reports-refresh')?.addEventListener('click', () => void refreshReports());
 }

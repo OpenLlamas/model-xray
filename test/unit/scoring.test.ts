@@ -114,3 +114,68 @@ test('fewer than 2 scorable entries: total stays null, overall follows worst obs
   assert.equal(singleFail.overall, 'fail');
   assert.ok(singleFail.notes.some((n) => n.includes('可评分项不足')));
 });
+
+// ---------- capability 被证伪罚（fail 级 finding → 总分上限 60 + overall fail） ----------
+
+/** capability outcome 携带指定级别 finding（其余探针默认满分）。 */
+function withCapabilityFinding(level: 'warn' | 'fail', score: number): ProbeOutcome[] {
+  return [
+    outcome('identity', 100),
+    outcome('context', 100),
+    outcome('billing', 100),
+    {
+      ...outcome('capability', score),
+      findings: [{ level, message: 'vision 可疑：仅 2/3 次识别正确', evidenceIds: [] }],
+    },
+    outcome('quality', 100),
+    outcome('ttft', null, 'insufficient'),
+  ];
+}
+
+test('capability with a fail finding caps total at 60 and forces overall fail', () => {
+  const result = computeTotal(withCapabilityFinding('fail', 100));
+  assert.ok(result.total !== null && result.total <= 60, `total=${result.total}`);
+  assert.equal(result.overall, 'fail');
+  assert.ok(result.notes.some((n) => n.includes('标称能力被证伪') && n.includes('60')), JSON.stringify(result.notes));
+});
+
+test('capability with only a warn finding does not trigger the falsified penalty', () => {
+  const result = computeTotal(withCapabilityFinding('warn', 100));
+  assert.equal(result.total, 100);
+  assert.equal(result.overall, 'pass');
+  assert.ok(!result.notes.some((n) => n.includes('标称能力被证伪')));
+});
+
+test('capability falsified penalty takes min with existing low scores (never raises total)', () => {
+  // 其他维度已低分（quality 20）：几何聚合总分已低于 60，封顶取 min 不得抬分
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    outcome('billing', 100),
+    {
+      ...outcome('capability', 100),
+      findings: [{ level: 'fail', message: '标称支持 vision，但端点明确拒绝', evidenceIds: [] }],
+    },
+    outcome('quality', 20),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  assert.ok(result.total !== null && result.total < 60, `total=${result.total}`);
+  assert.equal(result.overall, 'fail');
+});
+
+test('capability fail finding forces fail even when total is already capped by hard red', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    outcome('billing', 35),
+    {
+      ...outcome('capability', 100),
+      findings: [{ level: 'fail', message: '工具调用参数错误', evidenceIds: [] }],
+    },
+    outcome('quality', 100),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  // 硬红线 45 与 capability 证伪 60 并列取 min → 45
+  assert.equal(result.total, 45);
+  assert.equal(result.overall, 'fail');
+});

@@ -31,6 +31,7 @@
     "test": "npm run build && npm run test:only",
     "test:only": "node --test dist/test/*.test.js dist/test/unit/*.test.js",
     "web": "node scripts/web-server.mjs",
+    "ui": "node scripts/serve.mjs",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

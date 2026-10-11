@@ -413,7 +413,8 @@ function solve(
   if (/127\s*[×x*]\s*31/.test(question)) return '3937';
   if (/pong|ping/i.test(question)) return 'pong';
 
-  if (/你是什么AI模型|什么模型|真实身份|State your exact model|Which AI model|model name/i.test(question)) {
+  // v0.2.1：identity 固定版本自述题（完整模型名称/精确版本号）也按端点模型作答，否则 honest 端点会答非所问
+  if (/你是什么AI模型|什么模型|真实身份|State your exact model|Which AI model|model name|完整模型名称|精确版本号/i.test(question)) {
     const variants = [`我是 ${modelName}，由 OpenAI 开发。`, `I am ${modelName}, created by OpenAI.`, `I'm the ${modelName} model.`];
     return variants[served % variants.length] as string;
   }

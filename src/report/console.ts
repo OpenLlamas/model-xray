@@ -54,9 +54,9 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
         : report.overall === 'warn'
           ? '存在可疑项，结论：可疑'
           : '证据不足，无法得出结论';
-    lines.push(`总分 未判定 — ${reason}`);
+    lines.push(`可信度总分 未判定 — ${reason}`);
   } else {
-    lines.push(colorize(`总分 ${report.total}/100 — ${levelLabel(report.overall)}`, report.overall, color));
+    lines.push(colorize(`可信度总分 ${report.total}/100 — ${levelLabel(report.overall)}`, report.overall, color));
   }
   for (const note of report.notes) lines.push(`· ${note}`);
   lines.push('');

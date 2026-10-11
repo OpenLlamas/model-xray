@@ -44,7 +44,11 @@ async function attemptChat(url: string, options: ClientOptions, req: ChatRequest
       return errorResult(`HTTP ${response.status}: ${truncate(errorText, 500)}`, response.status, Date.now() - started);
     }
 
-    if (req.stream === true) {
+    // 端点兼容：部分中转站无视 stream:false 强制回 SSE（实测 new-api 网关即如此）。
+    // 按响应实际 content-type 分派解析器，否则非流式探针 JSON.parse 整轮失败、审计全灭；
+    // 「请求非流式却被强制流式」本身是端点 spec 违规，由调用方（guard/ttft 的观测）另行记录。
+    const contentType = response.headers.get('content-type') ?? '';
+    if (req.stream === true || contentType.includes('text/event-stream')) {
       return await readStream(response, started);
     }
     return await readJson(response, started);
