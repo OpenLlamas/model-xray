@@ -32,6 +32,7 @@
     "test:only": "node --test dist/test/*.test.js dist/test/unit/*.test.js",
     "web": "node scripts/web-server.mjs",
     "ui": "node scripts/serve.mjs",
+    "ask": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/run-test.ps1",
     "prepublishOnly": "npm run build"
   },
   "devDependencies": {

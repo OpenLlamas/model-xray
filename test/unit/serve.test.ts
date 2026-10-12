@@ -1,9 +1,10 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { request as httpRequest } from 'node:http';
-import { existsSync } from 'node:fs';
+import { existsSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { createMockServer, type MockServer } from '../mock-server.js';
 
 // 运行时位于 dist/test/unit/，向上回溯到仓库根（以 scripts/serve.mjs 为标记；
 // 编译后距仓库根 3 层，不硬编码相对层数，同 webserver.test.ts 的 findRepoRoot）。
@@ -189,6 +190,33 @@ test('serve：报告文件端点拒绝穿越与非法扩展名 → 404', async (
   const badExt = await request(server.port, '/api/reports/file?name=report-x.exe');
   assert.equal(badExt.status, 404, `非法扩展名应 404，实际 ${String(badExt.status)}`);
 });
+test('serve：POST /api/test out 越出仓库 → 400（页面渲染读不回报告）', async () => {
+  const server = await startServer();
+  const res = await postJson(
+    server.port,
+    '/api/test',
+    { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', out: '../outside-reports' },
+    server.token,
+  );
+  assert.equal(res.status, 400, `越界 out 应 400，实际 ${String(res.status)}：${res.body}`);
+  const data = JSON.parse(res.body) as Record<string, unknown>;
+  assert.match(String(data.error ?? ''), /out/);
+  assert.match(String(data.error ?? ''), /仓库/);
+});
+test('serve：POST /api/guard/start 价格只填一侧 → 400 含成对提示（录入价格才启用计费）', async () => {
+  const server = await startServer();
+  const keyRes = await postJson(server.port, '/api/key', { key: 'test-key' }, server.token);
+  assert.equal(keyRes.status, 200);
+  const res = await postJson(
+    server.port,
+    '/api/guard/start',
+    { baseUrl: 'http://127.0.0.1:9/v1', priceInput: '2.5' },
+    server.token,
+  );
+  assert.equal(res.status, 400, `单侧价格应 400，实际 ${String(res.status)}：${res.body}`);
+  const data = JSON.parse(res.body) as Record<string, unknown>;
+  assert.match(String(data.error ?? ''), /成对/);
+});
 test('serve：GET / 返回 200、注入 token 字面值且无占位符残留', async () => {
   const server = await startServer();
   const res = await request(server.port, '/');
@@ -257,4 +285,61 @@ test('serve：/api/test 携带 key 字段（dry-run）→ 注入子进程且日�
     server.token,
   );
   assert.equal(second.status, 200, `会话 key 应复用：${second.body}`);
+});
+test('serve：非 dry-run 真实审计（mock 上游）→ reportPaths 为绝对路径且可经 /api/reports/file 读取', { timeout: 180000 }, async () => {
+  const server = await startServer();
+  const mock: MockServer = await createMockServer({ mode: 'honest' });
+  const outDir = join(REPO_ROOT, 'reports', 'tmp-serve-e2e');
+  try {
+    // 页面录入 key（mock 不校验具体值，但 CLI 非 dry-run 要求 key 存在）
+    const keyRes = await postJson(server.port, '/api/key', { key: 'test-key' }, server.token);
+    assert.equal(keyRes.status, 200, `POST /api/key 应 200：${keyRes.body}`);
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { baseUrl: mock.baseUrl, model: 'gpt-4o', seed: '1234', out: 'reports/tmp-serve-e2e' },
+      server.token,
+    );
+    assert.equal(res.status, 200, `POST /api/test 应 200：${res.body}`);
+    const { id } = JSON.parse(res.body) as { id: string };
+    const deadline = Date.now() + 150000;
+    let status = '';
+    let lastError = '';
+    while (Date.now() < deadline) {
+      const logRes = await request(server.port, `/api/jobs/${id}/log?after=0`);
+      const log = JSON.parse(logRes.body) as { lines: Array<{ text: string }>; status: string };
+      status = log.status;
+      lastError = log.lines.length > 0 ? log.lines[log.lines.length - 1]!.text : '';
+      if (status !== 'running') break;
+      await delay(300);
+    }
+    assert.equal(status, 'done', `审计应在 150s 内完成，实际 status=${status}，最后日志：${lastError}`);
+    const detailRes = await request(server.port, `/api/jobs/${id}`);
+    const detail = JSON.parse(detailRes.body) as {
+      status: string;
+      exitCode: number;
+      reportPaths: { markdownPath: string; htmlPath: string; jsonPath: string; baselinePath: string | null } | null;
+    };
+    assert.equal(detail.exitCode, 0, `诚实 mock 审计应 exit 0`);
+    assert.ok(detail.reportPaths !== null, `非 dry-run 应产出 reportPaths（实际 null；日志尾部：${lastError}）`);
+    const paths = detail.reportPaths!;
+    // CLI 打印的是绝对路径（writeReports 用 resolve(outDir)+join）；normalize 后统一断言
+    const norm = (p: string) => p.replaceAll('\\', '/');
+    assert.match(norm(paths.jsonPath), /tmp-serve-e2e\/report-[^/]+\.json$/, `jsonPath 应指向 tmp-serve-e2e 下的 report-*.json：${paths.jsonPath}`);
+    // 绝对路径必须能被报告端点读回（query 需 URL 编码：Windows 绝对路径含 ':' 与 '\'）
+    const fileRes = await request(server.port, `/api/reports/file?name=${encodeURIComponent(paths.jsonPath)}`);
+    assert.equal(fileRes.status, 200, `绝对路径报告应 200：${fileRes.body}`);
+    const report = JSON.parse(fileRes.body) as { outcomes?: unknown[] };
+    assert.ok(Array.isArray(report.outcomes) && report.outcomes.length > 0, '读回的报告应有非空 outcomes');
+    const mdRes = await request(server.port, `/api/reports/file?name=${encodeURIComponent(paths.markdownPath)}`);
+    assert.equal(mdRes.status, 200);
+    // 回归防线：绝对路径不得成为读取仓库任意文件的后门
+    const pkg = await request(server.port, `/api/reports/file?name=${encodeURIComponent(join(REPO_ROOT, 'package.json'))}`);
+    assert.equal(pkg.status, 404, `仓库 package.json 应 404，实际 ${String(pkg.status)}`);
+    const plan = await request(server.port, `/api/reports/file?name=${encodeURIComponent(join(REPO_ROOT, 'plan.md'))}`);
+    assert.equal(plan.status, 404, `仓库 plan.md 应 404，实际 ${String(plan.status)}`);
+  } finally {
+    mock.server.close();
+    rmSync(outDir, { recursive: true, force: true });
+  }
 });
