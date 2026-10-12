@@ -15,7 +15,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { basename, isAbsolute, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const DEFAULT_PORT = 8620;
@@ -235,25 +235,44 @@ export async function createConsoleServer(options = {}) {
     res.end(req.method === 'HEAD' ? undefined : content);
   }
 
-  // —— 报告文件：仅 reports/ 目录 + 扩展名白名单 ——
-  async function serveReportFile(res, name) {
-    if (typeof name !== 'string' || name === '') {
-      sendError(res, 404, '未指定报告文件。');
-      return;
-    }
-    const segments = name.replaceAll('\\', '/').split('/');
-    for (const segment of segments) {
-      if (segment === '' || segment === '.' || segment === '..' || segment.startsWith('.')) {
-        sendError(res, 404, '非法的报告文件路径。');
-        return;
+  // —— 报告文件：两类合法请求 ——
+  //   ① reports/ 相对路径（历史列表/页面渲染用）；
+  //   ② 绝对路径（CLI 在 stderr 打印 resolve(outDir) 后的绝对路径，任务完成后的 reportPaths 就是它）。
+  // 安全防线：解析结果必须仍在 repoRoot 内，且（位于 reports/ 下 或 文件名形如 report-/baseline-），
+  // 防止借绝对路径读取仓库任意文件（package.json/plan.md 等一律 404）。
+  function resolveReportRequest(name) {
+    if (typeof name !== 'string' || name === '') return { error: '未指定报告文件。' };
+    const normalized = name.replaceAll('\\', '/');
+    let file;
+    if (/^(?:[A-Za-z]:)?\//.test(normalized)) {
+      file = resolve(normalized);
+    } else {
+      const segments = normalized.split('/');
+      for (const segment of segments) {
+        if (segment === '' || segment === '.' || segment === '..' || segment.startsWith('.')) {
+          return { error: '非法的报告文件路径。' };
+        }
       }
+      file = resolve(reportsRoot, ...segments);
     }
-    const file = resolve(reportsRoot, ...segments);
-    const rel = relative(reportsRoot, file);
-    if (rel === '' || rel.startsWith('..')) {
-      sendError(res, 404, '非法的报告文件路径。');
+    const relRepo = relative(repoRoot, file);
+    if (relRepo === '' || relRepo.startsWith('..') || isAbsolute(relRepo)) {
+      return { error: '报告文件路径越出仓库范围。' };
+    }
+    const relReports = relative(reportsRoot, file);
+    const insideReports = relReports !== '' && !relReports.startsWith('..') && !isAbsolute(relReports);
+    if (!insideReports && !/^(report|baseline)-.+\./i.test(basename(file))) {
+      return { error: '仅提供报告文件（reports/ 下或 report-/baseline- 命名）。' };
+    }
+    return { file };
+  }
+  async function serveReportFile(res, name) {
+    const resolved = resolveReportRequest(name);
+    if (resolved.error !== undefined) {
+      sendError(res, 404, resolved.error);
       return;
     }
+    const file = resolved.file;
     const dotAt = file.lastIndexOf('.');
     const ext = dotAt === -1 ? '' : file.slice(dotAt).toLowerCase();
     if (!REPORT_EXT_WHITELIST.has(ext)) {
@@ -352,7 +371,17 @@ export async function createConsoleServer(options = {}) {
       args.push('--timeout', timeout);
     }
     const out = typeof body.out === 'string' ? body.out.trim() : '';
-    if (out !== '') args.push('--out', out);
+    if (out !== '') {
+      // UI 承诺「结果页内渲染」：out 越出仓库范围会导致报告无法经 /api/reports/file 读回，提前拒绝
+      const resolvedOut = resolve(repoRoot, out);
+      const relOut = relative(repoRoot, resolvedOut);
+      if (relOut === '' || relOut.startsWith('..') || isAbsolute(relOut)) {
+        throw new Error(
+          `out 必须位于仓库目录内（页面渲染需要读取报告文件）。收到：${JSON.stringify(out)}。示例：reports`,
+        );
+      }
+      args.push('--out', out);
+    }
     const baseline = typeof body.baseline === 'string' ? body.baseline.trim() : '';
     if (baseline !== '') args.push('--baseline', baseline);
     if (body.deep === true) args.push('--deep');
@@ -360,7 +389,7 @@ export async function createConsoleServer(options = {}) {
     else args.push('--yes');
     return args;
   }
-  function startTestJob(body) {
+  function startTestJob(body, args) {
     const job = {
       id: randomUUID(),
       status: 'running',
@@ -382,7 +411,7 @@ export async function createConsoleServer(options = {}) {
       secrets,
     );
     try {
-      const child = spawn(process.execPath, [cliPath, ...buildTestArgs(body)], {
+      const child = spawn(process.execPath, [cliPath, ...args], {
         cwd: repoRoot,
         env: { ...process.env, ...(effectiveKey() !== null ? { MODEL_XRAY_KEY: effectiveKey() } : {}) },
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -420,7 +449,19 @@ export async function createConsoleServer(options = {}) {
     if (out !== null) args.push('--out', out);
     const priceIn = typeof body.priceInput === 'string' ? body.priceInput.trim() : '';
     const priceOut = typeof body.priceOutput === 'string' ? body.priceOutput.trim() : '';
-    if (priceIn !== '' && priceOut !== '') args.push('--price-input', priceIn, '--price-output', priceOut);
+    // 价格必须成对且为正数：单填一个就静默忽略会架空「录入价格才启用计费」的语义
+    if ((priceIn !== '') !== (priceOut !== '')) {
+      throw new Error('price-input 与 price-output 必须成对填写。示例：priceInput=2.5, priceOutput=10（单位：每百万 tokens）');
+    }
+    if (priceIn !== '') {
+      if (!isPositiveNumberStr(priceIn)) {
+        throw new Error(`price-input 必须为正数。收到：${JSON.stringify(priceIn)}。示例：2.5`);
+      }
+      if (!isPositiveNumberStr(priceOut)) {
+        throw new Error(`price-output 必须为正数。收到：${JSON.stringify(priceOut)}。示例：10`);
+      }
+      args.push('--price-input', priceIn, '--price-output', priceOut);
+    }
     guard.status = 'running';
     guard.port = body.port;
     guard.baseUrl = body.baseUrl;
@@ -599,7 +640,9 @@ export async function createConsoleServer(options = {}) {
             return;
           }
           try {
-            const job = startTestJob(body);
+            // 先做参数校验/组装：非法参数直接 400（含收到值与示例），不进入任务生命周期
+            const args = buildTestArgs(body);
+            const job = startTestJob(body, args);
             send(res, 200, { id: job.id });
           } catch (error) {
             sendError(res, 400, error instanceof Error ? error.message : String(error));
@@ -632,8 +675,12 @@ export async function createConsoleServer(options = {}) {
           if (typeof body.key === 'string' && body.key.trim() !== '') {
             state.sessionKey = body.key.trim();
           }
-          startGuard({ ...body, baseUrl: base.value, port });
-          send(res, 200, { started: true, port });
+          try {
+            startGuard({ ...body, baseUrl: base.value, port });
+            send(res, 200, { started: true, port });
+          } catch (error) {
+            sendError(res, 400, error instanceof Error ? error.message : String(error));
+          }
           return;
         }
         if (pathname === '/api/guard/stop') {

@@ -427,11 +427,11 @@ if (typeof document !== 'undefined') {
   }
   function showRunBanner(kind, title, detail = '') {
     if (runBanner === null) return;
-    runBanner.className = `banner ${kind === 'fail' ? 'banner-fail' : kind === 'pass' ? 'banner-pass' : 'banner-offline'}`;
+    runBanner.className = `banner ${kind === 'fail' ? 'banner-fail' : kind === 'warn' ? 'banner-warn' : kind === 'pass' ? 'banner-pass' : 'banner-offline'}`;
     runBanner.textContent = detail === '' ? title : `${title} — ${detail}`;
     runBanner.removeAttribute('hidden');
   }
-  async function renderReportResult(reportPaths, overall) {
+  async function renderReportResult(reportPaths, exitCode, jobStatus) {
     const wrap = byId('report-result');
     const links = byId('report-links');
     const out = byId('report-out');
@@ -457,16 +457,29 @@ if (typeof document !== 'undefined') {
         links.appendChild(a);
       }
     }
+    // 判定优先取报告 JSON 的 overall（warn 只有这里能拿到），读不到再按退出码兜底
+    let overall = null;
     if (out !== null && reportPaths.jsonPath !== null) {
       const res = await fetch(`/api/reports/file?name=${encodeURIComponent(reportPaths.jsonPath)}`);
       if (res.ok) {
-        const result = renderScorecard(await res.text());
+        const text = await res.text();
+        const result = renderScorecard(text);
         out.innerHTML = result.error !== null ? `<p class="error">${escapeHtml(result.error)}</p>` : result.html;
+        try {
+          const parsed = JSON.parse(text);
+          if (typeof parsed.overall === 'string') overall = parsed.overall;
+        } catch {
+          /* overall 兜底走退出码 */
+        }
       }
     }
     wrap.removeAttribute('hidden');
-    if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：存在异常，请查看下方评分卡与 findings');
+    if (jobStatus === 'error') showRunBanner('fail', '⚠ 任务异常终止（子进程失败）：请查看日志');
+    else if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：存在异常，请查看下方评分卡与 findings');
+    else if (overall === 'warn') showRunBanner('warn', '⚠ 可疑：存在可疑迹象但未实锤，请查看评分卡与 findings');
     else if (overall === 'pass') showRunBanner('pass', '✔ 检测通过：本轮未发现掺假/缩水证据');
+    else if (exitCode === 1) showRunBanner('fail', '⚠ 检测不通过（exit 1）：请查看日志与报告');
+    else if (exitCode === 2) showRunBanner('fail', '任务出错或未得出结论（exit 2）：请核对参数/key/端点后重试，详见日志');
   }
   function stopLogPoll() {
     if (logPollTimer !== null) {
@@ -477,7 +490,6 @@ if (typeof document !== 'undefined') {
   }
   function pollJob(id) {
     let after = 0;
-    let overall = null;
     logPollTimer = setInterval(async () => {
       try {
         const res = await api(`/api/jobs/${id}/log?after=${after}`);
@@ -494,11 +506,7 @@ if (typeof document !== 'undefined') {
         const detail = await api(`/api/jobs/${id}`);
         const exitCode = detail.ok ? detail.data.exitCode : null;
         const reportPaths = detail.ok ? detail.data.reportPaths : null;
-        // 退出码语义：0 pass/warn · 1 fail · 2 error
-        if (exitCode === 2) showRunBanner('fail', '任务出错（参数或端点问题）：exit 2，请查看日志');
-        else if (exitCode === 1) overall = 'fail';
-        if (log.status === 'error') showRunBanner('fail', '任务异常终止（子进程失败）');
-        await renderReportResult(reportPaths, overall);
+        await renderReportResult(reportPaths, exitCode, log.status);
       } catch (error) {
         stopLogPoll();
         showRunBanner('fail', '轮询中断', error instanceof Error ? error.message : String(error));
