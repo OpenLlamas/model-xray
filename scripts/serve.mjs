@@ -5,15 +5,19 @@
 //   ② 一次性检测：POST /api/test 真实 spawn CLI 子进程，逐行流式回传日志（/api/jobs/:id/log）；
 //   ③ key 页面录入：仅存于本进程内存（keySource=page），绝不回显、绝不写日志；
 //   ④ 历史报告：列取/读取 reports/ 下的报告文件（白名单扩展名 + 防穿越）；
-//   ⑤ 常驻监控：托管 `model-xray guard` 子进程（启动/停止/日志尾随）。
+//   ⑤ 常驻监控：托管 `model-xray guard` 子进程（启动/停止/日志尾随）；
+//   ⑥ 别名网关管理面：/api/gateway/*（渠道 CRUD/状态/虚拟 key/用量/告警；数据面由 dist/src/gateway 独立回环端口提供）；
+//      S1 账本（dist/src/ledger，reports/gateway-ledger.db）随网关启动做恢复、随停止关闭（正文零持久化）。
 // 安全约定：
-//   - 只监听 127.0.0.1；token 每次启动随机生成；POST 端点必须携带 x-model-xray-token；
+//   - 只监听 127.0.0.1；token 每次启动随机生成；/api/gateway/* 与全部 POST 端点必须携带 x-model-xray-token；
 //   - key 只经环境变量 MODEL_XRAY_KEY 注入子进程，不出现在命令行参数 / 日志 / 响应里；
-//   - 静态文件仅限 web/ 目录；路径穿越、点文件、畸形编码一律拒绝。
+//   - 网关上游 apiKey 只存本进程内存（渠道视图 hasKey:true，绝不回显/落盘/日志）；
+//   - 静态文件仅限 web/ 目录；路径穿越、点文件、畸形编码一律拒绝；
+
 import { createServer } from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { mkdir, readFile, readdir, stat } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { basename, isAbsolute, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -124,6 +128,8 @@ export async function createConsoleServer(options = {}) {
     sessionKey: null,
     job: null,
     guard: { child: null, status: 'stopped', port: null, baseUrl: null, exitCode: null, lines: [], nextSeq: 0 },
+    // 别名网关管理面状态：实例懒加载自 dist/（未构建时相关端点回 503，控制台其余功能不受影响）
+    gateway: { instance: null, modulePromise: null, starting: false, ledger: null, ledgerPromise: null },
   };
   const envKey = () => process.env.MODEL_XRAY_KEY || process.env.OPENAI_API_KEY || null;
   const effectiveKey = () => state.sessionKey ?? envKey();
@@ -513,6 +519,47 @@ export async function createConsoleServer(options = {}) {
     return true;
   }
 
+  // —— 别名网关管理面（懒加载 dist 网关模块；未构建时端点回 503 引导构建） ——
+  // 加载失败不缓存 null：构建完成后下次点击启动即可重试成功（无需重启控制台）。
+  function loadGatewayModule() {
+    const gateway = state.gateway;
+    if (gateway.modulePromise === null) {
+      gateway.modulePromise = import(pathToFileURL(join(repoRoot, 'dist', 'src', 'gateway', 'server.js')).href).catch(() => {
+        gateway.modulePromise = null;
+        return null;
+      });
+    }
+    return gateway.modulePromise;
+  }
+  function loadLedgerModule() {
+    const gateway = state.gateway;
+    if (gateway.ledgerPromise === null) {
+      gateway.ledgerPromise = import(pathToFileURL(join(repoRoot, 'dist', 'src', 'ledger', 'ledger.js')).href).catch(() => {
+        gateway.ledgerPromise = null;
+        return null;
+      });
+    }
+    return gateway.ledgerPromise;
+  }
+  // ChannelError（来自 dist 模块）结构透传 status；其余错误按 400 处理
+  function sendGatewayChannelError(res, error) {
+    if (error !== null && typeof error === 'object' && typeof error.status === 'number' && typeof error.message === 'string') {
+      sendError(res, error.status, error.message);
+      return;
+    }
+    sendError(res, 400, error instanceof Error ? error.message : String(error));
+  }
+  function gatewayNotRunning(res, hint) {
+    sendError(res, 400, `网关未运行：请先 POST /api/gateway/start 启动（${hint}）。示例：{"port":"8622"}（缺省 = 随机回环端口）`);
+  }
+  function decodeChannelId(raw) {
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return null;
+    }
+  }
+
   const server = await new Promise((resolveServer, rejectServer) => {
     const srv = createServer(async (req, res) => {
       try {
@@ -591,6 +638,213 @@ export async function createConsoleServer(options = {}) {
             next: guard.nextSeq,
             running: guard.status === 'running',
           });
+          return;
+        }
+        // —— 别名网关管理面：全部端点要求控制台 token（含 GET；渠道视图绝不含上游 key） ——
+        if (pathname.startsWith('/api/gateway/')) {
+          if (!requireToken(req, res)) return;
+          const gateway = state.gateway;
+          if (req.method === 'GET') {
+            if (pathname === '/api/gateway/status') {
+              if (gateway.instance === null) {
+                send(res, 200, { running: false });
+                return;
+              }
+              send(res, 200, { running: true, ...gateway.instance.status() });
+              return;
+            }
+            if (pathname === '/api/gateway/channels') {
+              if (gateway.instance === null) {
+                send(res, 200, { channels: [] });
+                return;
+              }
+              send(res, 200, {
+                channels: gateway.instance.store.list().map((channel) => gateway.instance.store.view(channel)),
+              });
+              return;
+            }
+            if (pathname === '/api/gateway/virtual-key') {
+              if (gateway.instance === null) {
+                gatewayNotRunning(res, '虚拟 key 随网关启动生成');
+                return;
+              }
+              send(res, 200, { virtualKey: gateway.instance.virtualKey });
+              return;
+            }
+            // 用量与告警（S2/S3）：运行期实时口径（内存计数），账本（reports/gateway-ledger.db）为权威账
+            if (pathname === '/api/gateway/usage') {
+              if (gateway.instance === null) {
+                send(res, 200, { usage: [] });
+                return;
+              }
+              send(res, 200, { usage: gateway.instance.usageSummary() });
+              return;
+            }
+            if (pathname === '/api/gateway/events') {
+              if (gateway.instance === null) {
+                send(res, 200, { events: [] });
+                return;
+              }
+              send(res, 200, { events: gateway.instance.events() });
+              return;
+            }
+            sendError(res, 404, '未知的 API 端点。');
+            return;
+          }
+          if (req.method !== 'POST') {
+            sendError(res, 405, '该端点仅支持 GET/POST。');
+            return;
+          }
+          let gbody;
+          try {
+            gbody = await readBody(req);
+          } catch (error) {
+            sendError(res, 400, error instanceof Error ? error.message : String(error));
+            return;
+          }
+          if (pathname === '/api/gateway/start') {
+            if (gateway.instance !== null) {
+              sendError(res, 409, '网关已在运行；如需换端口请先 POST /api/gateway/stop 停止。');
+              return;
+            }
+            if (gateway.starting) {
+              sendError(res, 409, '网关正在启动中：请稍候（无需重复点击；长时间无响应可重试）。');
+              return;
+            }
+            gateway.starting = true;
+            try {
+              let port = 0;
+              if (gbody.port !== undefined && gbody.port !== null && String(gbody.port).trim() !== '') {
+                const raw = String(gbody.port).trim();
+                if (raw === '0') {
+                  port = 0;
+                } else if (!isPositiveIntStr(raw) || Number(raw) > 65535) {
+                  sendError(res, 400, `port 必须是 [0, 65535] 整数（0 或缺省 = 随机回环端口）。收到：${JSON.stringify(raw)}。示例：8622`);
+                  return;
+                } else {
+                  port = Number(raw);
+                }
+              }
+              const gatewayModule = await loadGatewayModule();
+              const ledgerModule = await loadLedgerModule();
+              if (gatewayModule === null || ledgerModule === null) {
+                sendError(res, 503, '网关模块未构建：请先在仓库目录运行 npm run build（生成 dist/src/gateway 与 dist/src/ledger）后再次点击启动即可（无需重启本控制台）。');
+                return;
+              }
+              // S1 账本：随网关启动创建；启动时先做 recover（补结上次进程中断的请求），随停止/控制台关闭而 close。
+              // 账本写失败 fail-open（转发不受影响），degraded 状态经 /api/gateway/status 披露。
+              let ledger = null;
+              try {
+                await mkdir(reportsRoot, { recursive: true });
+                ledger = new ledgerModule.Ledger(join(reportsRoot, 'gateway-ledger.db'));
+                const recovered = ledger.recover();
+                if (recovered > 0) {
+                  console.error(`[gateway] 账本恢复：补结 ${recovered} 条中断请求（client_status=interrupted，归因 gateway，不计渠道错误）`);
+                }
+                const instance = await gatewayModule.createAliasGateway({ port, ledger, onLog: (line) => console.error(line) });
+                gateway.instance = instance;
+                gateway.ledger = ledger;
+                ledger = null; // 所有权移交运行中的网关，停止/关闭时由本进程统一 close
+                console.error(`[gateway] 已启动：127.0.0.1:${instance.port}（仅本机回环；虚拟 key 只在页面展示，不落日志）`);
+                send(res, 200, { port: instance.port, virtualKey: instance.virtualKey });
+              } catch (error) {
+                if (ledger !== null) ledger.close();
+                const code = error !== null && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+                if (code === 'EADDRINUSE') {
+                  sendError(res, 400, `端口 ${port} 被占用：请换一个端口或留空使用随机端口。收到：${JSON.stringify(String(port))}。示例：{"port":"8623"}`);
+                } else {
+                  sendError(res, 400, `网关启动失败：${error instanceof Error ? error.message : String(error)}。示例：{"port":"8622"}（缺省 = 随机回环端口）`);
+                }
+              }
+            } finally {
+              gateway.starting = false;
+            }
+            return;
+          }
+          if (pathname === '/api/gateway/stop') {
+            if (gateway.starting) {
+              sendError(res, 409, '网关正在启动中：请等启动完成后再停止（避免启动/停止互相覆盖）。');
+              return;
+            }
+            if (gateway.instance === null) {
+              send(res, 200, { stopped: false });
+              return;
+            }
+            const instance = gateway.instance;
+            gateway.instance = null;
+            gateway.modulePromise = null;
+            gateway.ledgerPromise = null;
+            await instance.close().catch(() => undefined);
+            if (gateway.ledger !== null) {
+              // 先停网关（不再产生新结算）再关账本：checkpoint 后释放文件句柄
+              gateway.ledger.close();
+              gateway.ledger = null;
+            }
+            console.error('[gateway] 已停止（在途请求由数据面自行收尾；账本已 checkpoint 关闭）');
+            send(res, 200, { stopped: true });
+            return;
+          }
+          if (pathname === '/api/gateway/channels') {
+            if (gateway.instance === null) {
+              gatewayNotRunning(res, '渠道需挂在运行中的网关上');
+              return;
+            }
+            try {
+              const channel = gateway.instance.store.create(gbody);
+              console.error(`[gateway] 渠道已添加：${channel.id}（别名 ${channel.models.length} 个；上游 key 仅存内存，不回显/不落日志）`);
+              send(res, 200, { channel: gateway.instance.store.view(channel) });
+            } catch (error) {
+              sendGatewayChannelError(res, error);
+            }
+            return;
+          }
+          const channelDeleteMatch = pathname.match(/^\/api\/gateway\/channels\/([^/]+)\/delete$/);
+          if (channelDeleteMatch !== null) {
+            const id = decodeChannelId(channelDeleteMatch[1]);
+            if (id === null) {
+              sendError(res, 400, '渠道 id 百分号编码畸形，无法解析。示例：先用 GET /api/gateway/channels 列出有效 id。');
+              return;
+            }
+            if (gateway.instance === null) {
+              gatewayNotRunning(res, '删除渠道需网关运行中');
+              return;
+            }
+            if (!gateway.instance.store.remove(id)) {
+              sendError(res, 404, `未找到渠道 ${JSON.stringify(id)}（可能已被删除）。示例：先用 GET /api/gateway/channels 列出有效 id。`);
+              return;
+            }
+            console.error(`[gateway] 渠道已移除：${id}（在途请求不打断；别名即刻释放可复用）`);
+            send(res, 200, { deleted: true });
+            return;
+          }
+          const channelMatch = pathname.match(/^\/api\/gateway\/channels\/([^/]+)$/);
+          if (channelMatch !== null) {
+            const id = decodeChannelId(channelMatch[1]);
+            if (id === null) {
+              sendError(res, 400, '渠道 id 百分号编码畸形，无法解析。示例：先用 GET /api/gateway/channels 列出有效 id。');
+              return;
+            }
+            if (gateway.instance === null) {
+              gatewayNotRunning(res, '更新渠道需网关运行中');
+              return;
+            }
+            try {
+              const channel = gateway.instance.store.update(id, gbody);
+              send(res, 200, { channel: gateway.instance.store.view(channel) });
+            } catch (error) {
+              sendGatewayChannelError(res, error);
+            }
+            return;
+          }
+          if (pathname === '/api/gateway/virtual-key/rotate') {
+            if (gateway.instance === null) {
+              gatewayNotRunning(res, '虚拟 key 随网关启动生成');
+              return;
+            }
+            send(res, 200, { virtualKey: gateway.instance.rotateVirtualKey() });
+            return;
+          }
+          sendError(res, 404, '未知的 API 端点。');
           return;
         }
         // 其余均为 POST：需要 token
@@ -710,29 +964,70 @@ export async function createConsoleServer(options = {}) {
     const job = state.job;
     if (job !== null && job.child !== null) job.child.kill();
     await stopGuard().catch(() => undefined);
+    const gatewayInstance = state.gateway.instance;
+    if (gatewayInstance !== null) {
+      state.gateway.instance = null;
+      state.gateway.modulePromise = null;
+      state.gateway.ledgerPromise = null;
+      await gatewayInstance.close().catch(() => undefined);
+    }
+    const ledgerInstance = state.gateway.ledger;
+    if (ledgerInstance !== null) {
+      state.gateway.ledger = null;
+      ledgerInstance.close();
+    }
     await closing.catch(() => undefined);
   };
   return { port: address.port, token, close };
 }
 
-// —— CLI 直跑：node scripts/serve.mjs [port]（默认 8620；传 0 表示随机端口） ——
+// —— CLI 直跑：node scripts/serve.mjs [port] [--no-browser] ——
+//   [port] 缺省 8620；传 0 表示随机端口。
+function parseServeArgs(argv) {
+  let port = null;
+  let noBrowser = false;
+  for (let index = 0; index < argv.length; index += 1) {
+    const arg = argv[index];
+    if (arg === '--no-browser') {
+      noBrowser = true;
+      continue;
+    }
+    if (arg === '--help' || arg === '-h') {
+      return { ok: false, help: true, message: '用法：node scripts/serve.mjs [port] [--no-browser]（port 缺省 8620；0 表示随机端口）' };
+    }
+    if (/^\d+$/.test(arg) && Number(arg) <= 65535) {
+      port = Number(arg);
+      continue;
+    }
+    return { ok: false, message: `参数非法：${JSON.stringify(arg)}。示例：node scripts/serve.mjs 8620（或 0 表示随机端口）` };
+  }
+  return { ok: true, port, noBrowser };
+}
+
 const invokedDirectly =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(resolve(process.argv[1])).href;
 if (invokedDirectly) {
-  const raw = process.argv[2];
-  let port = DEFAULT_PORT;
-  if (raw !== undefined) {
-    if (!/^\d+$/.test(raw) || Number(raw) > 65535) {
-      console.error(`端口参数非法：${JSON.stringify(raw)}。示例：node scripts/serve.mjs 8620（或 0 表示随机端口）`);
-      process.exit(2);
-    }
-    port = Number(raw);
+  const parsed = parseServeArgs(process.argv.slice(2));
+  if (!parsed.ok) {
+    console.error(parsed.message);
+    process.exit(parsed.help === true ? 0 : 2);
   }
+  const port = parsed.port ?? DEFAULT_PORT;
   const repoRoot = resolve(SCRIPT_DIR, '..');
   try {
     const server = await createConsoleServer({ port, repoRoot });
-    console.log(`model-xray 控制台：http://127.0.0.1:${server.port}（仅本机回环；Ctrl+C 退出）`);
-    if (server.port !== 0 && process.stdout.isTTY && process.env.MODEL_XRAY_NO_BROWSER !== '1') {
+    console.log(`model-xray 控制台：http://127.0.0.1:${server.port}（仅本机回环）`);
+    let shutdownStarted = false;
+    const shutdown = (trigger, exitCode = 0) => {
+      if (shutdownStarted) return Promise.resolve();
+      shutdownStarted = true;
+      console.log(`model-xray 控制台正在退出（${trigger}）…`);
+      return server
+        .close()
+        .catch(() => undefined)
+        .then(() => process.exit(exitCode));
+    };
+    if (!parsed.noBrowser && server.port !== 0 && process.stdout.isTTY && process.env.MODEL_XRAY_NO_BROWSER !== '1') {
       const url = `http://127.0.0.1:${server.port}`;
       const opener =
         process.platform === 'win32'
@@ -743,9 +1038,9 @@ if (invokedDirectly) {
       opener.on('error', () => undefined);
       opener.unref();
     }
-    process.on('SIGINT', () => {
-      void server.close().finally(() => process.exit(0));
-    });
+    console.log('Ctrl+C（或关闭 stdin）停止。');
+    process.on('SIGINT', () => void shutdown('SIGINT'));
+    process.on('SIGTERM', () => void shutdown('SIGTERM'));
   } catch (error) {
     const code = error !== null && typeof error === 'object' && 'code' in error ? String(error.code) : '';
     if (code === 'EADDRINUSE') {

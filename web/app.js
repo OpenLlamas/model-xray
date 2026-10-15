@@ -301,16 +301,20 @@ if (typeof document !== 'undefined') {
   const isOffline = () => TOKEN === null;
 
   // —— 三 tab 切换 ——
-  const tabs = { test: byId('tab-test'), guard: byId('tab-guard'), reports: byId('tab-reports') };
-  const panels = { test: byId('panel-test'), guard: byId('panel-guard'), reports: byId('panel-reports') };
+  const tabs = { test: byId('tab-test'), guard: byId('tab-guard'), gateway: byId('tab-gateway'), reports: byId('tab-reports') };
+  const panels = { test: byId('panel-test'), guard: byId('panel-guard'), gateway: byId('panel-gateway'), reports: byId('panel-reports') };
   function selectTab(which) {
-    for (const key of ['test', 'guard', 'reports']) {
+    for (const key of ['test', 'guard', 'gateway', 'reports']) {
       tabs[key]?.setAttribute('aria-selected', key === which ? 'true' : 'false');
       if (panels[key]) panels[key].hidden = key !== which;
     }
   }
   tabs.test?.addEventListener('click', () => selectTab('test'));
   tabs.guard?.addEventListener('click', () => selectTab('guard'));
+  tabs.gateway?.addEventListener('click', () => {
+    selectTab('gateway');
+    void refreshGateway();
+  });
   tabs.reports?.addEventListener('click', () => {
     selectTab('reports');
     void refreshReports();
@@ -558,6 +562,7 @@ if (typeof document !== 'undefined') {
   let guardLogNext = 0;
   function renderGuardStatus(st) {
     if (guardStateEl === null) return;
+    guardStateEl.dataset.running = st?.running === true ? 'true' : 'false';
     if (st?.running === true) {
       guardStateEl.textContent = `状态：运行中（本地代理 http://127.0.0.1:${String(st.port)}/v1 → ${String(st.baseUrl)}）`;
     } else if (st?.status === 'exited') {
@@ -621,7 +626,312 @@ if (typeof document !== 'undefined') {
     await pollGuardOnce();
   });
 
-  // —— Tab ③：历史报告 ——
+  // —— Tab ③：多渠道 OpenAI API 聚合入口（上游凭证仅驻留本机服务内存） ——
+  const gatewayError = byId('gateway-error');
+  const channelForm = byId('channel-form');
+  const channelList = byId('channel-list');
+  const gatewayState = byId('gateway-status');
+  const gatewayBaseUrl = byId('gateway-base-url');
+  const gatewayKeyState = byId('gateway-client-key-state');
+  const gatewayClientKey = byId('f-gateway-client-key');
+  const gatewayCopyUrl = byId('gateway-copy-url');
+  const ledgerBanner = byId('ledger-degraded-banner');
+  /** 渠道 id → 渠道名（用量表的渠道列用名称展示，缺失时兜底 id）。 */
+  const channelLabels = new Map();
+  let gatewayRunning = false;
+
+  function showGatewayError(message = '') {
+    if (gatewayError === null) return;
+    gatewayError.textContent = message;
+    gatewayError.toggleAttribute('hidden', message === '');
+  }
+  function setChannelForm(channel = null) {
+    if (!(channelForm instanceof HTMLFormElement)) return;
+    channelForm.reset();
+    const editing = channel !== null;
+    byId('f-channel-id').value = editing ? String(channel.id) : '';
+    byId('f-channel-label').value = editing ? String(channel.label) : '';
+    byId('f-channel-base-url').value = editing ? String(channel.baseUrl) : '';
+    byId('f-channel-key').value = '';
+    byId('f-channel-key').required = !editing;
+    byId('channel-key-help').textContent = editing ? '（留空保持原密钥不变）' : '*';
+    const modelMap = editing && channel.modelMap !== null && typeof channel.modelMap === 'object' ? channel.modelMap : {};
+    const models = editing ? channel.models : [];
+    byId('f-channel-models').value = Array.isArray(models) ? models.join(', ') : '';
+    byId('f-channel-map').value = Object.entries(modelMap).map(([alias, model]) => `${alias}=${String(model)}`).join('\n');
+    channelForm.hidden = false;
+    byId('f-channel-label')?.focus();
+  }
+  function channelModelTags(channel) {
+    const models = Array.isArray(channel?.models) ? channel.models : [];
+    return models.map((model) => `<span class="channel-model">${escapeHtml(model)}</span>`).join('');
+  }
+  function renderChannels(channels) {
+    if (channelList === null) return;
+    channelList.textContent = '';
+    channelLabels.clear();
+    if (!Array.isArray(channels) || channels.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'note';
+      empty.textContent = '尚未添加 API 渠道。添加端点后，可以选择启动聚合网关。';
+      channelList.appendChild(empty);
+      return;
+    }
+    for (const channel of channels) {
+      const card = document.createElement('article');
+      card.className = 'channel-card';
+      const indicator = document.createElement('span');
+      indicator.className = 'channel-indicator';
+      indicator.dataset.enabled = String(channel.enabled === true);
+      const main = document.createElement('div');
+      main.className = 'channel-main';
+      const title = document.createElement('div');
+      title.className = 'channel-title';
+      title.textContent = `${String(channel.label)}${channel.enabled === true ? '' : ' · 已停用'}`;
+      const endpoint = document.createElement('div');
+      endpoint.className = 'channel-endpoint';
+      endpoint.textContent = String(channel.baseUrl);
+      const models = document.createElement('div');
+      models.className = 'channel-models';
+      models.innerHTML = channelModelTags(channel);
+      main.append(title, endpoint, models);
+      const actions = document.createElement('div');
+      actions.className = 'channel-actions';
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'secondary';
+      toggle.textContent = channel.enabled === true ? '停用' : '启用';
+      toggle.addEventListener('click', () => void updateChannel(channel, { enabled: channel.enabled !== true }));
+      const edit = document.createElement('button');
+      edit.type = 'button';
+      edit.className = 'secondary';
+      edit.textContent = '编辑';
+      edit.addEventListener('click', () => setChannelForm(channel));
+      const remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'secondary';
+      remove.textContent = '移除';
+      remove.addEventListener('click', async () => {
+        const response = await api(`/api/gateway/channels/${encodeURIComponent(String(channel.id))}/delete`, { method: 'POST', body: '{}' });
+        if (!response.ok) showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`));
+        else { showGatewayError(); await refreshGateway(); }
+      });
+      actions.append(toggle, edit, remove);
+      card.append(indicator, main, actions);
+      channelList.appendChild(card);
+      channelLabels.set(String(channel.id), String(channel.label));
+    }
+  }
+  async function updateChannel(channel, patch) {
+    const response = await api(`/api/gateway/channels/${encodeURIComponent(String(channel.id))}`, {
+      method: 'POST', body: JSON.stringify(patch),
+    });
+    if (!response.ok) showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`));
+    else { showGatewayError(); await refreshGateway(); }
+  }
+  async function refreshGateway() {
+    if (isOffline()) return;
+    try {
+      const [statusResponse, channelResponse] = await Promise.all([
+        api('/api/gateway/status'),
+        api('/api/gateway/channels'),
+      ]);
+      if (!statusResponse.ok || !channelResponse.ok) {
+        const problem = statusResponse.ok ? channelResponse : statusResponse;
+        showGatewayError(String(problem.data?.error ?? `HTTP ${problem.status}`));
+        return;
+      }
+      const status = statusResponse.data;
+      gatewayRunning = status?.running === true;
+      // 账本降级横幅（页面顶部）：写入失败必须显式披露数据缺口，绝不静默；转发不受影响（fail-open）
+      const degraded = gatewayRunning && status !== null && typeof status === 'object' ? status.degraded : null;
+      const writeErrors = Number(degraded?.writeErrors ?? 0);
+      const showDegraded = gatewayRunning && (degraded?.degraded === true || writeErrors > 0);
+      if (ledgerBanner) {
+        ledgerBanner.textContent = showDegraded
+          ? `账本降级：写入失败 ${writeErrors} 次（数据缺口，统计不含被丢弃请求）`
+          : '';
+        ledgerBanner.toggleAttribute('hidden', !showDegraded);
+      }
+      if (gatewayState) {
+        gatewayState.textContent = gatewayRunning
+          ? `运行中 · ${Number(status.enabledChannelCount ?? 0)} 个模型 · 请求 ${Number(status.requests?.total ?? 0)} 次（错 ${Number(status.requests?.error ?? 0)}）`
+          : '未启动';
+        gatewayState.title =
+          gatewayRunning && status.lastError ? `最近一次上游错误：${String(status.lastError.message)}` : '';
+      }
+      const base = gatewayRunning ? `http://127.0.0.1:${String(status.port)}/v1` : '等待启动';
+      if (gatewayBaseUrl) gatewayBaseUrl.textContent = base;
+      if (gatewayCopyUrl) gatewayCopyUrl.textContent = base;
+      if (gatewayClientKey && gatewayRunning && gatewayClientKey.value === '') {
+        const keyResponse = await api('/api/gateway/virtual-key');
+        if (keyResponse.ok) gatewayClientKey.value = String(keyResponse.data?.virtualKey ?? '');
+      }
+      if (!gatewayRunning && gatewayClientKey) gatewayClientKey.value = '';
+      if (gatewayKeyState) gatewayKeyState.textContent = gatewayRunning ? '会话密钥' : '未生成';
+      renderChannels(channelResponse.data?.channels);
+      if (!gatewayRunning) {
+        // 网关停止：实时面板清空（内存计数随实例销毁；账本才是权威历史）
+        renderUsage([]);
+        renderAlerts([]);
+      }
+      showGatewayError();
+    } catch (error) {
+      showGatewayError(error instanceof Error ? error.message : String(error));
+    }
+  }
+  byId('btn-channel-new')?.addEventListener('click', () => setChannelForm());
+  byId('btn-channel-cancel')?.addEventListener('click', () => { if (channelForm) channelForm.hidden = true; });
+  channelForm?.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    const id = inputValue('f-channel-id');
+    const models = inputValue('f-channel-models').split(',').map((item) => item.trim()).filter(Boolean);
+    const modelMap = {};
+    for (const line of inputValue('f-channel-map').split(/\r?\n/)) {
+      if (line.trim() === '') continue;
+      const split = line.indexOf('=');
+      if (split < 1 || line.slice(split + 1).trim() === '') {
+        showGatewayError(`模型映射格式无效：${JSON.stringify(line)}。示例：fast-model=gpt-4o-mini`);
+        return;
+      }
+      modelMap[line.slice(0, split).trim()] = line.slice(split + 1).trim();
+    }
+    const body = {
+      label: inputValue('f-channel-label'), baseUrl: inputValue('f-channel-base-url'),
+      apiKey: inputValue('f-channel-key'), models, modelMap,
+    };
+    if (id !== '') delete body.apiKey; // 编辑时空 key 表示保留；非空 key 显式轮换
+    if (id !== '' && inputValue('f-channel-key') !== '') body.apiKey = inputValue('f-channel-key');
+    const response = await api(id === '' ? '/api/gateway/channels' : `/api/gateway/channels/${encodeURIComponent(id)}`, {
+      method: 'POST', body: JSON.stringify(body),
+    });
+    if (!response.ok) { showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`)); return; }
+    channelForm.hidden = true;
+    showGatewayError();
+    await refreshGateway();
+  });
+  byId('btn-gateway-start')?.addEventListener('click', async () => {
+    showGatewayError();
+    const port = inputValue('f-gateway-port').trim();
+    const response = await api('/api/gateway/start', { method: 'POST', body: JSON.stringify(port === '' ? {} : { port }) });
+    if (!response.ok) { showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`)); return; }
+    gatewayRunning = true;
+    if (gatewayClientKey) gatewayClientKey.value = String(response.data?.virtualKey ?? '');
+    await refreshGateway();
+  });
+  byId('btn-gateway-rotate')?.addEventListener('click', async () => {
+    const response = await api('/api/gateway/virtual-key/rotate', { method: 'POST', body: '{}' });
+    if (!response.ok) { showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`)); return; }
+    if (gatewayClientKey) gatewayClientKey.value = String(response.data?.virtualKey ?? '');
+    await refreshGateway();
+  });
+  byId('btn-gateway-stop')?.addEventListener('click', async () => {
+    const response = await api('/api/gateway/stop', { method: 'POST', body: '{}' });
+    if (!response.ok) showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`));
+    else await refreshGateway();
+  });
+  byId('f-gateway-client-key')?.addEventListener('focus', (event) => event.currentTarget.select());
+
+  // —— 用量与异常面板（S2/S3 实时口径）：3 秒轮询，仅当网关运行中且本标签可见 ——
+  const usageBody = byId('gateway-usage-body');
+  const alertsList = byId('gateway-alerts');
+  const ALERT_KIND_LABELS = {
+    model_mismatch: '模型自述不符',
+    error_rate: '错误率异常',
+    truncated: '响应截断',
+    usage_invalid: 'usage 异常',
+  };
+  function formatLatency(value) {
+    const ms = Number(value);
+    if (!Number.isFinite(ms)) return '—';
+    return ms >= 1000 ? `${(ms / 1000).toFixed(2)} s` : `${Math.round(ms)} ms`;
+  }
+  function renderUsage(usage) {
+    if (!(usageBody instanceof HTMLTableSectionElement)) return;
+    usageBody.textContent = '';
+    const rows = Array.isArray(usage) ? usage : [];
+    if (rows.length === 0) {
+      const tr = document.createElement('tr');
+      const td = document.createElement('td');
+      td.colSpan = 10;
+      td.className = 'placeholder';
+      td.textContent = '暂无实时用量（网关未运行或尚无已结算请求）。';
+      tr.appendChild(td);
+      usageBody.appendChild(tr);
+      return;
+    }
+    for (const row of rows) {
+      const cells = [
+        String(row.alias),
+        channelLabels.get(String(row.channelId)) ?? String(row.channelId),
+        String(Number(row.requests ?? 0)),
+        String(Number(row.ok ?? 0)),
+        String(Number(row.error ?? 0)),
+        String(Number(row.tokenPrompt ?? 0)),
+        String(Number(row.tokenCompletion ?? 0)),
+        row.ttftP50Ms === null || row.ttftP50Ms === undefined ? '—' : formatLatency(row.ttftP50Ms),
+        row.provisional === true
+          ? `样本不足 n=${Number(row.ttftSamples ?? 0)}`
+          : row.ttftP95Ms === null || row.ttftP95Ms === undefined ? '—' : formatLatency(row.ttftP95Ms),
+        row.usageValidRate === null || row.usageValidRate === undefined ? '—' : `${(Number(row.usageValidRate) * 100).toFixed(1)}%`,
+      ];
+      const tr = document.createElement('tr');
+      for (const text of cells) {
+        const td = document.createElement('td');
+        td.textContent = text;
+        tr.appendChild(td);
+      }
+      usageBody.appendChild(tr);
+    }
+  }
+  function renderAlerts(events) {
+    if (alertsList === null) return;
+    alertsList.textContent = '';
+    const list = Array.isArray(events) ? events : [];
+    if (list.length === 0) {
+      const li = document.createElement('li');
+      li.className = 'placeholder';
+      li.textContent = '暂无告警（网关未运行或窗口未达阈值）。';
+      alertsList.appendChild(li);
+      return;
+    }
+    for (const event of list) {
+      const kind = String(event.kind ?? '');
+      const label = ALERT_KIND_LABELS[kind] ?? kind;
+      const observed =
+        kind === 'model_mismatch' || kind === 'truncated'
+          ? `${Number(event.observed ?? 0)} 次`
+          : `${(Number(event.observed ?? 0) * 100).toFixed(0)}%`;
+      const evidenceCount = Array.isArray(event.evidence_request_ids) ? event.evidence_request_ids.length : 0;
+      const li = document.createElement('li');
+      li.textContent =
+        `${new Date(Number(event.ts)).toLocaleTimeString()} · ${channelLabels.get(String(event.channel)) ?? String(event.channel)}` +
+        ` · ${label} · 窗口 ${Number(event.n ?? 0)} 条 / 观测 ${observed} · 证据请求 ${evidenceCount} 条（账本可下钻）`;
+      alertsList.appendChild(li);
+    }
+  }
+  async function refreshGatewayLedger() {
+    if (isOffline() || !gatewayRunning) return;
+    try {
+      const [usageResponse, eventsResponse] = await Promise.all([api('/api/gateway/usage'), api('/api/gateway/events')]);
+      if (usageResponse.ok) renderUsage(usageResponse.data?.usage);
+      if (eventsResponse.ok) renderAlerts(eventsResponse.data?.events);
+    } catch {
+      /* 面板局部失败静默：主刷新已负责错误提示 */
+    }
+  }
+  window.setInterval(() => {
+    if (tabs.gateway?.getAttribute('aria-selected') === 'true') void refreshGatewayLedger();
+  }, 3000);
+  renderUsage([]);
+  renderAlerts([]);
+
+  void refreshGateway();
+  window.setInterval(() => {
+    if (tabs.gateway?.getAttribute('aria-selected') === 'true') void refreshGateway();
+  }, 2500);
+
+  // —— Tab ④：历史报告 ——
   const historyError = byId('history-error');
   const historyOut = byId('history-out');
   async function refreshReports() {
