@@ -103,3 +103,64 @@
 - **审计误报**：采样噪声、版本静默更新→分层告警+静默期+保守阈值，只提示风险不下结论；默认开启的检测必须成本透明（每日 $X 明示）。
 - **探测成本**：每渠道每日预算上限，默认轻量套件。
 - **范围失控**（v2 新增）：1–2 人团队，GUI 严守"8620 演进"路径，九页大GUI按需生长；所有"可砍"项（New API 引擎、Rust 重写、L2 默认开、Gemini 原生入口、DuckDB、多平台 Webhook、⌘K/双语）未经复盘不复活。
+
+## 十、网关主入口化方案（v3，2026-10-14，kimi-k3/glm-5.3/deepseek-v4.1-flash 三模型评审 + 逐条裁决）
+
+> 前提变更：Tauri 桌面壳已删除（只保留 CLI + 8620 WebUI）；下一迭代把「API 聚合网关」升级为唯一主入口：任意 OpenAI 客户端指向网关，全部流量经过程序，程序在其上做全流量监控、渠道持续检测、周期主动探测。
+
+### 裁决后的七条铁律（三模型一致，全 [必须]）
+
+1. **origin 贯穿**：每条账本/评分/告警记录必带 `origin: user|probe|health`；评分窗口按 `(channel, origin)` 二维开窗，探针流量永不混入用户流量统计与对账窗口。
+2. **core 共用**：SSE 切帧/usage 提取/TTFT 计量从 guard 抽成纯函数库 `core/`（输入字节流+注入时钟，输出结构化事件），guard、网关数据面、探针三方共用同一份代码；`core/` 不 import 任何有状态模块，fixture 回放 100% 确定性覆盖。
+3. **账本 append-only**：SQLite（node:sqlite 内置，WAL）不可变请求记录 + settlements 子记录，settle 幂等（`WHERE status='inflight'`，0 行受影响=重复结算不双记）；token 必记但可 NULL（NULL 必带 `token_source`/`token_missing_reason`，禁止写 0 冒充）；金额可空；`error_source: upstream|gateway|client` 三值必填——**渠道评分只消费 upstream，网关自身故障绝不冤枉渠道**；`upstream_status` 与 `client_status` 分离（客户端断开≠上游失败）。
+4. **被动为主，探针为辅**：被动观测（免费、不可被针对性伪装）是第一信号源；探针结论最高只到 `suspect`，只有被动+主动双源一致才允许 alert/红线；两者矛盾 = **differential_treatment 独立告警**（中转站对探针给优待的铁证），绝不加权平均把矛盾洗掉。
+5. **诚实 N/A**：低样本渠道不外推——n<5 不出分、n<20 不报 p95（只给 median+原始值）、n<30 标 provisional；任何评分输出强制带 `n` 与覆盖率披露（「总分 82，基于 4/6 维」）；缺失维度权重重归一化，N/A 永不记 0。
+6. **观测降级不装瞎**：账本写失败/磁盘只读时转发照常（fail-open），但 healthz=degraded + 控制台横幅 + 评分卡标注数据缺口时段；TTFT 用单调时钟并附带事件循环滞后观测，滞后超阈样本标记剔除（本地工具最大误报源）。
+7. **正文零持久化**：用户流量只存结构元数据（token 数、chunk 形态、finish_reason、has_tools/has_image、计时），正文内存解析后即弃；探针流量内容是自产的，可存全文做证据链——这条写进 schema（用户流量表没有 content 列）而非靠自觉；canary key 金丝雀测试钉死「key/正文不入日志/库」。
+
+### 关键设计裁决（分歧处）
+
+- **计费对账双轨**（kimi 账本即真相 vs deepseek/glm 静默窗口，二者互补非冲突）：① 网关直通模式——分子用账本 Σusage（全 origin），分母用余额 Δ，前提渠道声明 `exclusive_key=true`（key 被网关独占），false 则该维度 N/A；② 非独占 key——沿用探针静默窗口 Δ 法，窗口内落任何其他请求立即 contaminated 作废。重试纪律平移：billable 请求默认永不自动重试。
+- **include_usage 注入默认关**（采 deepseek 保守派）：网关默认字节原样透传，不替客户端改请求语义（改了就不是"原样透传"且部分站会 400）；按渠道 opt-in，探针永远强制带 usage；上游因注入 400 时不重发（防双扣费），学习标记"该通道流式无 usage"→ N/A。
+- **端口终态**：单进程双监听——8621=数据面（`/v1` 用虚拟 key `sk-mx-`，存量 guard 客户端零改动；显式声明渠道走 guard 透明兼容模式），8620=控制面（WebUI+`/__mx` 管理 API 用管理 token）；控制面永不代理、数据面永不吐 HTML。否决单端口混鉴权。
+- **TTFT 双口径**：同时记 `upstream_ttft`（渠道评分用）与 `client_ttft`（体验用），本地网关开销不污染渠道结论。
+- **per-install seed**（采纳 glm）：题集 seed 改为装机时随机、本地持久化，跨次运行仍固定（与基线对比兼容），但全网不再同一公开 seed，防针对性过题；被动观测是终极兜底。
+- **熔断/回退/重试缓做**（三模型一致 + M6 opt-in）：熔断只"标记+告警"不自动切流（探针失败≠渠道不可用，不得用自己的本地故障诬告渠道）；自动回退默认关（回退会把"假模型"问题洗成"可用性"问题）；重试仅首字节前 + attempt 子记录链 + 窗口内对账作废。前置条件：网关承载真实日常流量稳定 ≥2 周。
+- **多后端聚类后置（建议）**：中转站单别名背后可能轮询多后端——先做行为签名聚类（finish_reason 分布/delta 粒度/usage 形态），检出后报告「该别名疑似 ≥k 个后端」，指纹告警降级为簇级跟踪，不做单源硬比对。
+- **key 持久化（建议，后置）**：默认仍内存；可选加密存储（scrypt+AES-256-GCM，零新依赖）或 OS 钥匙串作为独立小切片。
+- **identity 指纹代价（披露即可）**：强制 `Accept-Encoding: identity` 是可识别特征，短期保留+文档披露；中期可评估透传+tee 侧解压（字节不再原样，需权衡）。
+
+### M1–M6 切片（每片可独立验收，正确性 > 覆盖面 > 花哨）
+
+| 切片 | 内容 | 硬验收（每条一命令） | Out-of-scope |
+|---|---|---|---|
+| M1 内核+账本 | core 抽取（guard 改依赖，旧测试全绿不动）；SQLite append-only 账本（origin/error_source/token_source、幂等 settle、崩溃恢复 inflight→interrupted） | `verify:sse`（逐字节切割回放+UTF-8 跨界+tee 零差异）·`verify:usage`（7 类畸形 fixture 表断言）·`verify:ledger`（hang/abort/dup-settle 恰好一个终态）·`verify:crash`（kill -9 后 integrity_check+无半行）·`verify:leak`（canary grep=0） | 评分、告警、探针、UI、重试 |
+| M2 全流量被动观测 | 网关 tee→账本（origin=user）；模型一致性/usage 分类/双 TTFT/finish_reason/参数保真度（info 级）；`(channel,origin)` 评分卡三档样本量语义 | `verify:ttft`（role-only 假首 chunk 排除）·`verify:tz`（epoch ms 库内一致）·`verify:looplag`（注入 300ms 阻塞样本被剔除）·低样本 N/A 用例 | 主动探针、对账、告警外发 |
+| M3 评分+告警状态机 | 去抖/冷却/静默/风暴熔断（>10 条/分钟折叠为单条摘要）；degraded 横幅；控制台渠道页（带 n 与覆盖率） | `verify:alerts`（脚本化事件流回放，发射时刻序列精确匹配）·`verify:degraded`（DB 只读→转发 200+healthz degraded） | 探针、Δ 窗口 |
+| M4 探测调度+融合 | CLI test 抽库；L0 体检（max_tokens=1）/L1 身份/L2 手动全量；预算四闸门（金额/token/RPM 份额/并发）+泊松抖动；被动异常→定向确认探针；differential_treatment 告警；探测花费日报 | `verify:sched`（虚拟时钟 30 天预算零突破）·`verify:delta`（窗口中途落用户请求→void 且如实报告）·探针全文入库+用户正文零入库 grep 断言 | 完整 test 周期自动跑、熔断 |
+| M5 对账+端口收敛 | 双轨计费对账（账本Σusage×exclusive_key / 探针静默窗）；8621 双模式数据面；guard CLI 保留（共用 core 零重复）；WebUI 接新 API（不加功能只换数据源） | `verify:ports`（8620 无 /v1、8621 无 HTML）·存量 guard 客户端零改动 e2e ·对账 fixture（并发/跨界/充值三类） | 多渠道重试/回退 |
+| M6 可用性 opt-in（可无限期推迟） | 熔断标记+告警；首字节前重试（attempt 链+窗口作废）；显式回退记录 fallback_from/to | `verify:retry`（父请求+N 子尝试全链入账、恰好一次 settle） | 自动切流、负载均衡 |
+
+### 反面清单（全 [必须拒绝]，三方一致）
+
+1. 自动重试提成功率——双发计费污染对账、证据归因断裂；失败原样透传，客户端自己的重试如实记两笔。
+2. N/A 记 0 / 用探针填用户流量样本空洞——几何均值下 0 分=诬告；缺失维度剔除+重归一+覆盖率披露。
+3. 探针失败⇒渠道不可用（并自动切流）——本地网络抖动会变成诬告渠道还断真实流量；探针结论只到 suspect。
+4. 多后端中转上做单源基线硬比对——30% 流量走灌水后端会让渠道均分来回摆、告警 flap；先聚类再下结论。
+5. 用对话正文做检测证据/截留正文（含"只截一段错误体调试"）——一次违约，隐私承诺归零；schema 层禁止。
+6. 把上游 usage 当真值——虚增/伪造常态；探针强制 tokenizer 对比，用户流量抽查。
+7. 主被动分数加权平均——矛盾（被动 dirty+主动 clean）恰是最有价值的差异化证据，必须升格为独立告警类型。
+
+### 总口径
+
+**检测结论 = 证据链 + 样本量 + 污染标记 + 置信度 + N/A 边界**，不是"一个总分定生死"。每份报告都要经得起反问：「这个结论基于哪几条请求、什么口径、N/A 了什么、本机有没有嫌疑」。
+
+### S1-S3 实施规格 + 双向审查裁决（2026-10-14，kimi-k3 正向 / glm-5.3 反向 / deepseek-v4.1-flash 裁决）
+
+第一实施切片 = S1 账本（node:sqlite WAL，Node 22.22 已验证 DatabaseSync 可用）+ S2 tee 观测与实时用量 + S3 渠道告警。裁决「有条件通过」，3 项必修已并入规格：
+
+1. **管理端点不落数据面**：用量/事件/健康（usage/events/health）全部走 8620 控制台既有 token 鉴权 API（/api/gateway/*），8621 数据面不新增任何无鉴权端点。
+2. **settlement 同步落库**：requests 插入与 settlements 结算同步写、失败即 degraded 计数（fail open 转发），**绝不经有界丢弃队列**；丢弃队列仅承载可丢的观测指标。
+3. **验收口径修正**：「/__mx usage 与账本 SUM 完全相等」仅在正常（非 degraded）窗口成立，degraded 期披露丢弃/差异计数，不再无条件断言相等。
+
+采入规格的审查建议：client_status 枚举补 `interrupted`（启动恢复用）；settlements 冗余 channel_id/alias 列（聚合不依赖 join，requests 插入失败不产生口径失真）；落账矩阵（usage 被拒收→token 列 NULL + token_source='none' + missing_reason 取 missing|negative|inconsistent|absent，usage_valid=0）；model_mismatch 比较大小写不敏感 + 窗口内 ≥2 次才升级告警（T1 差异化防御的保守起点）；TTFT 漂移需 n≥20 + 绝对下限 300ms，低样本 provisional；告警重启后 5min 静默期防重发风暴（持久化后置 M5）；tee 全程逐帧 try/catch + tee_error 计数（观测失败绝不碰字节透传）；非流式旁路解析副本上限 2MB，超限跳过并计数；/v1/models 不入账本（仅网关计数）；amount 本切片恒 NULL（定价 M5）；user_version=1 + 「本版不清理」retention 声明；关闭顺序 = 停收新→观测 flush→wal_checkpoint(TRUNCATE)→close。key_hash 聚合维度、DatabaseSync 批量写压测、告警持久化：记录为后续项。

@@ -5,207 +5,232 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>model-xray 控制台</title>
 <style>
-  :root { color-scheme: dark; }
+  :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0a0c10; color: #e8eaf0; font-synthesis: none; }
   * { box-sizing: border-box; }
-  body { margin: 0; font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0f1115; color: #d7dae0; }
-  main { max-width: 980px; margin: 0 auto; padding: 24px 16px 64px; }
-  h1 { font-size: 20px; margin: 0 0 6px; }
-  h4 { margin: 18px 0 6px; font-size: 14px; color: #aab2bf; }
-  .privacy { color: #8b93a1; font-size: 13px; margin: 4px 0 0; }
-  .banner { border-radius: 8px; padding: 10px 14px; margin: 12px 0; font-size: 14px; }
-  .banner-offline { background: #4a3a12; color: #ffd66b; border: 1px solid #6b5417; }
-  .banner-warn { background: #4a3a12; color: #ffd66b; border: 1px solid #6b5417; font-weight: 600; }
-  .banner-fail { background: #4d1f1f; color: #ff8585; border: 1px solid #7a2e2e; font-weight: 600; }
-  .banner-pass { background: #1e4620; color: #7ddf87; border: 1px solid #2f6b31; font-weight: 600; }
-  .note { background: #141a22; border: 1px solid #24405e; color: #9fc0e8; border-radius: 8px; padding: 10px 14px; font-size: 13px; margin: 12px 0; }
-  .keybar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; background: #14171d; border: 1px solid #2a2f3a; border-radius: 8px; padding: 10px 12px; margin: 12px 0; }
-  .keybar .state { font-size: 13px; color: #aab2bf; }
-  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 999px; margin-right: 5px; background: #8b93a1; vertical-align: middle; }
-  .dot.on { background: #7ddf87; }
-  .tabs { display: flex; gap: 8px; margin: 18px 0; }
-  .tabs button { padding: 8px 16px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
-  .tabs button[aria-selected="true"] { background: #2b6cb0; border-color: #2b6cb0; color: #fff; }
-  .panel { background: #14171d; border: 1px solid #2a2f3a; border-radius: 8px; padding: 16px; }
-  label { display: block; margin: 10px 0 4px; font-size: 13px; color: #aab2bf; }
-  input[type="text"], input[type="password"], textarea { width: 100%; padding: 8px; background: #0f1115; color: #e6e9ee; border: 1px solid #2a2f3a; border-radius: 6px; font: inherit; }
+  body { min-width: 320px; min-height: 100vh; margin: 0; background: radial-gradient(ellipse at 68% -20%, #202033 0, transparent 42%), #0a0c10; color: #e8eaf0; font-size: 14px; letter-spacing: .005em; }
+  button, input { font: inherit; }
+  button { color: inherit; }
+  .app-shell { min-height: 100vh; }
+  .sidebar { position: fixed; inset: 0 auto 0 0; z-index: 5; display: flex; width: 238px; flex-direction: column; padding: 25px 15px 16px; border-right: 1px solid #ffffff0c; background: #0d0f14eF; backdrop-filter: blur(22px); }
+  .brand { display: flex; gap: 12px; align-items: center; padding: 0 9px 28px; }
+  .brand-mark { position: relative; display: grid; width: 35px; height: 35px; place-items: center; border: 1px solid #a793ff66; border-radius: 12px; background: linear-gradient(145deg, #483d75, #211d35); box-shadow: 0 5px 22px #8b72ff25; color: #f4efff; font-size: 17px; font-weight: 700; }
+  .brand-mark::after { position: absolute; right: 5px; bottom: 5px; width: 5px; height: 5px; border-radius: 50%; background: #94e4c0; content: ""; box-shadow: 0 0 8px #94e4c0; }
+  .brand-name { font-size: 14px; font-weight: 680; letter-spacing: -.025em; }
+  .brand-caption { margin-top: 3px; color: #777d8c; font-size: 10px; letter-spacing: .15em; text-transform: uppercase; }
+  .nav-label { padding: 0 11px; color: #666c79; font-size: 10px; font-weight: 700; letter-spacing: .14em; text-transform: uppercase; }
+  .tabs { display: grid; gap: 5px; margin: 9px 0 0; }
+  .tabs button { display: flex; min-height: 41px; align-items: center; gap: 12px; padding: 0 11px; border: 1px solid transparent; border-radius: 9px; background: transparent; color: #9b9eaa; cursor: pointer; text-align: left; transition: background .16s ease, color .16s ease, border-color .16s ease; }
+  .tabs button:hover { background: #ffffff08; color: #e6e4ef; }
+  .tabs button[aria-selected="true"] { border-color: #b5a2ff20; background: linear-gradient(100deg, #a88bff1d, #a88bff08); color: #eee9ff; box-shadow: inset 2px 0 #b6a2ff; }
+  .nav-icon { width: 19px; color: #878391; font-size: 16px; text-align: center; }
+  .tabs button[aria-selected="true"] .nav-icon { color: #c0adff; }
+  .sidebar-spacer { flex: 1; }
+  .local-card { padding: 13px; border: 1px solid #ffffff0d; border-radius: 11px; background: linear-gradient(145deg, #171922, #111319); }
+  .local-card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: #d0d0d9; font-size: 12px; font-weight: 600; }
+  .local-card p { margin: 0; color: #828694; font-size: 11px; line-height: 1.6; }
+  .sidebar-foot { padding: 14px 10px 0; color: #5e626e; font-size: 10px; }
+  .workspace { min-height: 100vh; margin-left: 238px; }
+  .topbar { position: sticky; top: 0; z-index: 4; display: flex; min-height: 66px; align-items: center; justify-content: space-between; gap: 16px; padding: 0 clamp(24px, 4vw, 60px); border-bottom: 1px solid #ffffff0c; background: #0b0d12bf; backdrop-filter: blur(18px); }
+  .crumb { display: flex; align-items: center; gap: 9px; color: #7c808d; font-size: 12px; }
+  .crumb strong { color: #d7d7e0; font-weight: 550; }
+  .top-actions { display: flex; align-items: center; gap: 12px; }
+  .local-pill { display: inline-flex; align-items: center; gap: 7px; padding: 6px 9px; border: 1px solid #8ce3bf1c; border-radius: 999px; background: #8ce3bf0a; color: #a8d9c5; font-size: 10px; letter-spacing: .04em; }
+  .local-pill::before { width: 6px; height: 6px; border-radius: 50%; background: #80dcb7; content: ""; box-shadow: 0 0 8px #80dcb777; }
+  main { width: min(1160px, 100%); margin: 0 auto; padding: 39px clamp(24px, 4vw, 60px) 72px; }
+  .page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 20px; margin-bottom: 25px; }
+  .eyebrow { margin: 0 0 8px; color: #aa96ff; font-size: 10px; font-weight: 700; letter-spacing: .16em; text-transform: uppercase; }
+  h1 { margin: 0; color: #f0eef5; font-size: clamp(25px, 3vw, 34px); font-weight: 570; letter-spacing: -.045em; line-height: 1.14; }
+  h1 span { color: #9388a9; font-weight: 400; }
+  h2 { margin: 0; font-size: 16px; font-weight: 600; letter-spacing: -.02em; }
+  h3 { margin: 0; font-size: 13px; font-weight: 600; }
+  h4 { margin: 23px 0 9px; color: #c6c3ce; font-size: 12px; font-weight: 600; }
+  .privacy { max-width: 670px; margin: 9px 0 0; color: #858996; font-size: 12px; line-height: 1.65; }
+  .privacy strong { color: #c1b2f6; font-weight: 500; }
+  .keybar { display: flex; min-height: 53px; align-items: center; gap: 10px; margin: 20px 0 25px; padding: 8px 10px 8px 14px; border: 1px solid #292b38; border-radius: 11px; background: linear-gradient(100deg, #15171f, #12141a); box-shadow: 0 8px 30px #00000012; }
+  .keybar .state { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; color: #b9b8c2; font-size: 11px; }
+  #key-state { color: #8f929e; }
+  .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #686b75; vertical-align: middle; }
+  .dot.on { background: #77d9b0; box-shadow: 0 0 9px #77d9b066; }
+  .keybar input { flex: 1 1 260px; min-width: 120px; padding: 9px 11px; border: 1px solid transparent; border-radius: 7px; outline: none; background: #0e1016; color: #e6e3ee; font-size: 12px; transition: border-color .15s ease; }
+  .keybar input:focus, input[type="text"]:focus, input[type="password"]:focus { border-color: #a58bff80; box-shadow: 0 0 0 3px #a58bff12; }
+  .banner { margin: 13px 0; padding: 11px 14px; border: 1px solid; border-radius: 9px; font-size: 12px; line-height: 1.6; }
+  .banner-offline { border-color: #c09a4a40; background: #d5a84310; color: #e2c681; }
+  .banner-warn { border-color: #c09a4a45; background: #d5a84312; color: #efca72; font-weight: 570; }
+  .banner-fail { border-color: #ff727244; background: #ff555510; color: #ff9292; font-weight: 570; }
+  .banner-pass { border-color: #64d49b35; background: #58cf9210; color: #91dcb3; font-weight: 570; }
+  .note { margin: 0 0 20px; padding: 13px 15px; border: 1px solid #a58bff22; border-radius: 9px; background: linear-gradient(100deg, #9a7cff0d, #13151b); color: #aaa6b8; font-size: 11px; line-height: 1.7; }
+  .note strong { color: #c7b8ff; font-weight: 550; }
+  .panel { animation: panel-enter .22s ease both; padding: 22px; border: 1px solid #ffffff10; border-radius: 13px; background: linear-gradient(150deg, #15171e, #111319 70%); box-shadow: 0 18px 55px #00000017; }
+  .panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; margin-bottom: 20px; }
+  .panel-head p { margin: 5px 0 0; color: #838793; font-size: 11px; line-height: 1.6; }
+  .panel-kicker { color: #777b88; font-size: 10px; letter-spacing: .08em; }
+  .row { display: flex; gap: 13px; flex-wrap: wrap; }
+  .row > div { flex: 1 1 235px; min-width: 0; }
+  label { display: block; margin: 13px 0 7px; color: #a5a5b1; font-size: 11px; }
+  input[type="text"], input[type="password"], textarea { width: 100%; min-height: 39px; padding: 9px 11px; border: 1px solid #292b35; border-radius: 7px; outline: none; background: #0d0f14; color: #e4e1eb; font-size: 12px; transition: border-color .15s ease, box-shadow .15s ease; }
+  input::placeholder { color: #565a66; }
   textarea { min-height: 120px; }
-  .row { display: flex; gap: 12px; flex-wrap: wrap; }
-  .row > div { flex: 1 1 220px; }
-  .checks { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 0; }
-  .checks label { display: flex; align-items: center; gap: 6px; margin: 0; }
-  button.primary { margin-top: 12px; padding: 8px 18px; background: #2b6cb0; border: none; color: #fff; border-radius: 6px; cursor: pointer; font: inherit; }
-  button.primary:disabled { background: #24445e; color: #8aa4bd; cursor: not-allowed; }
-  button.secondary { margin-top: 12px; padding: 8px 16px; background: #1a1d24; color: #d7dae0; border: 1px solid #2a2f3a; border-radius: 6px; cursor: pointer; font: inherit; }
-  .error { color: #ff6b6b; margin-top: 10px; white-space: pre-wrap; }
-  pre.command, pre.log { background: #0b0d11; border: 1px solid #2a2f3a; padding: 12px; border-radius: 6px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; font-size: 13px; }
-  pre.log { min-height: 60px; max-height: 340px; overflow-y: auto; }
-  .log-line-warn { color: #ffd66b; }
-  .log-line-fail { color: #ff8585; }
-  .hints { color: #9fb3c8; font-size: 13px; }
-  .placeholder { color: #8b93a1; }
-  details summary { cursor: pointer; color: #9fb3c8; font-size: 13px; margin-top: 10px; }
-  table.probes { width: 100%; border-collapse: collapse; margin-top: 12px; }
-  table.probes th, table.probes td { border: 1px solid #2a2f3a; padding: 6px 10px; text-align: left; font-size: 14px; }
-  .badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; }
-  .badge-pass { background: #1e4620; color: #7ddf87; }
-  .badge-warn { background: #4a3a12; color: #ffd66b; }
-  .badge-fail { background: #4d1f1f; color: #ff8585; }
-  .badge-unknown { background: #262b34; color: #9aa3b2; }
-  .scorecard-head { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
-  .scorecard-head .total { font-size: 18px; }
-  ul.findings, ul.notes { margin: 6px 0; padding-left: 20px; }
-  ul.findings li, ul.notes li { margin: 4px 0; }
-  .report-links a { color: #6cb2ff; margin-right: 14px; font-size: 13px; }
-  #report-list { list-style: none; margin: 10px 0; padding: 0; }
-  #report-list li { display: flex; gap: 10px; align-items: baseline; padding: 6px 8px; border-bottom: 1px solid #1d222b; }
-  #report-list .name { color: #6cb2ff; cursor: pointer; word-break: break-all; }
+  .checks { display: flex; min-height: 39px; align-items: center; gap: 14px; flex-wrap: wrap; margin: 4px 0; }
+  .checks label { display: inline-flex; align-items: center; gap: 7px; margin: 0; color: #afb0bb; font-size: 11px; }
+  input[type="checkbox"] { accent-color: #ad96ff; }
+  button.primary, button.secondary { display: inline-flex; min-height: 37px; align-items: center; justify-content: center; gap: 8px; padding: 0 14px; border-radius: 7px; cursor: pointer; font-size: 11px; font-weight: 570; transition: transform .15s ease, background .15s ease, border-color .15s ease; }
+  button.primary { margin-top: 15px; border: 1px solid #b29aff55; background: linear-gradient(115deg, #8068d0, #6650ad); color: white; box-shadow: 0 5px 18px #876cec20; }
+  button.primary:hover:not(:disabled) { transform: translateY(-1px); background: linear-gradient(115deg, #927ae1, #7660c1); }
+  button.primary:disabled { border-color: #454052; background: #373342; color: #9994a3; cursor: not-allowed; box-shadow: none; }
+  button.secondary { margin-top: 10px; border: 1px solid #30313c; background: #1a1c24; color: #c0bfca; }
+  button.secondary:hover { border-color: #555064; background: #20222b; color: #eeeaf7; }
+  .keybar button.secondary { min-height: 33px; margin-top: 0; padding: 0 12px; }
+  .error { margin-top: 10px; color: #ff8a8a; font-size: 11px; line-height: 1.6; white-space: pre-wrap; }
+  pre.command, pre.log { overflow: auto; padding: 13px 14px; border: 1px solid #292a35; border-radius: 8px; background: #0a0b10; color: #c4c4cf; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: 11px; line-height: 1.75; white-space: pre-wrap; word-break: break-word; }
+  pre.log { min-height: 70px; max-height: 360px; }
+  .log-line-warn { color: #efca72; }
+  .log-line-fail { color: #ff8989; }
+  .hints { color: #9295a2; font-size: 11px; line-height: 1.7; }
+  .placeholder { color: #747885; }
+  details { margin-top: 13px; }
+  details summary { color: #9992ae; cursor: pointer; font-size: 11px; }
+  table.probes { width: 100%; margin-top: 12px; border-collapse: collapse; }
+  table.probes th, table.probes td { padding: 9px 10px; border: 1px solid #292b34; text-align: left; font-size: 11px; }
+  table.probes th { background: #1a1c24; color: #8e909c; font-weight: 550; }
+  table.probes td { color: #c9c7d1; }
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 10px; }
+  .badge-pass { background: #4bc38c18; color: #88ddb0; }
+  .badge-warn { background: #e0b84e18; color: #e8c46e; }
+  .badge-fail { background: #ed676718; color: #ff9292; }
+  .badge-unknown { background: #ffffff0c; color: #a3a5b0; }
+  .scorecard-head { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
+  .scorecard-head .total { color: #f1edf8; font-size: 16px; font-weight: 600; }
+  ul.findings, ul.notes { margin: 7px 0; padding-left: 19px; color: #b3b2be; }
+  ul.findings li, ul.notes li { margin: 6px 0; line-height: 1.55; }
+  .report-links { display: flex; gap: 14px; flex-wrap: wrap; }
+  .report-links a, #report-list a { color: #baaaff; font-size: 11px; text-decoration: none; }
+  .report-links a:hover, #report-list a:hover { color: #e0d7ff; text-decoration: underline; }
+  #report-list { margin: 14px 0 0; padding: 0; list-style: none; }
+  #report-list li { display: flex; min-height: 46px; align-items: center; gap: 12px; padding: 8px 10px; border-bottom: 1px solid #ffffff0a; }
+  #report-list .name { flex: 1; overflow-wrap: anywhere; color: #c3b5ff; cursor: pointer; font-size: 11px; }
   #report-list .name:hover { text-decoration: underline; }
-  #report-list .meta { color: #8b93a1; font-size: 12px; white-space: nowrap; }
-  fieldset.optional { border: 1px dashed #3a4150; border-radius: 8px; margin-top: 12px; padding: 8px 12px 12px; }
-  fieldset.optional legend { color: #9fb3c8; font-size: 13px; padding: 0 6px; }
+  #report-list .meta { color: #747885; font-size: 10px; white-space: nowrap; }
+  fieldset.optional { margin: 17px 0 0; padding: 7px 13px 14px; border: 1px solid #31303c; border-radius: 9px; }
+  fieldset.optional legend { padding: 0 6px; color: #a6a1b7; font-size: 10px; }
+  .guard-state { display: flex; align-items: center; gap: 9px; margin: 17px 0 4px; padding: 12px 13px; border: 1px solid #ffffff0b; border-radius: 8px; background: #ffffff04; color: #a6a7b2; font-size: 11px; }
+  .guard-state::before { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #737680; content: ""; }
+  .guard-state[data-running="true"]::before { background: #73d5aa; box-shadow: 0 0 10px #73d5aa88; }
+  .channel-list { display: grid; gap: 9px; margin-top: 13px; }
+  .channel-card { display: flex; align-items: center; gap: 13px; padding: 13px; border: 1px solid #ffffff0d; border-radius: 9px; background: #ffffff03; }
+  .channel-indicator { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #727580; }
+  .channel-indicator[data-enabled="true"] { background: #78d9af; box-shadow: 0 0 9px #78d9af66; }
+  .channel-main { flex: 1; min-width: 0; }
+  .channel-title { color: #d6d2e1; font-size: 12px; font-weight: 560; }
+  .channel-endpoint { overflow: hidden; margin-top: 5px; color: #7c808c; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .channel-models { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 8px; }
+  .channel-model { padding: 3px 7px; border: 1px solid #9b85e51c; border-radius: 5px; background: #a18cff0a; color: #beb2e4; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; }
+  .channel-actions { display: flex; gap: 6px; flex: 0 0 auto; }
+  .channel-actions button { min-height: 30px; margin: 0; padding: 0 9px; font-size: 10px; }
+  .channel-form { margin-top: 15px; padding: 16px; border: 1px solid #a58bff24; border-radius: 10px; background: #a58bff06; }
+  .channel-form-actions { display: flex; gap: 7px; }
+  .split-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 23px; }
+  .split-heading h4 { margin: 0; }
+  .metric-strip { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin: 0 0 16px; }
+  .metric { min-height: 75px; padding: 13px; border: 1px solid #ffffff0d; border-radius: 9px; background: #ffffff03; }
+  .metric-label { color: #828592; font-size: 10px; }
+  .metric-value { margin-top: 8px; color: #e3dfff; font-size: 17px; font-weight: 550; letter-spacing: -.025em; }
+  #offline-banner { margin-top: 18px; }
+  @keyframes panel-enter { from { opacity: .55; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
+  @media (max-width: 900px) { .sidebar { width: 205px; } .workspace { margin-left: 205px; } main { padding-right: 24px; padding-left: 24px; } .topbar { padding: 0 24px; } }
+  @media (max-width: 690px) { .sidebar { position: sticky; inset: 0 0 auto; width: 100%; height: auto; padding: 10px 13px 0; border-right: 0; border-bottom: 1px solid #ffffff0c; } .brand { padding: 0 5px 10px; } .brand-mark { width: 30px; height: 30px; } .nav-label, .local-card, .sidebar-foot, .sidebar-spacer { display: none; } .tabs { display: flex; gap: 5px; overflow-x: auto; margin: 0; padding-bottom: 8px; } .tabs button { min-height: 37px; flex: 0 0 auto; gap: 7px; padding: 0 9px; font-size: 10px; } .nav-icon { width: auto; font-size: 13px; } .workspace { margin-left: 0; } .topbar { position: static; min-height: 46px; padding: 0 16px; } main { padding: 26px 15px 48px; } .page-heading { margin-bottom: 17px; } .keybar { gap: 7px; flex-wrap: wrap; padding: 10px; } .keybar .state { flex: 1 1 100%; } .keybar input { flex-basis: 150px; } .panel { padding: 16px 13px; } .panel-head { margin-bottom: 13px; } .metric-strip { grid-template-columns: 1fr; gap: 7px; } .metric { min-height: 0; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; } .metric-value { margin: 0; font-size: 14px; } #report-list li { gap: 8px; } #report-list .meta { white-space: normal; text-align: right; } }
+  @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 </style>
 </head>
 <body>
-<main>
-  <h1>model-xray <span class="privacy">本地控制台（仅 127.0.0.1）</span></h1>
-  <p class="privacy">所有数据在本机处理：key 仅存于本地服务进程内存，报告与日志都留在本机，不经任何第三方。默认开启模型检测（身份/质量/能力/上下文/时延）；计费核价为可选（需录入价格）。</p>
-  <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测与监控不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
-
-  <div class="keybar">
-    <span class="state"><span id="key-dot" class="dot"></span>API key：<span id="key-state">检测中…</span></span>
-    <input id="f-key" type="password" placeholder="sk-xxx（回车或点保存；仅存本机内存）" style="flex:1 1 260px" autocomplete="off">
-    <button id="btn-key-save" class="secondary" type="button" style="margin-top:0">保存</button>
-    <button id="btn-key-clear" class="secondary" type="button" style="margin-top:0">清除</button>
+<div class="app-shell">
+  <aside class="sidebar" aria-label="主导航">
+    <div class="brand"><div class="brand-mark">x</div><div><div class="brand-name">model-xray</div><div class="brand-caption">Endpoint intelligence</div></div></div>
+    <div class="nav-label">工作区</div>
+    <nav class="tabs" aria-label="工作区导航">
+      <button id="tab-test" type="button" aria-selected="true"><span class="nav-icon">◈</span>模型检测</button>
+      <button id="tab-guard" type="button" aria-selected="false"><span class="nav-icon">⌁</span>实时监控</button>
+      <button id="tab-gateway" type="button" aria-selected="false"><span class="nav-icon">⛓</span>API 聚合</button>
+      <button id="tab-reports" type="button" aria-selected="false"><span class="nav-icon">▤</span>检测报告</button>
+    </nav>
+    <div class="sidebar-spacer"></div>
+    <div class="local-card"><div class="local-card-title"><span class="dot on"></span>隐私优先</div><p>请求、密钥和检测证据均由本机处理。模型能力与计量结论基于实际探测，不依赖供应商自述。</p></div>
+    <div class="sidebar-foot">MODEL-XRAY · LOCAL WORKSPACE</div>
+  </aside>
+  <div class="workspace">
+    <header class="topbar"><div class="crumb">工作区 <span>/</span> <strong>模型可信度</strong></div><div class="top-actions"><span class="local-pill">LOCAL ONLY</span><span class="hints">v0.2 · 本机运行</span></div></header>
+    <main>
+      <div class="page-heading"><div><p class="eyebrow">Model observability</p><h1>看清每一次 <span>模型交付</span></h1><p class="privacy">用可复现的探针核验模型身份、能力、上下文与用量。<strong>发现证据，而不只是相信标签。</strong></p></div></div>
+      <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测与监控不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
+      <div id="ledger-degraded-banner" class="banner banner-warn" hidden></div>
+      <div class="keybar">
+        <span class="state"><span id="key-dot" class="dot"></span>上游凭证 <span id="key-state">检测中…</span></span>
+        <input id="f-key" type="password" placeholder="粘贴 API key，仅暂存于本机内存" autocomplete="off">
+        <button id="btn-key-save" class="secondary" type="button">保存到本次会话</button>
+        <button id="btn-key-clear" class="secondary" type="button">清除</button>
+      </div>
+      <section id="panel-test" class="panel">
+        <div class="panel-head"><div><p class="eyebrow">01 / 一次性审计</p><h2>验证一个模型端点</h2><p>执行独立探针并生成带原始证据的评分报告。深度测试会产生真实 API 请求及费用。</p></div><span class="panel-kicker">AUDIT RUN</span></div>
+        <div class="metric-strip"><div class="metric"><div class="metric-label">默认检查</div><div class="metric-value">6 个维度</div></div><div class="metric"><div class="metric-label">证据输出</div><div class="metric-value">可复测基线</div></div><div class="metric"><div class="metric-label">计费核价</div><div class="metric-value">按需启用</div></div></div>
+        <div class="note"><strong>检测默认启用。</strong> 身份真伪、输出质量、能力矩阵、上下文长度与首字时延会按可用信息自动评估；计费核价只在录入宣称价格后运行。</div>
+        <div class="row"><div><label for="f-base-url">API 端点 *</label><input id="f-base-url" type="text" placeholder="https://relay.example.com/v1"></div><div><label for="f-model">模型 ID *</label><input id="f-model" type="text" placeholder="gpt-4o"></div></div>
+        <div class="row"><div><label for="f-claimed-context">宣称上下文窗口（tokens，可选）</label><input id="f-claimed-context" type="text" inputmode="numeric" placeholder="例如 128000"></div><div><label>该端点宣称支持的能力</label><div class="checks"><label><input id="f-expect-vision" type="checkbox">视觉</label><label><input id="f-expect-tool" type="checkbox">工具调用</label><label><input id="f-expect-thinking" type="checkbox">推理</label></div></div></div>
+        <fieldset class="optional"><legend>计费校验 · 可选</legend><div class="hints">只有同时填写输入和输出单价后才会核验账单倍率，不填不会显示误导性的 $0。</div><div class="row"><div><label for="f-price-input">输入单价（$/百万 tokens）</label><input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-price-output">输出单价（$/百万 tokens）</label><input id="f-price-output" type="text" inputmode="decimal" placeholder="10"></div></div></fieldset>
+        <div class="row"><div><label for="f-seed">随机种子（可选，复测时固定）</label><input id="f-seed" type="text" inputmode="numeric" placeholder="12345"></div><div><label for="f-timeout">单次请求超时（秒）</label><input id="f-timeout" type="text" inputmode="numeric" placeholder="60"></div></div>
+        <div class="row"><div><label for="f-out">报告目录</label><input id="f-out" type="text" placeholder="reports"></div><div><label for="f-baseline">对照基线（可选）</label><input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json"></div></div>
+        <div class="checks"><label><input id="f-deep" type="checkbox">增强样本（耗时和费用更高）</label><label><input id="f-dry-run" type="checkbox">仅预演，不发送请求</label></div>
+        <button id="btn-run" class="primary" type="button">开始检测 <span aria-hidden="true">→</span></button>
+        <div id="run-error" class="error" hidden></div><div id="run-banner" hidden></div>
+        <div class="split-heading"><h4>任务实时输出</h4><span class="hints">密钥自动脱敏 · 报告仅写入本机</span></div>
+        <pre id="run-log" class="log placeholder">等待检测任务。填写端点与模型 ID 后即可开始。</pre>
+        <div id="report-result" hidden><h4>可信度评分卡</h4><div id="report-links" class="report-links"></div><div id="report-out"></div></div>
+        <details><summary>查看可复制的 CLI 命令</summary><pre id="command-out" class="command"></pre><pre id="hints-out" class="hints"></pre></details>
+      </section>
+      <section id="panel-guard" class="panel" hidden>
+        <div class="panel-head"><div><p class="eyebrow">02 / 被动观测</p><h2>监控真实模型流量</h2><p>将客户端接入本机透明代理，逐请求检查响应模型、token 用量与首字时延。</p></div><span class="panel-kicker">LIVE GUARD</span></div>
+        <div class="note">监控按客户端真实请求工作，不会重放对话内容。日志只保留请求元数据。启动后，将客户端 API Base URL 指向 <code>http://127.0.0.1:&lt;port&gt;/v1</code>。</div>
+        <div class="row"><div><label for="f-guard-base-url">上游 API 端点 *</label><input id="f-guard-base-url" type="text" placeholder="https://relay.example.com/v1"></div><div><label for="f-guard-port">本机代理端口（默认 8621）</label><input id="f-guard-port" type="text" inputmode="numeric" placeholder="8621"></div></div>
+        <fieldset class="optional"><legend>余额对账 · 可选</legend><div class="hints">仅在渠道提供兼容的余额端点并填写价格时启用。</div><div class="row"><div><label for="f-guard-price-in">输入单价（$/百万 tokens）</label><input id="f-guard-price-in" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-guard-price-out">输出单价（$/百万 tokens）</label><input id="f-guard-price-out" type="text" inputmode="decimal" placeholder="10"></div></div></fieldset>
+        <button id="btn-guard-start" class="primary" type="button">启动实时监控</button><button id="btn-guard-stop" class="secondary" type="button">停止监控</button>
+        <div id="guard-error" class="error" hidden></div><div class="guard-state" id="guard-state">状态：未启动</div>
+        <div class="split-heading"><h4>流量事件</h4><span class="hints">实时更新 · 滚动评分窗口</span></div><pre id="guard-log" class="log placeholder">启动后，告警与请求摘要会显示在这里。</pre>
+      </section>
+      <section id="panel-gateway" class="panel" hidden>
+        <div class="panel-head"><div><p class="eyebrow">03 / 本地聚合路由</p><h2>连接并整理多个模型端点</h2><p>将多个 OpenAI 兼容渠道统一映射到一个本地 API Base URL，模型别名决定请求路由。</p></div><span class="panel-kicker">LOCAL GATEWAY</span></div>
+        <div class="metric-strip"><div class="metric"><div class="metric-label">路由方式</div><div class="metric-value">模型别名直达</div></div><div class="metric"><div class="metric-label">上游密钥</div><div class="metric-value">仅内存保管</div></div><div class="metric"><div class="metric-label">失败回退</div><div class="metric-value">首版关闭</div></div></div>
+        <div class="note"><strong>明确的首版边界。</strong> 暂支持 OpenAI Chat Completions 与 models 列表；每个模型别名固定路由到一个渠道，不自动重试或跨渠道回退。所有渠道密钥仅在应用运行期间保存在本机服务内存，重启后需重新录入。</div>
+        <div class="split-heading"><h4>本地 API 状态</h4><span class="hints">仅本机回环监听</span></div>
+        <div class="metric-strip"><div class="metric"><div class="metric-label">网关状态</div><div id="gateway-status" class="metric-value">未启动</div></div><div class="metric"><div class="metric-label">Base URL</div><div id="gateway-base-url" class="metric-value">等待启动</div></div><div class="metric"><div class="metric-label">虚拟客户端 Key</div><div id="gateway-client-key-state" class="metric-value">未生成</div></div></div>
+        <div class="row"><div><label for="f-gateway-port">本机监听端口（留空则自动分配）</label><input id="f-gateway-port" type="text" inputmode="numeric" placeholder="自动分配，或例如 8630"></div><div><label for="f-gateway-client-key">客户端虚拟 Key（仅启动期间可见）</label><input id="f-gateway-client-key" type="password" autocomplete="off" readonly placeholder="启动后生成；勿与任何上游 Key 混用"></div></div>
+        <button id="btn-gateway-start" class="primary" type="button">启动本地 API</button><button id="btn-gateway-rotate" class="secondary" type="button">轮换客户端 Key</button><button id="btn-gateway-stop" class="secondary" type="button">停止网关</button>
+        <div id="gateway-error" class="error" hidden></div>
+        <div class="split-heading"><h4>渠道与模型别名</h4><button id="btn-channel-new" class="secondary" type="button">添加渠道</button></div>
+        <p class="hints">别名（alias）是客户端请求使用的模型名；上游模型名不同可单独填写映射。新密钥不会保留到本地磁盘。</p>
+        <div id="channel-list" class="channel-list"></div>
+        <form id="channel-form" class="channel-form" hidden>
+          <input id="f-channel-id" type="hidden">
+          <div class="row"><div><label for="f-channel-label">渠道名称 *</label><input id="f-channel-label" type="text" required placeholder="例如：主力中转站"></div><div><label for="f-channel-base-url">上游 OpenAI API Base URL *</label><input id="f-channel-base-url" type="text" required placeholder="https://api.example.com/v1"></div></div>
+          <div class="row"><div><label for="f-channel-key">上游 API Key <span id="channel-key-help">*</span></label><input id="f-channel-key" type="password" autocomplete="new-password" placeholder="sk-…；仅在本机服务内存中保管"></div><div><label for="f-channel-models">对外模型别名 *</label><input id="f-channel-models" type="text" required placeholder="例如：fast-model,reasoning-model"></div></div>
+          <div class="row"><div><label for="f-channel-map">上游模型映射（选填，每行 alias=upstream-model）</label><textarea id="f-channel-map" placeholder="fast-model=gpt-4o-mini&#10;reasoning-model=claude-sonnet-4"></textarea></div></div>
+          <div class="channel-form-actions"><button id="btn-channel-save" class="primary" type="submit">保存渠道</button><button id="btn-channel-cancel" class="secondary" type="button">取消</button></div>
+        </form>
+        <div class="split-heading"><h4>用量与异常（实时）</h4><span class="hints">3 秒刷新 · 账本 reports/gateway-ledger.db</span></div>
+        <table id="gateway-usage" class="probes">
+          <thead><tr><th>模型别名</th><th>渠道</th><th>请求数</th><th>正常</th><th>错误</th><th>Prompt</th><th>Completion</th><th>TTFT p50</th><th>TTFT p95</th><th>usage 有效率</th></tr></thead>
+          <tbody id="gateway-usage-body"></tbody>
+        </table>
+        <div class="split-heading"><h4>异常告警</h4><span class="hints">模型自述不符 / 错误率 / 截断 / usage 异常（每类 30 分钟冷却）</span></div>
+        <ul id="gateway-alerts" class="findings"></ul>
+        <div class="split-heading"><h4>OpenAI 客户端接入</h4></div>
+        <div class="note">Base URL：<code id="gateway-copy-url">启动网关后显示</code>　·　客户端模型：查看上方已启用的别名　·　鉴权：使用本页显示的虚拟客户端 Key</div>
+      </section>
+      <section id="panel-reports" class="panel" hidden>
+        <div class="panel-head"><div><p class="eyebrow">04 / 可追溯结果</p><h2>检测历史与证据</h2><p>查看本机保存的报告、评分结果与版本化模型指纹基线。</p></div><button id="btn-reports-refresh" class="secondary" type="button">刷新列表</button></div>
+        <div class="note">报告保存在本机 <code>reports/</code> 目录。JSON 报告可直接展开评分卡；HTML 和 Markdown 报告保留为可分享的完整证据记录。</div>
+        <div class="hints">选择 JSON 查看检测维度与异常发现；其他格式通过本机报告查看器打开。</div><ul id="report-list"></ul><div id="history-error" class="error" hidden></div><div id="history-out"></div>
+      </section>
+    </main>
   </div>
-
-  <div class="tabs">
-    <button id="tab-test" type="button" aria-selected="true">① 一次性检测</button>
-    <button id="tab-guard" type="button" aria-selected="false">② 常驻监控</button>
-    <button id="tab-reports" type="button" aria-selected="false">③ 历史报告</button>
-  </div>
-
-  <section id="panel-test" class="panel">
-    <div class="note">默认开启模型检测：身份真伪 / 输出质量 / 能力矩阵 / 上下文长度 / 首字时延全部默认执行，异常会以红色警告置顶提示。计费核价为可选——需要录入该站宣称价格才启用。</div>
-    <div class="row">
-      <div>
-        <label for="f-base-url">base-url *（如 https://relay.example.com/v1）</label>
-        <input id="f-base-url" type="text" placeholder="https://relay.example.com/v1">
-      </div>
-      <div>
-        <label for="f-model">model *（如 gpt-4o）</label>
-        <input id="f-model" type="text" placeholder="gpt-4o">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="f-claimed-context">claimed-context（标称上下文，正整数，选填）</label>
-        <input id="f-claimed-context" type="text" inputmode="numeric" placeholder="32000">
-      </div>
-      <div>
-        <label>expect（该站宣称的能力，全不选 → none）</label>
-        <div class="checks">
-          <label><input id="f-expect-vision" type="checkbox"> vision</label>
-          <label><input id="f-expect-tool" type="checkbox"> tool</label>
-          <label><input id="f-expect-thinking" type="checkbox"> thinking</label>
-        </div>
-      </div>
-    </div>
-    <fieldset class="optional">
-      <legend>计费核价（可选）：需录入该站宣称价格（每百万 tokens），不填则跳过金额对账，不影响其他检测</legend>
-      <div class="row">
-        <div>
-          <label for="f-price-input">price-input（$/M tokens，正数）</label>
-          <input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5">
-        </div>
-        <div>
-          <label for="f-price-output">price-output（须与 price-input 成对）</label>
-          <input id="f-price-output" type="text" inputmode="decimal" placeholder="10">
-        </div>
-      </div>
-    </fieldset>
-    <div class="row">
-      <div>
-        <label for="f-seed">seed（正整数，选填；复测建议固定）</label>
-        <input id="f-seed" type="text" inputmode="numeric" placeholder="12345">
-      </div>
-      <div>
-        <label for="f-timeout">timeout（秒，正整数，选填）</label>
-        <input id="f-timeout" type="text" inputmode="numeric" placeholder="60">
-      </div>
-    </div>
-    <div class="row">
-      <div>
-        <label for="f-out">out（报告输出目录，缺省 reports）</label>
-        <input id="f-out" type="text" placeholder="reports">
-      </div>
-      <div>
-        <label for="f-baseline">baseline（基线文件路径，选填；复测对比用）</label>
-        <input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json">
-      </div>
-    </div>
-    <div class="checks">
-      <label><input id="f-deep" type="checkbox"> deep（更多样本，更慢更准）</label>
-      <label><input id="f-dry-run" type="checkbox"> dry-run（只打印计划，不发请求）</label>
-    </div>
-
-    <button id="btn-run" class="primary" type="button">开始检测</button>
-    <div id="run-error" class="error" hidden></div>
-    <div id="run-banner" hidden></div>
-    <h4>运行日志</h4>
-    <pre id="run-log" class="log placeholder">尚未开始。点击「开始检测」后这里会实时滚动显示 CLI 输出。</pre>
-    <div id="report-result" hidden>
-      <h4>评分卡</h4>
-      <div id="report-links" class="report-links"></div>
-      <div id="report-out"></div>
-    </div>
-    <details>
-      <summary>等价 CLI 命令（透明起见；也可复制到终端直接执行）</summary>
-      <pre id="command-out" class="command"></pre>
-      <pre id="hints-out" class="hints"></pre>
-    </details>
-  </section>
-
-  <section id="panel-guard" class="panel" hidden>
-    <div class="note">常驻监控：本地透明转发代理逐请求审计真实流量——模型一致性、token 计量、余额对账；每 20 个请求输出一次多维实时评分卡，异常即时告警。启动后把客户端 base-url 指向 <code>http://127.0.0.1:&lt;port&gt;/v1</code>，key 用与上方录入相同的值。</div>
-    <div class="row">
-      <div>
-        <label for="f-guard-base-url">base-url *（真实中转站地址）</label>
-        <input id="f-guard-base-url" type="text" placeholder="https://relay.example.com/v1">
-      </div>
-      <div>
-        <label for="f-guard-port">本地监听端口（[1, 65535]，默认 8621）</label>
-        <input id="f-guard-port" type="text" inputmode="numeric" placeholder="8621">
-      </div>
-    </div>
-    <fieldset class="optional">
-      <legend>计费对账（可选）：需录入宣称价格对，且站点提供余额查询端点</legend>
-      <div class="row">
-        <div>
-          <label for="f-guard-price-in">price-input（$/M tokens）</label>
-          <input id="f-guard-price-in" type="text" inputmode="decimal" placeholder="2.5">
-        </div>
-        <div>
-          <label for="f-guard-price-out">price-output（$/M tokens）</label>
-          <input id="f-guard-price-out" type="text" inputmode="decimal" placeholder="10">
-        </div>
-      </div>
-    </fieldset>
-    <button id="btn-guard-start" class="primary" type="button">启动监控</button>
-    <button id="btn-guard-stop" class="secondary" type="button">停止监控</button>
-    <div id="guard-error" class="error" hidden></div>
-    <div class="state" id="guard-state" style="margin-top:10px; font-size:13px; color:#aab2bf">状态：未启动</div>
-    <h4>监控输出</h4>
-    <pre id="guard-log" class="log placeholder">尚未启动。</pre>
-  </section>
-
-  <section id="panel-reports" class="panel" hidden>
-    <button id="btn-reports-refresh" class="secondary" type="button" style="margin-top:0">刷新列表</button>
-    <span class="hints">点击 .json 在页内渲染评分卡；.html / .md 在新标签打开。</span>
-    <ul id="report-list"></ul>
-    <div id="history-error" class="error" hidden></div>
-    <div id="history-out"></div>
-  </section>
-</main>
+</div>
 <script>window.MX_TOKEN = '__MX_TOKEN__';</script>
 <script type="module" src="./app.js"></script>
 </body>

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 // web/ 不在 tsconfig include 内（不参与 tsc 编译），运行时产物里没有 dist/web/app.js。
@@ -23,6 +23,7 @@ function locateWebApp(): string {
 
 const webApp = (await import(pathToFileURL(locateWebApp()).href)) as WebApp;
 const { buildCommand, renderScorecard, escapeHtml } = webApp;
+const dashboardHtml = readFileSync(join(dirname(locateWebApp()), 'index.html'), 'utf8');
 
 const BASE = 'https://relay.example.com/v1';
 
@@ -377,4 +378,15 @@ test('escapeHtml：全量转义 & < > " \'（并额外中和 = 以杜绝 onerror
     escapeHtml(`<a href="x" data-y='z'> & </a>`),
     '&lt;a href&#61;&quot;x&quot; data-y&#61;&#39;z&#39;&gt; &amp; &lt;/a&gt;',
   );
+});
+
+test('桌面工作区：导航项与检测/监控/聚合/报告视图一一对应', () => {
+  for (const section of ['test', 'guard', 'gateway', 'reports']) {
+    assert.match(dashboardHtml, new RegExp(`id="tab-${section}"`));
+    assert.match(dashboardHtml, new RegExp(`id="panel-${section}"`));
+  }
+  assert.match(dashboardHtml, /id="f-channel-key"[^>]*type="password"/);
+  assert.match(dashboardHtml, /id="f-gateway-client-key"[^>]*type="password"/);
+  assert.match(dashboardHtml, /@media \(max-width: 690px\)/);
+  assert.match(dashboardHtml, /prefers-reduced-motion: reduce/);
 });

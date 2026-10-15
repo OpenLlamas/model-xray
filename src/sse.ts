@@ -90,6 +90,8 @@ export interface StreamChunk {
   /** payload 带 usage 键但被 validateUsage 拒绝时的原因；未带 usage 键为 null */
   usageReason: UsageRejection | null;
   finishReason: string | null;
+  /** 响应自述模型名（网关旁路观测用；payload 未带或非字符串时为 null） */
+  model: string | null;
 }
 
 /**
@@ -185,7 +187,8 @@ export function parseStreamPayload(data: string): StreamChunk | null {
   }
 
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
-  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason };
+  const model = typeof obj['model'] === 'string' && obj['model'] !== '' ? (obj['model'] as string) : null;
+  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model };
 }
 
 export function extractText(value: unknown): string {
