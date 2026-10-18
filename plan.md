@@ -70,7 +70,7 @@
 
 ## 六、GUI 与体验（从 8620 三标签演进，控制范围）
 
-- **M1 起步形态=8620 控制台扩展**：一次性检测 / 常驻监控 / 历史报告三标签已验证，渠道管理在此之上生长；仪表盘/路由/本地 Key 等九页设计**后置按需增页**，1–2 人团队不做大而全。
+- **M1 起步形态=8620 控制台扩展**：一次性检测 / API 聚合与实时监控 / 历史报告三标签已验证（guard 收敛为纯 CLI，控制台不再托管其启停），渠道管理在此之上生长；仪表盘/路由/本地 Key 等九页设计**后置按需增页**，1–2 人团队不做大而全。
 - 首启向导：添加渠道 → 测试（自动跑 L0+轻量体检）→ 复制 Base URL 和 Key，三步完成；明示探测成本。
 - 一键写入分两级：**L1=复制 BaseURL+Key**（近乎零成本，M3）；L2=全量改写客户端配置**带回滚**（M5，误覆盖风险与收益不成比例地高）。
 - 托盘常驻：状态灯 + 今日 token/花费（未录价渠道只显 token）。
@@ -164,3 +164,44 @@
 3. **验收口径修正**：「/__mx usage 与账本 SUM 完全相等」仅在正常（非 degraded）窗口成立，degraded 期披露丢弃/差异计数，不再无条件断言相等。
 
 采入规格的审查建议：client_status 枚举补 `interrupted`（启动恢复用）；settlements 冗余 channel_id/alias 列（聚合不依赖 join，requests 插入失败不产生口径失真）；落账矩阵（usage 被拒收→token 列 NULL + token_source='none' + missing_reason 取 missing|negative|inconsistent|absent，usage_valid=0）；model_mismatch 比较大小写不敏感 + 窗口内 ≥2 次才升级告警（T1 差异化防御的保守起点）；TTFT 漂移需 n≥20 + 绝对下限 300ms，低样本 provisional；告警重启后 5min 静默期防重发风暴（持久化后置 M5）；tee 全程逐帧 try/catch + tee_error 计数（观测失败绝不碰字节透传）；非流式旁路解析副本上限 2MB，超限跳过并计数；/v1/models 不入账本（仅网关计数）；amount 本切片恒 NULL（定价 M5）；user_version=1 + 「本版不清理」retention 声明；关闭顺序 = 停收新→观测 flush→wal_checkpoint(TRUNCATE)→close。key_hash 聚合维度、DatabaseSync 批量写压测、告警持久化：记录为后续项。
+
+### 查漏补缺切片裁决（2026-10-16，两路审计 + 图纸双审「有条件通过」→ 3 必修已并入）
+
+1. **ttft_high 命名裁决**：规格原文「TTFT 漂移」在本切片只实现「单窗口绝对下限」（未污染样本 n≥20 且 p95≥300ms）；与历史基线/相邻窗口比较的「漂移」语义未实现，命名如实改为 `ttft_high`，不叫 drift（名实必须一致）。
+2. **client_ttft 口径硬化**：client_ttft 独立于 upstream 口径——打点通道覆盖 `res.write`/`res.writeHead`/`res.end`（首字节任何形态均捕获），且结算时机不得早于响应头写出（上游 500 错误体转发等路径 settle 延后到 writeHead 之后）；全程无写入才写 NULL，绝不写 0 冒充，也不以「上游流式/成功」为 gate。回归用例：上游 500 JSON（upstream=NULL 而 client 非 NULL）。
+3. **静默期/冷却抑制诚实条款**：静默期早退不计入 `alertSuppressed`（那只计「规则已触发但被冷却拦下」，静默期规则根本不评估，冒充抑制次数=撒谎）；静默期效果以 `alertSilenceRemainingMs` + 粘性 `alertSilenceWasActive` 披露（过期后仍为 true，防「检查过没问题」假安心）。`/v1/models` 只进网关内存计数（requests.total/ok），不入账本；鉴权拒绝不计入 total。
+4. **验收脚本降级披露**：`verify:*` 十条仅覆盖已实现切片；verify:sched/delta/ports/retry 属 M4–M6，故意不设（不设假验收集）。README 两侧已加映射表。
+5. **已完成后置项（本切片顺带落地）**：面板静默/抑制披露行、轮询失败陈旧标注、污染剔除与 usage 缺失列、告警证据 id 展示、账本恢复（recovered）横幅。
+6. **仍然后置**（按序入后续切片）：告警证据 id 的账本一键下钻；(channel,origin) 二维窗口键化；guard 与网关共用切帧器；n<5 / n<20 / n<30 三档样本量语义在网关侧对齐；TTFT 相邻窗口/历史基线「漂移」比较；风暴熔断（>10 条/分钟折叠摘要）。
+
+### 聚合页体验重构 + Anthropic Messages 支持（v3.1，2026-10-18，用户验收驱动；不改七条铁律口径）
+
+- **聚合页流程重排（四步）**：① 渠道与模型 → ② 启动本地 API → ③ 实时监控 → ④ 客户端接入；按钮统一 `.action-row` 修复间距（flex+gap，行内按钮清零 `margin-top`，回归锚钉在 webui 测试）；`ANTHROPIC_BASE_URL` 复制行按「不带 /v1」口径（SDK 自行拼 `/v1/messages`）。
+- **一键获取模型**：`POST /api/gateway/probe-models`（8620，token 鉴权）由控制台进程代取上游 `GET {basePath}/models`——复用 ssrf 校验+钉定、15s 超时、2MB 上限；openai 走 `Authorization: Bearer`、anthropic 走 `x-api-key` + `anthropic-version: 2023-06-01`；key 只进请求头、响应片段 scrub；上游未实现 /models（部分 Anthropic 中转）时错误信息引导改手动添加。
+- **渠道持久化语义变更**：渠道表从「挂在网关实例」改为控制台持有（`scripts/serve.mjs` 进程内持久 `ChannelStore`，`createAliasGateway({store})` 注入）：网关启动前即可配置、跨网关启停保留；控制台进程退出仍丢失（文案如实披露）。回归测试钉死「启动前配置 → 启动后数据面 /v1/models 可见」。
+- **Anthropic Messages 协议（M5「Anthropic/Gemini 兼容适配层」部分前移）**：渠道 `protocol: 'openai'|'anthropic'`（严格枚举，400 带收到值与示例；update 保持现值、view 透出）；数据面扩为四条路由（+`POST /v1/messages`、`POST /v1/messages/count_tokens`）；`/v1/messages*` 双鉴权（`x-api-key` 或 Bearer，常量时间）；双向 409 `protocol_mismatch`（绝不触达上游）；上游 `${basePath}/messages`、强制 `x-api-key`、透传 `anthropic-version`/`anthropic-beta`、缺 `max_tokens` → 400；count_tokens 轻路径（真实转发、零账本、不进 usage 告警窗口）。tee 按渠道协议分派解析：`message_start`→usage.input、`content_block_delta`→首内容信号/TTFT、`message_delta`→ `stop_reason` 映射（`end_turn→stop`/`max_tokens→length`/`stop_sequence→stop`/`tool_use→tool_calls`）与 output_tokens 终值，非法形状降级 null 不抛；监控告警与 OpenAI 通道同口径（`truncated` 告警仍基于连接截断，与 finish_reason 无关）。
+- **范围外（守住）**：无重试/回退/熔断、无定价（amount 仍 NULL）、Gemini 未做、正文零持久化不变。
+
+### v3.2 unified 统一中转 + OpenAI Responses + 按模型价格计费（2026-10-18，用户第 8 条反馈驱动）
+
+- **协议三值**：`protocol: 'unified'|'openai'|'anthropic'`（缺省 unified；缺省/非三值 400 带收到值+示例）。unified=统一中转按**客户端请求格式**透传（chat→/chat/completions、responses→/responses、messages→/messages，五条路由全通）；显式协议仅拒跨格式（409，不触达上游）。数据面扩为五条路由（v3.1 四条 + `POST /v1/responses`）。
+- **OpenAI 第二种格式（Responses）**：`POST /v1/responses` 仅 Bearer 鉴权；上游 `${basePath}/responses`、Bearer + CLIENT_HEADER_ALLOWLIST；tee 观测 `TeeFormat='chat'|'messages'|'responses'` 按请求种类推导（与渠道协议解耦）；`sse.ts` 新增 `mapResponsesUsage`/`parseResponsesStreamPayload`/`responsesContentHasSignal`（纯函数降级绝不抛；`response.completed→stop`、`incomplete→length/原样 reason`、`failed→错误不落 tee`）。
+- **一键导入移除**：前端导入解析器/接线/用例/README 描述全清（用户明示不需要）。
+- **按模型 token 统计**：监控 usage 表 14 列（新增缓存/费用列）；`tokenCached`（chat cached_tokens / responses cached_tokens_details / anthropic cache_read）、`tokenReasoning`（responses reasoning_tokens）独立口径；`costUsd` 内存累计 + 账本 `settlements.amount` 实际落值（v3.1 恒 NULL 结束）。
+- **modelPrices（可选录价，新建 `src/gateway/pricing.ts`）**：`{input, output, cachedRead?, threshold?, input2?, output2?, cachedRead2?}`（USD/百万 tokens）；`threshold` 严格大于时**整单二档**（`cachedRead2 ?? input2`）；cached>prompt 钳 0；不录价只统计 token，金额恒 NULL 绝不 $0。严格校验 400 带收到值+示例（键∈models、input/output 成对、阶梯三元组同在或缺省）；update `undefined→保持`、`{}→清空`、models 变更后重校验绝不静默失效；settle 按路由时刻捕获价、usageSummary 按「当前是否仍录价」判空。
+- **验证**：全量 `npm test` 474/475（唯一失败 TTFT⑭ 已知抖动，隔离复跑 gateway 54/54 exit 0）；四契约文件新用例 117/117；e2e 驱动 15/15（mock 统一中转：unified 三格式路由+模型映射、threshold 阶梯费用、缓存按 cachedRead/缺省 input 价计、probe 三态、无虚拟 key 401）。
+- **口径披露**：真实上游仅发 `response.completed` 不发 delta 帧时 TTFT 观测为 null（保守不伪造）；`response.failed` 错误消息 tee 无消费方不落字段（规格偏差留痕）。
+
+### 修复：报告「清理（保留最新）」点击无响应（2026-10-18，用户反馈驱动）
+
+- 根因两层：① 清理确认用 `window.confirm` 原生对话框，在内嵌浏览器/网页视图环境会被静默吞掉（点击零反馈、无请求）；② 目录里没有更旧工件时（deleted=0）只有一行小字，观感等同「没反应」。
+- 修复：清理按钮改**两步点击确认**（首次点击进入待确认态：按钮文字变「再点一次＝清理」+ 琥珀色描边 + 提示文案；5 秒内再点执行；点其他位置/超时自动取消）——不依赖任何原生对话框；deleted=0 时明确显示「无需清理：没有更旧的报告/基线可删」；新增回归：webui 测试锁死「不得调用 window.confirm(」+ 两按钮均走两步确认；Playwright 真实浏览器 10/10（含 Playwright 默认自动 dismissal 对话框 ≈ webview 病态环境的复现口径、同戳基线保留、点外取消、清空全部）。
+
+### 全功能审计 83 项 + 编辑回填两处修复（2026-10-18，用户指令「检查每一个功能 包括 webui 里的每一个功能」）
+
+- **审计口径**：`tmp/mx-audit.mjs`（报告夹具仓库副本 + mock 上游 + Playwright msedge，全程不触真实仓库）三段 83 项——A 服务端 22 项（Host/Origin/token/CSP/穿越/越界/静态白名单/1MB body/错误脱敏/probe 复用与拒绝/渠道视图无明文 key/任务 dry-run 生命周期/405 Allow 头）、B 浏览器 60 项（三 tab 全交互：key 生命周期、运行携带输入 key 即用、命令预览逐参数精确匹配、预演流、渠道表单校验/取消/别名跟随/价格行同步/模型行移除同步缩价/去重探测/停启/启动/轮换+旧 key 401+点选全选/复制三键剪贴板内容、数据面三格式、用量表数值与费用、静默期披露、清理 409 互锁、停止复位、编辑回填、报告列表分流/「打开」链接实际可下载/评分卡/两步清理/keep-latest 文件系统语义）、C 清空后复核——全绿 83/83。
+- **修复 1（`scripts/serve.mjs`）**：非 POST 方法语义——未知路径必须 404「未知的 API 端点」（原先一律回 405「该端点仅支持 POST」，文案说谎）；仅 `POST_ONLY_ENDPOINTS`（/api/key、/api/key/clear、/api/reports/clear、/api/test）上的非 POST 方法回 405，且 405 一律带 `Allow: POST`（静态 405 带 `Allow: GET, HEAD`，RFC 9110）。serve.test.ts guard 用例改 404 并新增「405/404 不得混淆 + Allow + 未知 POST 404 + 静态 Allow」行为用例；serve-console.test.ts 加源码钉子。
+- **修复 2（`web/app.js`）**：编辑渠道价格行回填空白、保存静默清价——`channelForm.reset()` 只清价格输入值不清行元素，空草稿快照掩盖 seed；修复：`setChannelForm` 先清残留价格行再 `syncPriceRows(seed, true)`。
+- **修复 3（`web/app.js`）**：编辑表单不恢复「允许本机/内网上游」勾选 → 私有上游渠道保存被 400 拒、公网渠道被静默翻转 false；修复：按 `channel.allowPrivateUpstream` 恢复勾选。两处均加 webui-wiring 源码钉子。
+- **验证**：全量 `npm test` 520/520（含新增钉子）；审计复跑 83/83；e2e 单文件 38/38（全量并发下 usage-scale 两例曾见负载抖动，单跑与全量复跑均绿，属已知时间敏感模式）。
+- **工作区**：根目录调试残留 tmp-hist*.mjs / tmp-verify-issue.mjs 已清除；审计与 e2e 脚本归档 `tmp/`（gitignore）；reports/ 按既定策略视为 runtime data（.gitignore 新增 reports/），tracked 旧报告删除保持 staged，随下次提交生效。

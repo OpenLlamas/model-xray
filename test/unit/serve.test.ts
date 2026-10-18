@@ -1,6 +1,6 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { request as httpRequest } from 'node:http';
+import { createServer, request as httpRequest } from 'node:http';
 import { existsSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -134,8 +134,10 @@ test('serve：dry-run 测试任务真实 spawn CLI 跑完 → done / exitCode 0'
   while (Date.now() < deadline) {
     const logRes = await request(server.port, `/api/jobs/${id}/log?after=0`);
     assert.equal(logRes.status, 200);
-    const log = JSON.parse(logRes.body) as { lines: Array<{ text: string }>; status: string; next: number };
+    const log = JSON.parse(logRes.body) as { lines: Array<{ text: string }>; status: string; next: number; startedAt: number };
     assert.ok(Array.isArray(log.lines), 'log.lines 应为数组');
+    assert.equal(typeof log.startedAt, 'number', 'log.startedAt 应存在（前端已用时间依赖）');
+    assert.ok(log.startedAt > 0);
     sawStatus = log.status;
     lastSeqSeen = log.next;
     if (log.status !== 'running') break;
@@ -149,6 +151,61 @@ test('serve：dry-run 测试任务真实 spawn CLI 跑完 → done / exitCode 0'
   assert.equal(detail.status, 'done');
   assert.equal(detail.exitCode, 0);
   assert.equal(detail.reportPaths, null, 'dry-run 不产出报告，reportPaths 应为 null');
+});
+test('serve：POST /api/test 半组阶梯价 → 400 成组提示（不发起任务）', async () => {
+  const server = await startServer();
+  const res = await postJson(
+    server.port,
+    '/api/test',
+    {
+      dryRun: true,
+      baseUrl: 'http://127.0.0.1:9/v1',
+      model: 'gpt-4o',
+      priceInput: '2',
+      priceOutput: '8',
+      priceThreshold: '1000000',
+      priceInput2: '6',
+    },
+    server.token,
+  );
+  assert.equal(res.status, 400, res.body);
+  const data = JSON.parse(res.body) as Record<string, unknown>;
+  assert.match(String(data.error ?? ''), /成组/);
+  assert.match(String(data.error ?? ''), /示例/);
+});
+test('serve：POST /api/test 缓存读 + 完整二档阶梯价 → dry-run exitCode 0', { timeout: 20000 }, async () => {
+  const server = await startServer();
+  const res = await postJson(
+    server.port,
+    '/api/test',
+    {
+      dryRun: true,
+      baseUrl: 'http://127.0.0.1:9/v1',
+      model: 'gpt-4o',
+      priceInput: '2',
+      priceOutput: '8',
+      priceCachedRead: '0',
+      priceThreshold: '1000000',
+      priceInput2: '6',
+      priceOutput2: '22.5',
+      priceCachedRead2: '0.75',
+    },
+    server.token,
+  );
+  assert.equal(res.status, 200, `POST /api/test 应 200：${res.body}`);
+  const { id } = JSON.parse(res.body) as { id: string };
+  const deadline = Date.now() + 15000;
+  let status = '';
+  while (Date.now() < deadline) {
+    const logRes = await request(server.port, `/api/jobs/${id}/log?after=0`);
+    assert.equal(logRes.status, 200);
+    status = (JSON.parse(logRes.body) as { status: string }).status;
+    if (status !== 'running') break;
+    await delay(200);
+  }
+  assert.equal(status, 'done');
+  const detail = JSON.parse((await request(server.port, `/api/jobs/${id}`)).body) as { exitCode: number };
+  assert.equal(detail.exitCode, 0);
 });
 test('serve：任务运行中并发第二个 POST /api/test → 409（全局互斥）', { timeout: 20000 }, async () => {
   const server = await startServer();
@@ -203,19 +260,34 @@ test('serve：POST /api/test out 越出仓库 → 400（页面渲染读不回报
   assert.match(String(data.error ?? ''), /out/);
   assert.match(String(data.error ?? ''), /仓库/);
 });
-test('serve：POST /api/guard/start 价格只填一侧 → 400 含成对提示（录入价格才启用计费）', async () => {
+test('serve：guard 控制台托管已移除 → /api/guard/* 一律 404（未知路径不得谎称「仅支持 POST」）', async () => {
   const server = await startServer();
-  const keyRes = await postJson(server.port, '/api/key', { key: 'test-key' }, server.token);
-  assert.equal(keyRes.status, 200);
-  const res = await postJson(
-    server.port,
-    '/api/guard/start',
-    { baseUrl: 'http://127.0.0.1:9/v1', priceInput: '2.5' },
-    server.token,
-  );
-  assert.equal(res.status, 400, `单侧价格应 400，实际 ${String(res.status)}：${res.body}`);
+  const res = await postJson(server.port, '/api/guard/start', { baseUrl: 'http://127.0.0.1:9/v1' }, server.token);
+  assert.equal(res.status, 404, `已移除的端点应 404，实际 ${String(res.status)}：${res.body}`);
   const data = JSON.parse(res.body) as Record<string, unknown>;
-  assert.match(String(data.error ?? ''), /成对/);
+  assert.match(String(data.error ?? ''), /未知的 API 端点/);
+  const legacyGet = await request(server.port, '/api/guard/status');
+  assert.equal(legacyGet.status, 404, `未知路径的 GET 应 404，实际 ${String(legacyGet.status)}：${legacyGet.body}`);
+  assert.match(String((JSON.parse(legacyGet.body) as Record<string, unknown>).error ?? ''), /未知的 API 端点/);
+});
+test('serve：非 POST 方法语义——已登记 POST 端点 GET → 405+Allow，未知路径 GET/POST → 404（两者不得混淆）', async () => {
+  const server = await startServer();
+  const known = await request(server.port, '/api/key');
+  assert.equal(known.status, 405, `已登记端点 GET 应 405，实际 ${String(known.status)}：${known.body}`);
+  assert.equal(String(known.headers.allow ?? ''), 'POST', `405 必须带 Allow: POST（RFC 9110），实际 ${String(known.headers.allow)}`);
+  const unknown = await request(server.port, '/api/does-not-exist');
+  assert.equal(unknown.status, 404, `未知路径 GET 应 404，实际 ${String(unknown.status)}：${unknown.body}`);
+  const unknownPost = await postJson(server.port, '/api/does-not-exist', {}, server.token);
+  assert.equal(unknownPost.status, 404, `未知路径 POST 应 404，实际 ${String(unknownPost.status)}：${unknownPost.body}`);
+  const staticPost = await postJson(server.port, '/index.html', {}, server.token);
+  assert.equal(staticPost.status, 405, `静态资源 POST 应 405，实际 ${String(staticPost.status)}`);
+  assert.equal(String(staticPost.headers.allow ?? ''), 'GET, HEAD', `静态 405 必须带 Allow: GET, HEAD，实际 ${String(staticPost.headers.allow)}`);
+  const gatewayPut = await request(server.port, '/api/gateway/status', {
+    method: 'PUT',
+    headers: { 'x-model-xray-token': server.token },
+  });
+  assert.equal(gatewayPut.status, 405, `网关端点 PUT 应 405，实际 ${String(gatewayPut.status)}：${gatewayPut.body}`);
+  assert.equal(String(gatewayPut.headers.allow ?? ''), 'GET, POST', `网关端点 405 必须带 Allow: GET, POST，实际 ${String(gatewayPut.headers.allow)}`);
 });
 test('serve：GET / 返回 200、注入 token 字面值且无占位符残留', async () => {
   const server = await startServer();
@@ -341,5 +413,201 @@ test('serve：非 dry-run 真实审计（mock 上游）→ reportPaths 为绝对
   } finally {
     mock.server.close();
     rmSync(outDir, { recursive: true, force: true });
+  }
+});
+// —— 网关管理面：渠道挂在控制台持久 store 上（网关启动前即可配置/修改/删除，跨启停保留） ——
+
+test('serve：网关未启动时渠道 CRUD 可用（创建/更新/删除；protocol 校验；key 不回显）', async () => {
+  const server = await startServer();
+  const create = await postJson(
+    server.port,
+    '/api/gateway/channels',
+    {
+      label: '预配置渠道',
+      baseUrl: 'https://relay.example.com/v1',
+      apiKey: 'sk-test-aaaaaaaa1111',
+      models: ['m1', 'm2'],
+      modelMap: { m1: 'gpt-4o' },
+      protocol: 'openai',
+    },
+    server.token,
+  );
+  assert.equal(create.status, 200, `网关未启动也应能创建渠道：${create.body}`);
+  assert.ok(!create.body.includes('sk-test-aaaaaaaa1111'), '渠道视图不得回显 key');
+  const created = JSON.parse(create.body) as { channel: { id: string; protocol: string; models: string[] } };
+  assert.equal(created.channel.protocol, 'openai');
+  assert.deepEqual(created.channel.models, ['m1', 'm2']);
+  const defaulted = await postJson(
+    server.port,
+    '/api/gateway/channels',
+    { label: '缺省协议渠道', baseUrl: 'https://relay.example.com/v1', apiKey: 'sk-test-bbbbbbbb2222', models: ['u1'], modelMap: {} },
+    server.token,
+  );
+  assert.equal(defaulted.status, 200, `缺省 protocol 应可创建：${defaulted.body}`);
+  const defaultedView = JSON.parse(defaulted.body) as { channel: { id: string; protocol: string; modelPrices: Record<string, unknown> } };
+  assert.equal(defaultedView.channel.protocol, 'unified', '缺省协议为 unified（统一中转）');
+  assert.deepEqual(defaultedView.channel.modelPrices, {}, '未录价 = 空对象');
+  const priced = await postJson(
+    server.port,
+    `/api/gateway/channels/${encodeURIComponent(created.channel.id)}`,
+    { modelPrices: { m1: { input: 2.5, output: 10, cachedRead: 0.5 }, m2: { input: 1, output: 2, threshold: 1000, input2: 3, output2: 4 } } },
+    server.token,
+  );
+  assert.equal(priced.status, 200, `录价应 200：${priced.body}`);
+  assert.deepEqual((JSON.parse(priced.body) as { channel: { modelPrices: unknown } }).channel.modelPrices, {
+    m1: { input: 2.5, output: 10, cachedRead: 0.5 },
+    m2: { input: 1, output: 2, threshold: 1000, input2: 3, output2: 4 },
+  });
+  const clearedPrice = await postJson(
+    server.port,
+    `/api/gateway/channels/${encodeURIComponent(created.channel.id)}`,
+    { modelPrices: {} },
+    server.token,
+  );
+  assert.equal(clearedPrice.status, 200);
+  assert.deepEqual((JSON.parse(clearedPrice.body) as { channel: { modelPrices: unknown } }).channel.modelPrices, {}, '显式 {} 清空');
+  const badPrice = await postJson(
+    server.port,
+    '/api/gateway/channels',
+    { label: 'X', baseUrl: 'https://x.example.com/v1', apiKey: 'sk-xxx111222333444', models: ['m'], modelPrices: { m: { input: -1, output: 1 } } },
+    server.token,
+  );
+  assert.equal(badPrice.status, 400);
+  const badPriceError = String((JSON.parse(badPrice.body) as { error: string }).error);
+  assert.match(badPriceError, /modelPrices/);
+  assert.match(badPriceError, /收到值/);
+  assert.match(badPriceError, /示例/);
+  const list = await request(server.port, '/api/gateway/channels', { headers: { 'x-model-xray-token': server.token } });
+  assert.equal(list.status, 200);
+  assert.ok(list.body.includes('预配置渠道'), `列表应含新渠道：${list.body}`);
+  const update = await postJson(
+    server.port,
+    `/api/gateway/channels/${encodeURIComponent(created.channel.id)}`,
+    { protocol: 'anthropic' },
+    server.token,
+  );
+  assert.equal(update.status, 200, `更新渠道应 200：${update.body}`);
+  const updated = JSON.parse(update.body) as { channel: { protocol: string; models: string[] } };
+  assert.equal(updated.channel.protocol, 'anthropic');
+  assert.deepEqual(updated.channel.models, ['m1', 'm2'], '未提交的字段应保留');
+  const badProtocol = await postJson(
+    server.port,
+    '/api/gateway/channels',
+    { label: 'X', baseUrl: 'https://x.example.com/v1', apiKey: 'sk-xxx111222333444', models: ['m'], protocol: 'gemini' },
+    server.token,
+  );
+  assert.equal(badProtocol.status, 400);
+  const badProtocolError = String((JSON.parse(badProtocol.body) as { error: string }).error);
+  assert.match(badProtocolError, /protocol/);
+  assert.match(badProtocolError, /统一/, '非法协议文案宣传 unified 统一中转');
+  const remove = await postJson(
+    server.port,
+    `/api/gateway/channels/${encodeURIComponent(created.channel.id)}/delete`,
+    {},
+    server.token,
+  );
+  assert.equal(remove.status, 200, `删除渠道应 200：${remove.body}`);
+});
+
+test('serve：probe-models 服务端代取上游 /models（Bearer 头、SSRF 私网口径、channelId 复用已存 key）', async () => {
+  const server = await startServer();
+  let authSeen = '';
+  let apiKeySeen = '';
+  let versionSeen = '';
+  const upstream = createServer((req, res) => {
+    if (req.method === 'GET' && req.url === '/v1/models') {
+      authSeen = String(req.headers.authorization ?? '');
+      apiKeySeen = String(req.headers['x-api-key'] ?? '');
+      versionSeen = String(req.headers['anthropic-version'] ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'gpt-4o' }, { id: 'deepseek-chat' }] }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"message":"not found"}}');
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', () => resolve()));
+  const address = upstream.address();
+  const upstreamPort = address !== null && typeof address === 'object' ? address.port : 0;
+  const key = 'sk-probe-test-key-111122223333';
+  try {
+    const denied = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, protocol: 'openai' },
+      server.token,
+    );
+    assert.equal(denied.status, 400, `未勾选本机上游应被 SSRF 口径拒绝：${denied.body}`);
+    const direct = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, protocol: 'openai', allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(direct.status, 200, `探测应 200：${direct.body}`);
+    assert.deepEqual((JSON.parse(direct.body) as { models: string[] }).models, ['gpt-4o', 'deepseek-chat']);
+    assert.ok(!direct.body.includes(key), '探测响应不得回显 key');
+    assert.equal(authSeen, `Bearer ${key}`, 'OpenAI 渠道探测须带 Bearer 上游 key');
+    const anthropicProbe = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, protocol: 'anthropic', allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(anthropicProbe.status, 200, `Anthropic 协议探测应 200：${anthropicProbe.body}`);
+    assert.equal(apiKeySeen, key, 'Anthropic 渠道探测须带 x-api-key 上游 key（而非 Bearer）');
+    assert.equal(versionSeen, '2023-06-01', 'Anthropic 渠道探测须带 anthropic-version 头');
+    const unifiedProbe = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, protocol: 'unified', allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(unifiedProbe.status, 200, `unified 探测应 200：${unifiedProbe.body}`);
+    assert.equal(authSeen, `Bearer ${key}`, 'unified 探测须同时携带 Bearer');
+    assert.equal(apiKeySeen, key, 'unified 探测须同时携带 x-api-key');
+    assert.equal(versionSeen, '2023-06-01', 'unified 探测须同时携带 anthropic-version');
+    const badProbeProtocol = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, protocol: 'gemini', allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(badProbeProtocol.status, 400);
+    const badProbeError = String((JSON.parse(badProbeProtocol.body) as { error: string }).error);
+    assert.match(badProbeError, /收到值/);
+    assert.match(badProbeError, /统一/);
+    const create = await postJson(
+      server.port,
+      '/api/gateway/channels',
+      { label: '本机探测渠道', baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, models: ['gpt-4o'], allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(create.status, 200, `创建渠道应 200：${create.body}`);
+    const channelId = (JSON.parse(create.body) as { channel: { id: string } }).channel.id;
+    const reuse = await postJson(server.port, '/api/gateway/probe-models', { channelId }, server.token);
+    assert.equal(reuse.status, 200, `channelId 复用已存 key 应 200：${reuse.body}`);
+    assert.equal(authSeen, `Bearer ${key}`, '缺省协议（reuse 未传 protocol）按 unified 携带三头');
+    assert.equal(apiKeySeen, key);
+    const createAnthropic = await postJson(
+      server.port,
+      '/api/gateway/channels',
+      { label: '本机 anthropic 渠道', baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, models: ['claude-3-5-sonnet'], protocol: 'anthropic', allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(createAnthropic.status, 200, `创建 anthropic 渠道应 200：${createAnthropic.body}`);
+    const anthropicChannelId = (JSON.parse(createAnthropic.body) as { channel: { id: string } }).channel.id;
+    authSeen = '';
+    apiKeySeen = '';
+    versionSeen = '';
+    const reuseAnthropic = await postJson(server.port, '/api/gateway/probe-models', { channelId: anthropicChannelId }, server.token);
+    assert.equal(reuseAnthropic.status, 200, `anthropic 渠道复用应 200：${reuseAnthropic.body}`);
+    assert.equal(authSeen, '', '缺省 protocol 必须继承已存渠道的 anthropic 协议（不得回落 unified 携带 Bearer）');
+    assert.equal(apiKeySeen, key, '继承 anthropic 协议后须携带 x-api-key');
+    assert.equal(versionSeen, '2023-06-01', '继承 anthropic 协议后须携带 anthropic-version');
+    const missing = await postJson(server.port, '/api/gateway/probe-models', { channelId: 'no-such-channel' }, server.token);
+    assert.equal(missing.status, 404);
+  } finally {
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
   }
 });

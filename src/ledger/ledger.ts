@@ -315,7 +315,8 @@ export class Ledger {
       const rows = this.db
         .prepare(
           'SELECT r.id AS id, r.channel_id AS channel_id, r.alias AS alias FROM requests r ' +
-            'WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.request_id = r.id AND s.attempt_no = 1)',
+            // 不限定 attempt_no：只要存在任意一次结算就视为已落账（多 attempt 结算各自成行，见 settle 的 UNIQUE 冲突语义）
+            'WHERE NOT EXISTS (SELECT 1 FROM settlements s WHERE s.request_id = r.id)',
         )
         .all() as Array<{ id: string; channel_id: string; alias: string }>;
       let filled = 0;

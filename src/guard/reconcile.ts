@@ -1,5 +1,6 @@
 import { DRIFT_BILLING_ABS, DRIFT_BILLING_REL } from '../baseline.js';
 import { probeBalance, spendBetween, type BalanceReading } from '../balance.js';
+import { computeCostUsd, type ModelPrice } from '../gateway/pricing.js';
 import type { Usage } from '../types.js';
 import { JournalWriter, type BalanceSnapshot, type ReconcileEntry } from './journal.js';
 
@@ -21,8 +22,8 @@ export function gradeRatio(ratio: number): RatioVerdict {
 export interface ReconcilerOptions {
   baseUrl: string;
   apiKey: string;
-  /** 宣称价格（$/M tokens），成对正数；cost = Σ(tokens × price / 1e6) */
-  prices: { input: number; output: number };
+  /** 宣称价格（$/M tokens；含可选缓存读与二档阶梯），cost = computeCostUsd(usage, prices) */
+  prices: ModelPrice;
   /** 对账周期毫秒数（>0；0 时不建 Reconciler） */
   intervalMs: number;
   journal: JournalWriter;
@@ -40,13 +41,14 @@ export interface ReconcilerOptions {
  * 滚动对账器：余额差值 ÷ 窗口预期成本。
  * - 请求按「完成时间」归属窗口（recordCompletion 在请求 finalize 时调用）；
  * - usage 缺失/无效的请求单列计数（usageMissing），不进 cost 分母；
+ * - 窗口内存在缺失/无效 usage（分母不完整，实测倍率只会上偏）→ skipped，不出 ratio（防假阳性 fail）；
  * - 余额不可得 / 跨端点不同源 / 分母为 0 → skipped 事件，不出 ratio；
  * - Δbalance < 0（充值/退款混入）→ skipped_recharge 事件，不出 ratio。
  */
 export class Reconciler {
   private readonly baseUrl: string;
   private readonly apiKey: string;
-  private readonly prices: { input: number; output: number };
+  private readonly prices: ModelPrice;
   private readonly intervalMs: number;
   private readonly journal: JournalWriter;
   private readonly balanceTimeoutMs: number;
@@ -87,7 +89,10 @@ export class Reconciler {
   start(): void {
     if (this.timer !== null || this.intervalMs <= 0) return;
     this.timer = setInterval(() => {
-      void this.tick(false);
+      // 定时器回调绝不允许未处理 rejection 击穿常驻进程：任何异常降级为一行摘要
+      this.tick(false).catch((error) => {
+        this.onSummary(`[guard] 对账周期异常（不影响转发）：${error instanceof Error ? error.message : String(error)}`);
+      });
     }, this.intervalMs);
   }
 
@@ -105,8 +110,7 @@ export class Reconciler {
       this.windowUsageMissing += 1;
       return;
     }
-    this.windowCost +=
-      (usage.prompt_tokens * this.prices.input + usage.completion_tokens * this.prices.output) / 1e6;
+    this.windowCost += computeCostUsd(usage, this.prices);
   }
 
   /** 结算当前窗口并开新窗口。final=true 用于优雅退出的末次结算。 */
@@ -178,6 +182,11 @@ export class Reconciler {
     } else if (this.windowCost <= 0) {
       verdict = 'skipped';
       message = `窗口内无有效 usage（分母为 0；缺失/无效 ${this.windowUsageMissing} 笔单列），跳过对账。`;
+    } else if (this.windowUsageMissing > 0) {
+      // 分母不完整：余额差值含未观测 usage 请求的真实扣费，ratio 只会系统性上偏——
+      // 与测试侧「ratio_contaminated 作废实测」同一纪律，绝不拿不完整窗口出判定（防假阳性 fail）
+      verdict = 'skipped';
+      message = `窗口内 ${this.windowUsageMissing} 笔请求缺失/无效 usage，分母不完整、实测倍率只会上偏，作废本窗口不出倍率（缺失已单列）。`;
     } else {
       const computed = spendDelta / this.windowCost;
       if (!Number.isFinite(computed)) {

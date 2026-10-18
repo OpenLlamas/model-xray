@@ -1,5 +1,7 @@
 import { parseArgs } from 'node:util';
-import { positiveNumber, strictInt } from '../cli.js';
+import { strictInt } from '../cli.js';
+import { parsePriceFlags } from '../price-flags.js';
+import type { ModelPrice } from '../gateway/pricing.js';
 import { supportsColor } from '../color.js';
 import { FingerprintMonitor } from './fingerprint.js';
 import { JournalWriter, type ScoreEntry } from './journal.js';
@@ -30,9 +32,14 @@ const GUARD_HELP = `model-xray guard — 常驻监控：本地透明转发代理
   --out <dir>                 审计日志目录（默认 reports/guard；按日轮转 guard-YYYYMMDD.jsonl）
   --price-input <n>           宣称输入价（$/M tokens），与 --price-output 成对出现才启用金额对账
   --price-output <n>          宣称输出价（$/M tokens）
+  --price-cached-read <n>     宣称缓存读价（$/M tokens，可不填=按输入价）
+  --price-threshold <n>       长上下文阶梯阈值（prompt tokens 正整数；须与二档输入/输出同填）
+  --price-input2 <n>          二档输入价（$/M tokens）
+  --price-output2 <n>         二档输出价（$/M tokens）
+  --price-cached-read2 <n>    二档缓存读价（$/M tokens，可不填=按二档输入价）
   --reconcile-minutes <n>     余额对账周期，[0, 1440] 整数分钟（默认 15；0=关闭；仅在提供价格对后生效）
   --fingerprint-minutes <n>   主动指纹复核周期，[0, 10080] 整数分钟（默认 0=关闭；
-                              开启后每周期真实发起 3+1 次对话请求，会真实计费）
+                              开启后每周期真实发起 5+1 次对话请求（--deep 档 8+1），会真实计费）
   --help                      显示本帮助
 
 密钥：仅读环境变量 MODEL_XRAY_KEY（guard 不提供 --key 旗标，避免 key 进入命令行历史）。
@@ -65,6 +72,11 @@ export async function runGuard(args: string[]): Promise<number> {
         out: { type: 'string' },
         'price-input': { type: 'string' },
         'price-output': { type: 'string' },
+        'price-cached-read': { type: 'string' },
+        'price-threshold': { type: 'string' },
+        'price-input2': { type: 'string' },
+        'price-output2': { type: 'string' },
+        'price-cached-read2': { type: 'string' },
         'reconcile-minutes': { type: 'string' },
         'fingerprint-minutes': { type: 'string' },
         help: { type: 'boolean', default: false },
@@ -115,20 +127,20 @@ export async function runGuard(args: string[]): Promise<number> {
     return 2;
   }
 
-  const priceInputRaw = values['price-input'];
-  const priceOutputRaw = values['price-output'];
-  let prices: { input: number; output: number } | null = null;
-  if (priceInputRaw !== undefined || priceOutputRaw !== undefined) {
-    if (priceInputRaw === undefined || priceOutputRaw === undefined) {
-      console.error('--price-input 与 --price-output 必须成对出现。');
-      console.error('示例：--price-input 2.5 --price-output 10');
-      return 2;
-    }
-    const parsedInput = positiveNumber(priceInputRaw, 'price-input');
-    const parsedOutput = positiveNumber(priceOutputRaw, 'price-output');
-    if (parsedInput === null || parsedOutput === null) return 2;
-    prices = { input: parsedInput, output: parsedOutput };
+  const priceFlags = parsePriceFlags({
+    'price-input': values['price-input'],
+    'price-output': values['price-output'],
+    'price-cached-read': values['price-cached-read'],
+    'price-threshold': values['price-threshold'],
+    'price-input2': values['price-input2'],
+    'price-output2': values['price-output2'],
+    'price-cached-read2': values['price-cached-read2'],
+  });
+  if (priceFlags.error !== null) {
+    console.error(priceFlags.error);
+    return 2;
   }
+  const prices = priceFlags.price;
 
   const reconcileMinutes =
     values['reconcile-minutes'] !== undefined ? strictInt(values['reconcile-minutes'], 0, 1440, 'reconcile-minutes', '15') : 15;
@@ -266,7 +278,7 @@ function printBanner(info: {
   port: number;
   baseUrl: string;
   out: string;
-  prices: { input: number; output: number } | null;
+  prices: ModelPrice | null;
   reconcileMinutes: number;
   fingerprintActive: boolean;
   fingerprintMinutes: number;
@@ -277,7 +289,7 @@ function printBanner(info: {
     info.prices === null
       ? '关闭（未提供 --price-input/--price-output，仅统计 tokens 不算金额）'
       : info.reconcileMinutes > 0
-        ? `开启（价格 ${info.prices.input}/${info.prices.output} 每百万 tokens；周期 ${info.reconcileMinutes} 分钟）`
+        ? `开启（价格 ${info.prices.input}/${info.prices.output} 每百万 tokens${info.prices.cachedRead !== undefined ? `，缓存读 ${info.prices.cachedRead}` : ''}${info.prices.threshold !== undefined ? `；>${info.prices.threshold} tokens 阶梯 ${info.prices.input2}/${info.prices.output2}` : ''}；周期 ${info.reconcileMinutes} 分钟）`
         : '关闭（--reconcile-minutes 0）';
   console.log('model-xray guard 已启动');
   console.log(`  监听        http://127.0.0.1:${info.port}（仅本机回环）`);

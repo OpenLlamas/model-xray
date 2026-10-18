@@ -15,6 +15,7 @@ function toolCallResult(nonce: string): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'stop',
+    model: null,
     text: '',
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
@@ -33,6 +34,7 @@ function starvedResult(): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'length',
+    model: null,
     text: '',
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 512, total_tokens: 522 },
@@ -51,6 +53,7 @@ function textResult(text: string): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'stop',
+    model: null,
     text,
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 8, total_tokens: 18 },
@@ -98,6 +101,7 @@ function makeCtx(client: OpenAIClient): ProbeCtx {
     seed: 1,
     timeoutMs: 1000,
     retries: 0,
+    streamFallback: false,
     outDir: 'reports',
     html: false,
     yes: true,
@@ -138,6 +142,66 @@ test('capability tool: second round recovers at 512 → pass', async () => {
   assert.equal(outcome.level, 'pass');
 });
 
+test('capability tool: round 2 answers without echoing nonce → partial (never fail), round 1 proved tool emission', async () => {
+  // 回归（2026-10-17 官方 1M 上下文复核实证）：glm-5.3-flash 首轮正确发起工具调用且参数正确，
+  // 仅次轮未复述 nonce，被判 fail（capability 50）——与首轮已实证的工具调用能力自相矛盾。
+  const { client } = scriptedClient(() => textResult('好的，工具已执行'));
+  const outcome = await probeCapability(makeCtx(client));
+  assert.equal(outcome.metrics['tool'], 'partial');
+  assert.notEqual(outcome.metrics['tool'], 'fail');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => /tool calling 能力已实证/.test(f.message) && f.level === 'warn'));
+});
+
+test('capability tool: first round starved after retry → na (never fail 0), budgets 1024→2048', async () => {
+  // 回归：首轮原写死 max_tokens=200 且无 starved 判定 → thinking 模型推理吃掉预算后返回纯文本，
+  // 被误判「未发起工具调用」= fail 0（证据不足给 0 分，与 vision 路径自相矛盾）。
+  const requests: ChatRequest[] = [];
+  let calls = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      requests.push(req);
+      calls += 1;
+      return starvedResult();
+    },
+  };
+  const outcome = await probeCapability(makeCtx(client));
+  assert.equal(requests.length, 2, '首轮 1024 截断 → 2048 重试仍截断 → 证据不足，不再继续次轮');
+  assert.equal(requests[0]?.max_tokens, 1024);
+  assert.equal(requests[1]?.max_tokens, 2048);
+  assert.equal(outcome.metrics['tool'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => /首轮因推理占满预算/.test(f.message) && f.level === 'warn'));
+});
+
+test('capability tool: first round recovers at 2048 → tool call recorded with 2048 budget', async () => {
+  const requests: ChatRequest[] = [];
+  let calls = 0;
+  let nonce = 'NONCE1';
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      requests.push(req);
+      calls += 1;
+      if (calls === 1) return starvedResult();
+      if (calls === 2) {
+        const last = req.messages[req.messages.length - 1];
+        const prompt = typeof last?.content === 'string' ? last.content : '';
+        nonce = prompt.match(/"([A-Z0-9]{6})"/)?.[1] ?? 'NONCE1';
+        return toolCallResult(nonce);
+      }
+      return textResult(`nonce ${nonce} confirmed`);
+    },
+  };
+  const outcome = await probeCapability(makeCtx(client));
+  assert.equal(requests[0]?.max_tokens, 1024);
+  assert.equal(requests[1]?.max_tokens, 2048);
+  assert.equal(outcome.metrics['tool'], 'pass');
+  assert.equal(outcome.status, 'ok');
+});
+
 // ---------- vision：测试图尺寸守卫（8px 图是识别伪影，必须发 256px） ----------
 
 test('capability vision: every request carries a 256x256 PNG (VISION_IMAGE_SIZE, not the 8px artifact)', async () => {
@@ -168,4 +232,40 @@ test('capability vision: every request carries a 256x256 PNG (VISION_IMAGE_SIZE,
     assert.equal(png.readUInt32BE(16), 256, `图片宽度应为 256，实际 ${png.readUInt32BE(16)}`);
     assert.equal(png.readUInt32BE(20), 256, `图片高度应为 256，实际 ${png.readUInt32BE(20)}`);
   }
+});
+
+test('capability vision: all HTTP 200 blank responses → na (never fail, not a color error)', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return textResult('');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.level, 'unknown');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /空文本/.test(f.message)));
+});
+
+test('capability tool: first round HTTP 200 blank → na (blank response is not "no tool call")', async () => {
+  const requests: ChatRequest[] = [];
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      requests.push(req);
+      return textResult('');
+    },
+  };
+  const ctx = makeCtx(client);
+  const outcome = await probeCapability(ctx);
+  assert.equal(requests.length, 1, '空响应直接按证据不足处理，不再发次轮');
+  assert.equal(outcome.metrics['tool'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.level, 'unknown');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /空文本/.test(f.message)));
 });

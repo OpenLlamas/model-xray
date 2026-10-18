@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
 import { PROBE_BUDGETS, chatWithStarveRetry, isStarved } from '../../src/probes/starve.js';
+import { describeDecoyResponse } from '../../src/runner.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
 
 function starvedResult(maxTokens: number, text = ''): ChatResult {
@@ -10,6 +11,7 @@ function starvedResult(maxTokens: number, text = ''): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'length',
+    model: null,
     text,
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: maxTokens, total_tokens: 10 + maxTokens },
@@ -28,6 +30,7 @@ function okResult(text: string): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'stop',
+    model: null,
     text,
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
@@ -41,11 +44,31 @@ function okResult(text: string): ChatResult {
   };
 }
 
+function blankResult(): ChatResult {
+  return {
+    ok: true,
+    status: 200,
+    finishReason: null,
+    model: null,
+    text: '',
+    reasoning: null,
+    usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+    usageRejected: null,
+    attempts: 1,
+    toolCalls: [],
+    ttftMs: null,
+    durationMs: 1,
+    error: 'empty stream',
+    raw: '',
+  };
+}
+
 function httpErrorResult(status: number): ChatResult {
   return {
     ok: false,
     status,
     finishReason: null,
+    model: null,
     text: '',
     reasoning: null,
     usage: null,
@@ -85,6 +108,7 @@ function makeCtx(client: OpenAIClient): ProbeCtx {
     seed: 1,
     timeoutMs: 1000,
     retries: 0,
+    streamFallback: false,
     outDir: 'reports',
     html: false,
     yes: true,
@@ -101,6 +125,13 @@ test('isStarved: ok + finish_reason=length captures empty AND non-empty truncate
   assert.equal(isStarved(okResult('done')), false);
   // 请求失败（401/400/传输）即使带 length 语义也不是 starvation（ok=false）
   assert.equal(isStarved(httpErrorResult(401)), false);
+});
+
+test('describeDecoyResponse: 200 空响应不得写成「正常」，失败需带错误原因', () => {
+  assert.equal(describeDecoyResponse(okResult('')), '为空（HTTP 200，无 content）');
+  assert.equal(describeDecoyResponse(starvedResult(120)), '为空/截断（推理占满预算）');
+  assert.equal(describeDecoyResponse(httpErrorResult(500)), '失败（HTTP 500: rejected）');
+  assert.equal(describeDecoyResponse(okResult('no')), '正常');
 });
 
 test('chatWithStarveRetry: starved first call retries once with higher budget, records both calls', async () => {
@@ -181,14 +212,78 @@ test('chatWithStarveRetry: persistent starvation after retry is flagged', async 
   assert.equal(call.result.text, '{"a":');
 });
 
+test('chatWithStarveRetry: blank first call falls back to stream at retry budget and adopts answer', async () => {
+  const { client, requests } = stubClient([blankResult(), okResult('42')]);
+  const ctx = makeCtx(client);
+  // 默认 true；单测基线为 false，这里显式开启验证真实路径。
+  ctx.cfg.streamFallback = true;
+  const call = await chatWithStarveRetry(ctx, {
+    probe: 'quality',
+    label: 'main mod',
+    buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages: [{ role: 'user', content: 'q' }], temperature: 0, max_tokens: maxTokens }),
+    budget: PROBE_BUDGETS.quality,
+    retryBudget: PROBE_BUDGETS.qualityRetry,
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(requests[0]?.stream ?? false, false);
+  assert.equal(requests[0]?.max_tokens, PROBE_BUDGETS.quality);
+  assert.equal(requests[1]?.stream, true);
+  assert.equal(requests[1]?.max_tokens, PROBE_BUDGETS.qualityRetry);
+  assert.equal(call.starved, false);
+  assert.equal(call.retried, false);
+  assert.equal(call.blankRetried, true);
+  assert.equal(call.streamFallback, true);
+  assert.equal(call.result.text, '42');
+  assert.equal(ctx.evidence.size(), 2);
+  assert.match(ctx.evidence.all()[1]?.label ?? '', /stream-retry@512/);
+});
+
+test('chatWithStarveRetry: blank fallback also blank keeps first blank (no fabricated answer)', async () => {
+  const { client, requests } = stubClient([blankResult(), blankResult()]);
+  const ctx = makeCtx(client);
+  ctx.cfg.streamFallback = true;
+  const call = await chatWithStarveRetry(ctx, {
+    probe: 'quality',
+    label: 'main mod',
+    buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages: [{ role: 'user', content: 'q' }], temperature: 0, max_tokens: maxTokens }),
+    budget: PROBE_BUDGETS.quality,
+    retryBudget: PROBE_BUDGETS.qualityRetry,
+  });
+  assert.equal(requests.length, 2);
+  assert.equal(call.starved, false);
+  assert.equal(call.blankRetried, true);
+  assert.equal(call.streamFallback, false);
+  assert.equal(call.result.text, '');
+  assert.equal(ctx.evidence.size(), 2);
+});
+
+test('chatWithStarveRetry: streamFallback=false keeps single blank request', async () => {
+  const { client, requests } = stubClient([blankResult()]);
+  const ctx = makeCtx(client);
+  const call = await chatWithStarveRetry(ctx, {
+    probe: 'quality',
+    label: 'main mod',
+    buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages: [{ role: 'user', content: 'q' }], temperature: 0, max_tokens: maxTokens }),
+    budget: PROBE_BUDGETS.quality,
+    retryBudget: PROBE_BUDGETS.qualityRetry,
+  });
+  assert.equal(requests.length, 1);
+  assert.equal(call.blankRetried, false);
+  assert.equal(call.streamFallback, false);
+});
+
 test('PROBE_BUDGETS: documented values fixed by test (regression anchor)', () => {
   assert.deepEqual(PROBE_BUDGETS, {
     vision: 1024,
     visionRetry: 2048,
     quality: 256,
     qualityRetry: 512,
+    toolFirst: 1024,
+    toolFirstRetry: 2048,
     toolSecond: 256,
     toolSecondRetry: 512,
     identity: 512,
+    context: 1024,
+    contextRetry: 2048,
   });
 });

@@ -39,7 +39,7 @@ const UNIT_COST = (1000 * PRICES.input + 500 * PRICES.output) / 1e6;
 interface Harness {
   dir: string;
   flush: () => Promise<void>;
-  makeReconciler: (overrides?: { readings?: Array<BalanceReading | null> }) => Reconciler;
+  makeReconciler: (overrides?: { readings?: Array<BalanceReading | null>; prices?: { input: number; output: number; cachedRead?: number; threshold?: number; input2?: number; output2?: number; cachedRead2?: number } }) => Reconciler;
   cleanup: () => void;
 }
 
@@ -47,13 +47,13 @@ function makeHarness(readings: Array<BalanceReading | null>): Harness {
   const dir = makeTempDir();
   const journal = new JournalWriter(dir);
   let call = 0;
-  const makeReconciler = (overrides?: { readings?: Array<BalanceReading | null> }): Reconciler => {
+  const makeReconciler = (overrides?: { readings?: Array<BalanceReading | null>; prices?: { input: number; output: number; cachedRead?: number; threshold?: number; input2?: number; output2?: number; cachedRead2?: number } }): Reconciler => {
     const series = overrides?.readings ?? readings;
     call = 0;
     return new Reconciler({
       baseUrl: 'https://relay.example.com/v1',
       apiKey: 'test-key',
-      prices: PRICES,
+      prices: overrides?.prices ?? PRICES,
       intervalMs: 60000,
       journal,
       queryBalance: async () => {
@@ -101,6 +101,51 @@ test('guard reconcile：cost 数学（/1e6）与窗口累计', async () => {
     assert.equal(entry.verdict, 'warn');
   } finally {
     cleanup();
+  }
+});
+
+test('guard reconcile：缓存读 + 二档阶梯价与 gateway 同口径（严格 > threshold 才切档）', async () => {
+  const prices = { input: 1, output: 4, cachedRead: 0.5, threshold: 1000, input2: 3, output2: 6, cachedRead2: 0.25 };
+  // 二档：prompt=1001 > 1000 → (1001-300)×3 + 300×0.25 + 4×6 = 2202；一档：prompt=1000 → 1000×1 + 4×4 = 1016
+  const tier2: Usage = { prompt_tokens: 1001, completion_tokens: 4, total_tokens: 1005, cached_tokens: 300 };
+  const tier1: Usage = { prompt_tokens: 1000, completion_tokens: 4, total_tokens: 1004 };
+  const expected = (2202 + 1016) / 1e6;
+  const harness = makeHarness([spent(0), spent(expected)]);
+  try {
+    const reconciler = harness.makeReconciler({ prices });
+    await reconciler.initialize();
+    reconciler.recordCompletion(tier2);
+    reconciler.recordCompletion(tier1);
+    await reconciler.tick(false);
+    const entry = (await readReconcileEntries(harness))[0];
+    assert.ok(entry);
+    assert.ok(Math.abs((entry.cost ?? 0) - expected) < 1e-12, `cost=${entry.cost}`);
+    assert.equal(entry.ratio, 1);
+    assert.equal(entry.verdict, 'ok');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('guard reconcile：窗口含缺失/无效 usage → 作废不出倍率（分母不完整，防假阳性 fail）', async () => {
+  // spendDelta=2.5×UNIT_COST 但只有 1 笔 usage 进分母：旧实现 ratio=2.5 → 假 fail；
+  // 与测试侧「ratio_contaminated 作废实测」同纪律：缺 usage 的窗口绝不出判定
+  const harness = makeHarness([spent(0), spent(2.5 * UNIT_COST)]);
+  try {
+    const reconciler = harness.makeReconciler();
+    await reconciler.initialize();
+    reconciler.recordCompletion(USAGE);
+    reconciler.recordCompletion(null); // 上游已发但 usage 缺失/无效：真实扣费在 Δ 里，分母缺这份成本
+    await reconciler.tick(true);
+    const entry = (await readReconcileEntries(harness))[0];
+    assert.ok(entry);
+    assert.equal(entry.requests, 2);
+    assert.equal(entry.usageMissing, 1);
+    assert.equal(entry.verdict, 'skipped');
+    assert.equal(entry.ratio, null);
+    assert.match(entry.message, /缺失\/无效 usage/);
+  } finally {
+    harness.cleanup();
   }
 });
 

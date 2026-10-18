@@ -193,15 +193,15 @@ test('diffBaseline marks version/versions/model mismatches incomparable', () => 
 });
 
 test('baseline: probeset_version bump v0.1.0 → current blocks comparison; same version stays comparable', () => {
-  // 当前版本应为 v0.2.1（identity 探针加强：样本数 5/8、全体一致判定、claimed_version 旁证）
-  assert.equal(PROBESET_VERSION, 'v0.2.1');
+  // 当前版本应为 v0.2.2（quality 抗噪：主问题干净答错复采样一次，两次机会口径；沿承 v0.2.1 identity 加强）
+  assert.equal(PROBESET_VERSION, 'v0.2.2');
   const current = baselineOf({ probesetVersion: PROBESET_VERSION });
   const oldV1 = baselineOf({ probesetVersion: 'v0.1.0' });
   const diff = diffBaseline(oldV1, current);
   assert.equal(diff.comparable, false);
   assert.match(diff.skipReason ?? '', /题集版本/);
   assert.ok(diff.skipReason?.includes('v0.1.0'));
-  assert.ok(diff.skipReason?.includes('v0.2.1'));
+  assert.ok(diff.skipReason?.includes('v0.2.2'));
   // 同版本基线照常可比（不存在版本不可比跳过）
   const same = diffBaseline(baselineOf({ probesetVersion: PROBESET_VERSION }), current);
   assert.equal(same.comparable, true);

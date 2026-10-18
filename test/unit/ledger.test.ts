@@ -180,6 +180,7 @@ test('ledger ④：recover() 补 interrupted（归因 gateway）恰一次，重�
     const openB = ledger.recordRequest(requestInput({ alias: 'open-b' }));
     assert.ok(settledId && openA && openB);
     assert.equal(ledger.settle(settleInput(settledId, { alias: 'done' })), true);
+    const recoverAt = Date.now();
     assert.equal(ledger.recover(), 2, '恰补两条中断请求');
     assert.equal(ledger.recover(), 0, '再次调用不重复补结（幂等）');
     const rows = ledger.settlementsOf(openA);
@@ -188,6 +189,10 @@ test('ledger ④：recover() 补 interrupted（归因 gateway）恰一次，重�
     assert.equal(rows[0]!.errorSource, 'gateway', '恢复补结归因 gateway，绝不冤枉渠道');
     assert.equal(rows[0]!.tokenSource, 'none');
     assert.equal(rows[0]!.tokenMissingReason, 'absent');
+    // tz 口径：补结行 ts_ms 必须是合法 epoch 毫秒（非本地偏移/秒级/0 占位）
+    assert.ok(rows[0]!.tsMs > recoverAt - 1000 && rows[0]!.tsMs <= Date.now() + 1000, `补结行 ts_ms 应为 recover 时刻 ±1s 内的 epoch 毫秒（收到 ${rows[0]!.tsMs}）`);
+    const openBTsRaw = ledger.rawDbForTest.prepare('SELECT ts_ms FROM requests WHERE id = ?').get(openB) as { ts_ms: number };
+    assert.ok(openBTsRaw.ts_ms > recoverAt - 1000 && openBTsRaw.ts_ms <= Date.now() + 1000, `requests.ts_ms 应为 epoch 毫秒（收到 ${openBTsRaw.ts_ms}）`);
     assert.equal(ledger.stats().recovered, 2);
     const summary = ledger.usageSummary();
     assert.equal(summary.reduce((sum, row) => sum + row.requests, 0), 3);
@@ -474,6 +479,43 @@ test('ledger ⑪：recover 补结行同样上链（checked 精确）；篡改恢
     assert.equal(report.ok, false);
     assert.equal(report.table, 'settlements');
     assert.equal(report.brokenAtId, recovered.id, '恢复补结行被篡改（如洗白归因）必须断链');
+  } finally {
+    ledger.close();
+  }
+});
+
+test('ledger ④b：仅存在 attempt_no=2 结算时 recover() 不伪造 attempt_no=1 补结行', () => {
+  const ledger = new Ledger(':memory:');
+  try {
+    const id = ledger.recordRequest(requestInput({ alias: 'retry-only' }));
+    assert.ok(id);
+    assert.equal(ledger.settle(settleInput(id, { alias: 'retry-only', attempt_no: 2 })), true);
+    assert.equal(ledger.recover(), 0, '已存在任意 attempt 结算的请求不再补 interrupted');
+    assert.equal(ledger.settlementsOf(id).length, 1);
+    assert.equal(ledger.stats().recovered, 0);
+  } finally {
+    ledger.close();
+  }
+});
+
+test('ledger ⑫：settlement.amount 金额落库（非空数字存 REAL 不截断；未录价 NULL 恒为 NULL）', () => {
+  const ledger = new Ledger(':memory:');
+  try {
+    const priced = ledger.recordRequest(requestInput({ alias: 'priced' }));
+    assert.ok(priced);
+    assert.equal(ledger.settle(settleInput(priced, { alias: 'priced', amount: 0.000025 })), true);
+    const free = ledger.recordRequest(requestInput({ alias: 'free' }));
+    assert.ok(free);
+    assert.equal(ledger.settle(settleInput(free, { alias: 'free' })), true);
+    const pricedRow = ledger.settlementsOf(priced)[0]!;
+    assert.ok(
+      typeof pricedRow.amount === 'number' && Math.abs(pricedRow.amount - 0.000025) < 1e-15,
+      `小数金额必须原样保留（NUMERIC affinity → REAL），收到 ${String(pricedRow.amount)}`,
+    );
+    const freeRow = ledger.settlementsOf(free)[0]!;
+    assert.equal(freeRow.amount, null, '未录价必须 NULL，绝不写 0 冒充');
+    const raw = ledger.rawDbForTest.prepare('SELECT amount, typeof(amount) AS t FROM settlements WHERE request_id = ?').get(priced) as { amount: number; t: string };
+    assert.equal(raw.t, 'real', `SQLite 侧应存为 real（实际 ${raw.t}）`);
   } finally {
     ledger.close();
   }

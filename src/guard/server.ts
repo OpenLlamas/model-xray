@@ -4,8 +4,10 @@ import { request as httpsRequest } from 'node:https';
 import { normalize as posixNormalize } from 'node:path/posix';
 import { pipeline } from 'node:stream/promises';
 import { validateUsage } from '../sse.js';
+import type { ModelPrice } from '../gateway/pricing.js';
 import type { Usage, UsageRejection } from '../types.js';
 import type { JournalWriter } from './journal.js';
+import { sameModelId } from './model-id.js';
 import type { Reconciler } from './reconcile.js';
 import type { ScoreSample } from './scoreboard.js';
 
@@ -52,7 +54,7 @@ export function buildAnomalies(input: {
   finishReason: string | null;
 }): AnomalyCandidate[] {
   const out: AnomalyCandidate[] = [];
-  if (input.modelReq !== null && input.modelResp !== null && input.modelReq !== input.modelResp) {
+    if (input.modelReq !== null && input.modelResp !== null && !sameModelId(input.modelReq, input.modelResp)) {
     out.push({
       code: 'model_mismatch',
       level: 'warn',
@@ -62,7 +64,7 @@ export function buildAnomalies(input: {
   if (input.usageRejected !== null) {
     const why =
       input.usageRejected === 'missing'
-        ? 'usage 字段缺失或非数字'
+        ? 'usage 字段缺失/非数字/非整数'
         : input.usageRejected === 'negative'
           ? 'usage 出现负 token 数'
           : 'total_tokens ≠ prompt_tokens + completion_tokens';
@@ -215,7 +217,7 @@ export interface GuardServerOptions {
   /** MODEL_XRAY_KEY：对内校验客户端凭证、对外注入上游凭证 */
   key: string;
   journal: JournalWriter;
-  prices: { input: number; output: number } | null;
+  prices: ModelPrice | null;
   reconciler: Reconciler | null;
   fingerprint: FingerprintObserver | null;
   /** 上游 socket 空闲超时（默认 300s；流式下每收到数据自动重置） */
@@ -322,7 +324,8 @@ export function createGuardServer(options: GuardServerOptions): GuardHandle {
     // 1) 请求目标校验（防 SSRF/穿越）
     const target = validateRequestTarget(req.url ?? '/');
     if (!target.ok || target.path === null) {
-      state.path = (req.url ?? '/').slice(0, 200);
+      // 脱敏红线：journal 的 path 字段按约定「已去 query」，拒绝路径同样不得落原始 query（可能含凭证）
+      state.path = (req.url ?? '/').split('?')[0]!.slice(0, 200);
       state.status = target.status;
       state.errors.push({ code: target.status === 403 ? 'target_forbidden' : 'target_invalid', status: target.status });
       respondJson(res, target.status, { error: { message: `${target.message}。收到：${truncate(req.url ?? '', 200)}` } });
@@ -671,7 +674,9 @@ export function createGuardServer(options: GuardServerOptions): GuardHandle {
     }
 
     if (state.modelReq !== null && options.fingerprint !== null) options.fingerprint.noteModel(state.modelReq);
-    options.reconciler?.recordCompletion(state.usage);
+    // 对账窗口与评分卡同口径：只收「已实际发往上游」的请求——本地 401/403/目标校验拒绝
+    // 从未触达上游、不可能产生扣费，计入窗口只会虚增 requests/usageMissing、打破空窗静默
+    if (state.upstreamSent) options.reconciler?.recordCompletion(state.usage);
 
     // 评分卡：仅「已实际发往上游」的请求入窗；必修⑤——record 任何异常只 stderr 一行，绝不打断请求管线
     if (state.upstreamSent && options.scoreboard !== undefined) {

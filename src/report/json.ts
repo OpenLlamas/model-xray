@@ -28,6 +28,7 @@ function serializeEvidenceRecord(record: EvidenceRecord): Record<string, unknown
     request: serializeRequest(record.request),
     response: {
       status: record.response.status,
+      model: record.response.model ?? null,
       textPreview: record.response.textPreview,
       textChars: record.response.textChars,
       usage: serializeUsage(record.response.usage),
@@ -36,6 +37,8 @@ function serializeEvidenceRecord(record: EvidenceRecord): Record<string, unknown
       toolCallCount: record.response.toolCallCount,
       finish_reason: record.response.finishReason ?? null,
       error: record.response.error ?? null,
+      raw: record.response.raw,
+      rawChars: record.response.rawChars,
     },
     ttftMs: record.ttftMs ?? null,
     durationMs: record.durationMs,
@@ -51,6 +54,7 @@ function serializeRequest(request: EvidenceRequest): Record<string, unknown> {
     maxTokens: request.maxTokens ?? null,
     messageCount: request.messageCount,
     lastUserPreview: request.lastUserPreview,
+    lastUserTailPreview: request.lastUserTailPreview,
     lastUserChars: request.lastUserChars,
     totalChars: request.totalChars,
   };

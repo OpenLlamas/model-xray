@@ -1,6 +1,6 @@
 // web/app.js — model-xray 控制台前端
 // 约束（沿袭 P1.5）：
-//   ① 纯函数（escapeHtml / buildCommand / renderScorecard）供 Node 测试直接 import；
+//   ① 纯函数（escapeHtml / buildCommand / renderScorecard / scrubSecrets / buildModelPrices / formatCostUsd）供 Node 测试直接 import；
 //   ② DOM 接线全部收在 `typeof document !== 'undefined'` 守卫内；
 //   ③ 仅与本地回环服务（scripts/serve.mjs）通信，不访问任何外部地址；
 //   ④ key 只提交给本地服务（keySource=page），命令预览里绝不出现 key。
@@ -51,6 +51,13 @@ function isPositiveNumberStr(raw) {
   return Number.isFinite(value) && value > 0;
 }
 
+/** 严格非负数（缓存读价可免费）：形如数字、Number() 有限且 >= 0。 */
+function isNonNegativeNumberStr(raw) {
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return false;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 0;
+}
+
 /**
  * 由表单输入生成可复制的 CLI 命令。
  * @returns {{ command: string, hints: string[], error: string | null }}
@@ -96,18 +103,58 @@ export function buildCommand(input) {
 
   const priceInputRaw = String(input?.priceInput ?? '').trim();
   const priceOutputRaw = String(input?.priceOutput ?? '').trim();
+  const priceCachedReadRaw = String(input?.priceCachedRead ?? '').trim();
+  const priceThresholdRaw = String(input?.priceThreshold ?? '').trim();
+  const priceInput2Raw = String(input?.priceInput2 ?? '').trim();
+  const priceOutput2Raw = String(input?.priceOutput2 ?? '').trim();
+  const priceCachedRead2Raw = String(input?.priceCachedRead2 ?? '').trim();
   const hasPriceInput = priceInputRaw !== '';
   const hasPriceOutput = priceOutputRaw !== '';
+  const anyOptionalPrice =
+    priceCachedReadRaw !== '' ||
+    priceThresholdRaw !== '' ||
+    priceInput2Raw !== '' ||
+    priceOutput2Raw !== '' ||
+    priceCachedRead2Raw !== '';
   // 判空必须用 !== ''（不能用真值判断，否则 '0' 会被误判成「未填」）
-  if (hasPriceInput !== hasPriceOutput) {
-    return fail('--price-input 与 --price-output 必须成对填写。示例：--price-input 2.5 --price-output 10');
-  }
-  if (hasPriceInput) {
+  if (!hasPriceInput && !hasPriceOutput) {
+    if (anyOptionalPrice) {
+      return fail('--price-input 与 --price-output 必须成对填写（缓存读与阶梯价为可选补充）。示例：--price-input 2.5 --price-output 10');
+    }
+  } else {
+    if (!hasPriceInput || !hasPriceOutput) {
+      return fail('--price-input 与 --price-output 必须成对填写。示例：--price-input 2.5 --price-output 10');
+    }
     if (!isPositiveNumberStr(priceInputRaw)) {
       return fail(`--price-input 必须为正数（每百万 tokens 宣称价格，0 与负数无效）。收到：${JSON.stringify(priceInputRaw)}。示例：--price-input 2.5`);
     }
     if (!isPositiveNumberStr(priceOutputRaw)) {
       return fail(`--price-output 必须为正数（每百万 tokens 宣称价格，0 与负数无效）。收到：${JSON.stringify(priceOutputRaw)}。示例：--price-output 10`);
+    }
+    if (priceCachedReadRaw !== '' && !isNonNegativeNumberStr(priceCachedReadRaw)) {
+      return fail(`--price-cached-read 必须为不小于 0 的数字（缓存读命中价，可免费）。收到：${JSON.stringify(priceCachedReadRaw)}。示例：--price-cached-read 0.5`);
+    }
+    const tierPresent = priceThresholdRaw !== '' || priceInput2Raw !== '' || priceOutput2Raw !== '';
+    const tierComplete = priceThresholdRaw !== '' && priceInput2Raw !== '' && priceOutput2Raw !== '';
+    if (tierPresent && !tierComplete) {
+      return fail('--price-threshold、--price-input2、--price-output2 必须成组填写。示例：--price-threshold 1000000 --price-input2 6 --price-output2 22.5');
+    }
+    if (!tierComplete && priceCachedRead2Raw !== '') {
+      return fail('--price-cached-read2 仅在填写阶梯价（阈值/二档输入/二档输出）时可用。示例：--price-threshold 1000000 --price-input2 6 --price-output2 22.5 --price-cached-read2 0.75');
+    }
+    if (tierComplete) {
+      if (!isPositiveIntStr(priceThresholdRaw)) {
+        return fail(`--price-threshold 必须是正整数 tokens。收到：${JSON.stringify(priceThresholdRaw)}。示例：--price-threshold 1000000`);
+      }
+      if (!isPositiveNumberStr(priceInput2Raw)) {
+        return fail(`--price-input2 必须为正数（每百万 tokens 二档输入价）。收到：${JSON.stringify(priceInput2Raw)}。示例：--price-input2 6`);
+      }
+      if (!isPositiveNumberStr(priceOutput2Raw)) {
+        return fail(`--price-output2 必须为正数（每百万 tokens 二档输出价）。收到：${JSON.stringify(priceOutput2Raw)}。示例：--price-output2 22.5`);
+      }
+      if (priceCachedRead2Raw !== '' && !isNonNegativeNumberStr(priceCachedRead2Raw)) {
+        return fail(`--price-cached-read2 必须为不小于 0 的数字（二档缓存读命中价，可免费）。收到：${JSON.stringify(priceCachedRead2Raw)}。示例：--price-cached-read2 0.75`);
+      }
     }
   }
 
@@ -157,6 +204,13 @@ export function buildCommand(input) {
   if (hasPriceInput) {
     parts.push(`--price-input ${priceInputRaw}`);
     parts.push(`--price-output ${priceOutputRaw}`);
+    if (priceCachedReadRaw !== '') parts.push(`--price-cached-read ${priceCachedReadRaw}`);
+    if (priceThresholdRaw !== '') {
+      parts.push(`--price-threshold ${priceThresholdRaw}`);
+      parts.push(`--price-input2 ${priceInput2Raw}`);
+      parts.push(`--price-output2 ${priceOutput2Raw}`);
+      if (priceCachedRead2Raw !== '') parts.push(`--price-cached-read2 ${priceCachedRead2Raw}`);
+    }
   }
   if (seedRaw !== '') parts.push(`--seed ${seedRaw}`);
   if (timeoutRaw !== '') parts.push(`--timeout ${timeoutRaw}`);
@@ -265,6 +319,150 @@ export function renderScorecard(jsonText) {
 }
 
 // ---------------------------------------------------------------------------
+// 密钥脱敏：纯函数（Node 可导入，无 DOM 依赖）
+// ---------------------------------------------------------------------------
+
+/** 从展示文本中抹掉命中的密钥（控制台错误回显防泄露；另对 sk- 形态做兜底打码）。 */
+export function scrubSecrets(text, secrets) {
+  let out = String(text);
+  for (const secret of Array.isArray(secrets) ? secrets : []) {
+    if (typeof secret !== 'string' || secret.length < 6) continue;
+    out = out.split(secret).join('***');
+  }
+  return out.replace(/sk-[A-Za-z0-9_-]{12,}/g, 'sk-***');
+}
+
+// ---------------------------------------------------------------------------
+// 价格编辑与费用显示：纯函数（Node 可导入，无 DOM 依赖）
+// ---------------------------------------------------------------------------
+
+/** 价格字段中文名（报错文案用）。 */
+const PRICE_FIELD_LABELS = {
+  input: '输入单价',
+  output: '输出单价',
+  cachedRead: '缓存读单价',
+  threshold: '阶梯阈值',
+  input2: '二档输入单价',
+  output2: '二档输出单价',
+  cachedRead2: '二档缓存读单价',
+};
+
+/**
+ * 价格字段解析：空串 → null（未填）；合法非负有限数 → number；其余 → undefined（非法，调用方报错）。
+ * integer=true 用于阶梯阈值：必须为正整数。
+ */
+function parsePriceField(raw, integer = false) {
+  const text = String(raw ?? '').trim();
+  if (text === '') return null;
+  if (integer) {
+    return /^\d+$/.test(text) && Number.isSafeInteger(Number(text)) && Number(text) > 0 ? Number(text) : undefined;
+  }
+  if (!/^(\d+(\.\d*)?|\.\d+)$/.test(text)) return undefined;
+  const value = Number(text);
+  return Number.isFinite(value) && value >= 0 ? value : undefined;
+}
+
+/**
+ * 汇总价格编辑行为服务端 modelPrices 请求体（客户端先验，服务端仍会按同口径复验并给出精确报错）。
+ * 别名全空的行跳过；输入/输出必须成对（0 = 免费模型合法）；阶梯「阈值+二档输入+二档输出」成对或缺省。
+ * @returns {{ modelPrices: Record<string, object>, error: string | null }}
+ */
+export function buildModelPrices(entries) {
+  const modelPrices = {};
+  const list = Array.isArray(entries) ? entries : [];
+  for (const entry of list) {
+    const alias = String(entry?.alias ?? '').trim();
+    const raw = {
+      input: entry?.input,
+      output: entry?.output,
+      cachedRead: entry?.cachedRead,
+      threshold: entry?.threshold,
+      input2: entry?.input2,
+      output2: entry?.output2,
+      cachedRead2: entry?.cachedRead2,
+    };
+    const allBlank = Object.values(raw).every((value) => String(value ?? '').trim() === '');
+    if (alias === '') {
+      if (allBlank) continue;
+      return { modelPrices, error: '价格行缺少模型别名：请先在模型清单中填写别名（或清空该行价格）。' };
+    }
+    if (allBlank) continue;
+    const parsed = {
+      input: parsePriceField(raw.input),
+      output: parsePriceField(raw.output),
+      cachedRead: parsePriceField(raw.cachedRead),
+      threshold: parsePriceField(raw.threshold, true),
+      input2: parsePriceField(raw.input2),
+      output2: parsePriceField(raw.output2),
+      cachedRead2: parsePriceField(raw.cachedRead2),
+    };
+    for (const [field, value] of Object.entries(parsed)) {
+      if (value === undefined) {
+        return {
+          modelPrices,
+          error: `模型 ${JSON.stringify(alias)} 的「${PRICE_FIELD_LABELS[field]}」必须是${field === 'threshold' ? '正整数' : '不小于 0 的数字'}。示例：输入 2.5、输出 10、缓存读 0.5、阶梯阈值 1000000。`,
+        };
+      }
+    }
+    if (parsed.input === null || parsed.output === null) {
+      return {
+        modelPrices,
+        error: `模型 ${JSON.stringify(alias)}：输入与输出单价必须成对填写（缓存读可留空 = 按输入价计；只想统计 token 请全部留空）。`,
+      };
+    }
+    const tierPresent = parsed.threshold !== null || parsed.input2 !== null || parsed.output2 !== null || parsed.cachedRead2 !== null;
+    if (tierPresent && (parsed.threshold === null || parsed.input2 === null || parsed.output2 === null)) {
+      return {
+        modelPrices,
+        error: `模型 ${JSON.stringify(alias)}：阶梯价需同时填写「阶梯阈值 + 二档输入 + 二档输出」（二档缓存读可留空 = 按二档输入价计）。`,
+      };
+    }
+    modelPrices[alias] = {
+      input: parsed.input,
+      output: parsed.output,
+      ...(parsed.cachedRead !== null ? { cachedRead: parsed.cachedRead } : {}),
+      ...(tierPresent ? { threshold: parsed.threshold, input2: parsed.input2, output2: parsed.output2 } : {}),
+      ...(tierPresent && parsed.cachedRead2 !== null ? { cachedRead2: parsed.cachedRead2 } : {}),
+    };
+  }
+  return { modelPrices, error: null };
+}
+
+/**
+ * 费用显示：未配置价格（null/undefined/非法）→ '—'（绝不显示误导性的 $0）；0 → '$0'；其余按量级取小数位。
+ */
+export function formatCostUsd(value) {
+  if (value === null || value === undefined) return '—';
+  const number = Number(value);
+  if (!Number.isFinite(number)) return '—';
+  if (number === 0) return '$0';
+  if (Math.abs(number) >= 1) return `$${number.toFixed(2)}`;
+  if (Math.abs(number) >= 0.01) return `$${number.toFixed(4)}`;
+  return `$${number.toFixed(6)}`;
+}
+
+/** 运行日志逐行着色：阶段/请求/结果行使用不同的 class，便于在长日志中定位阶段边界。 */
+export function classifyLogLine(text) {
+  const phaseMatch = text.match(/\[RUN\]\s*阶段\s+([a-z-]+)/i);
+  if (phaseMatch !== null) {
+    const phase = phaseMatch[1].toLowerCase();
+    const done = /完成/.test(text);
+    return `log-line log-line-phase-${phase} ${done ? 'log-line-phase-done' : 'log-line-phase-start'}`;
+  }
+  const requestMatch = text.match(/\[RUN\]\s*([a-z-]+)\s+请求\s+#\d+/i);
+  if (requestMatch !== null) {
+    return `log-line log-line-request log-line-phase-${requestMatch[1].toLowerCase()}`;
+  }
+  if (/\[(FAIL|ERROR)\]|异常|告警/i.test(text)) return 'log-line log-line-fail';
+  if (/\[WARN\]|可疑/i.test(text)) return 'log-line log-line-warn';
+  if (/\[PASS\]/i.test(text)) return 'log-line log-line-pass';
+  if (/\[UNKNOWN\]/i.test(text)) return 'log-line log-line-unknown';
+  if (/\[INFO\]/i.test(text)) return 'log-line log-line-info';
+  return 'log-line';
+}
+
+
+// ---------------------------------------------------------------------------
 // DOM 接线（仅浏览器执行；Node 测试 import 时 document 为 undefined，直接跳过）
 // ---------------------------------------------------------------------------
 if (typeof document !== 'undefined') {
@@ -301,16 +499,15 @@ if (typeof document !== 'undefined') {
   const isOffline = () => TOKEN === null;
 
   // —— 三 tab 切换 ——
-  const tabs = { test: byId('tab-test'), guard: byId('tab-guard'), gateway: byId('tab-gateway'), reports: byId('tab-reports') };
-  const panels = { test: byId('panel-test'), guard: byId('panel-guard'), gateway: byId('panel-gateway'), reports: byId('panel-reports') };
+  const tabs = { test: byId('tab-test'), gateway: byId('tab-gateway'), reports: byId('tab-reports') };
+  const panels = { test: byId('panel-test'), gateway: byId('panel-gateway'), reports: byId('panel-reports') };
   function selectTab(which) {
-    for (const key of ['test', 'guard', 'gateway', 'reports']) {
+    for (const key of ['test', 'gateway', 'reports']) {
       tabs[key]?.setAttribute('aria-selected', key === which ? 'true' : 'false');
       if (panels[key]) panels[key].hidden = key !== which;
     }
   }
   tabs.test?.addEventListener('click', () => selectTab('test'));
-  tabs.guard?.addEventListener('click', () => selectTab('guard'));
   tabs.gateway?.addEventListener('click', () => {
     selectTab('gateway');
     void refreshGateway();
@@ -378,6 +575,11 @@ if (typeof document !== 'undefined') {
       expect: EXPECT_ALLOWED.filter((key) => checkedValue(`f-expect-${key}`)),
       priceInput: inputValue('f-price-input'),
       priceOutput: inputValue('f-price-output'),
+      priceCachedRead: inputValue('f-price-cached-read'),
+      priceThreshold: inputValue('f-price-threshold'),
+      priceInput2: inputValue('f-price-input2'),
+      priceOutput2: inputValue('f-price-output2'),
+      priceCachedRead2: inputValue('f-price-cached-read2'),
       seed: inputValue('f-seed'),
       timeout: inputValue('f-timeout'),
       out: inputValue('f-out'),
@@ -398,6 +600,7 @@ if (typeof document !== 'undefined') {
   }
   for (const id of [
     'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
+    'f-price-cached-read', 'f-price-threshold', 'f-price-input2', 'f-price-output2', 'f-price-cached-read2',
     'f-seed', 'f-timeout', 'f-out', 'f-baseline',
   ]) {
     byId(id)?.addEventListener('input', updateCommandPreview);
@@ -411,23 +614,78 @@ if (typeof document !== 'undefined') {
   const runBanner = byId('run-banner');
   const runLog = byId('run-log');
   const btnRun = byId('btn-run');
+  const runButtonLabel = byId('run-button-label');
+  const runStatus = byId('run-status');
+  const runStatusText = byId('run-status-text');
   let logPollTimer = null;
+  let logPollBusy = false;
+  let runStatusTimer = null;
+  let runStartedAt = null;
+  let lastLogAt = null;
+  let currentPhase = '';
+  let runTimeoutSec = 60;
 
   function appendLogLines(pre, lines) {
-    if (pre === null || !Array.isArray(lines)) return;
+    if (!Array.isArray(lines) || lines.length === 0) return;
+    const texts = lines.map((line) => (typeof line === 'object' && line !== null ? String(line.text ?? '') : String(line)));
+    lastLogAt = Date.now();
+    for (const text of texts) {
+      const phaseMatch = text.match(/\[RUN\]\s*阶段\s+([a-z-]+)/i) ?? text.match(/\[RUN\]\s*([a-z-]+)\s+请求\s+#\d+/i);
+      if (phaseMatch !== null) currentPhase = phaseMatch[1];
+    }
+    if (pre === null) return;
     if (pre.classList.contains('placeholder')) {
       pre.classList.remove('placeholder');
       pre.textContent = '';
     }
-    for (const line of lines) {
+    for (const text of texts) {
       const div = document.createElement('div');
-      const text = typeof line === 'object' && line !== null ? String(line.text ?? '') : String(line);
-      if (/\[(FAIL|ERROR)\]|异常|告警/i.test(text)) div.className = 'log-line-fail';
-      else if (/\[WARN\]|可疑/i.test(text)) div.className = 'log-line-warn';
+      div.className = classifyLogLine(text);
       div.textContent = text;
       pre.appendChild(div);
     }
     pre.scrollTop = pre.scrollHeight;
+  }
+  function formatElapsed(ms) {
+    const total = Math.max(0, Math.floor(ms / 1000));
+    return `${String(Math.floor(total / 60)).padStart(2, '0')}:${String(total % 60).padStart(2, '0')}`;
+  }
+  function updateRunStatus() {
+    if (runStatusText === null) return;
+    let text = `检测中… 已用 ${formatElapsed(Date.now() - (runStartedAt ?? Date.now()))}`;
+    if (currentPhase !== '') text += ` · 阶段 ${currentPhase}`;
+    if (lastLogAt === null) {
+      text += ' · 等待首个输出';
+    } else {
+      const idleSec = Math.max(0, Math.floor((Date.now() - lastLogAt) / 1000));
+      text += ` · 最近输出 ${idleSec}s 前`;
+      if (idleSec >= 30) {
+        text +=
+          idleSec >= runTimeoutSec + 5
+            ? '（已超过单请求上限，可能在重试或收尾）'
+            : `（长请求等待上游响应，单请求上限 ${runTimeoutSec}s）`;
+      }
+    }
+    runStatusText.textContent = text;
+  }
+  function startRunStatus(timeoutSec) {
+    runStartedAt = Date.now();
+    lastLogAt = null;
+    currentPhase = '';
+    runTimeoutSec = Number.isFinite(timeoutSec) && timeoutSec > 0 ? Math.round(timeoutSec) : 60;
+    if (runStatus !== null) runStatus.removeAttribute('hidden');
+    if (runButtonLabel !== null) runButtonLabel.textContent = '检测中…';
+    updateRunStatus();
+    if (runStatusTimer !== null) clearInterval(runStatusTimer);
+    runStatusTimer = setInterval(updateRunStatus, 500);
+  }
+  function stopRunStatus() {
+    if (runStatusTimer !== null) {
+      clearInterval(runStatusTimer);
+      runStatusTimer = null;
+    }
+    if (runStatus !== null) runStatus.setAttribute('hidden', '');
+    if (runButtonLabel !== null) runButtonLabel.textContent = '开始检测';
   }
   function showRunBanner(kind, title, detail = '') {
     if (runBanner === null) return;
@@ -435,13 +693,23 @@ if (typeof document !== 'undefined') {
     runBanner.textContent = detail === '' ? title : `${title} — ${detail}`;
     runBanner.removeAttribute('hidden');
   }
-  async function renderReportResult(reportPaths, exitCode, jobStatus) {
+  async function renderReportResult(reportPaths, exitCode, jobStatus, dryRun = false) {
     const wrap = byId('report-result');
     const links = byId('report-links');
     const out = byId('report-out');
     if (wrap === null) return;
+    const isDryRun = jobStatus === 'done' && dryRun === true;
     if (reportPaths === null) {
       wrap.setAttribute('hidden', '');
+      if (isDryRun) {
+        showRunBanner('pass', '预演完成：未发送任何请求，未生成报告（真实跑批才会产生报告文件）');
+      } else if (jobStatus === 'error') {
+        showRunBanner('fail', '⚠ 任务异常终止（子进程失败）：请查看日志');
+      } else if (exitCode === 1) {
+        showRunBanner('fail', '⚠ 检测不通过（exit 1）：请查看日志与报告');
+      } else if (exitCode === 2) {
+        showRunBanner('fail', '任务出错或未得出结论（exit 2）：请核对参数/key/端点后重试，详见日志');
+      }
       return;
     }
     if (links !== null) {
@@ -478,7 +746,8 @@ if (typeof document !== 'undefined') {
       }
     }
     wrap.removeAttribute('hidden');
-    if (jobStatus === 'error') showRunBanner('fail', '⚠ 任务异常终止（子进程失败）：请查看日志');
+    if (isDryRun) showRunBanner('pass', '预演完成：未发送任何请求（报告文件见上方链接）');
+    else if (jobStatus === 'error') showRunBanner('fail', '⚠ 任务异常终止（子进程失败）：请查看日志');
     else if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：存在异常，请查看下方评分卡与 findings');
     else if (overall === 'warn') showRunBanner('warn', '⚠ 可疑：存在可疑迹象但未实锤，请查看评分卡与 findings');
     else if (overall === 'pass') showRunBanner('pass', '✔ 检测通过：本轮未发现掺假/缩水证据');
@@ -490,11 +759,15 @@ if (typeof document !== 'undefined') {
       clearInterval(logPollTimer);
       logPollTimer = null;
     }
+    logPollBusy = false;
+    stopRunStatus();
     if (btnRun) btnRun.disabled = false;
   }
   function pollJob(id) {
     let after = 0;
     logPollTimer = setInterval(async () => {
+      if (logPollBusy) return;
+      logPollBusy = true;
       try {
         const res = await api(`/api/jobs/${id}/log?after=${after}`);
         if (!res.ok) {
@@ -503,6 +776,9 @@ if (typeof document !== 'undefined') {
           return;
         }
         const log = res.data;
+        if (typeof log.startedAt === 'number' && Number.isFinite(log.startedAt)) {
+          runStartedAt = log.startedAt;
+        }
         appendLogLines(runLog, log.lines);
         after = log.next;
         if (log.status === 'running') return;
@@ -510,10 +786,13 @@ if (typeof document !== 'undefined') {
         const detail = await api(`/api/jobs/${id}`);
         const exitCode = detail.ok ? detail.data.exitCode : null;
         const reportPaths = detail.ok ? detail.data.reportPaths : null;
-        await renderReportResult(reportPaths, exitCode, log.status);
+        const dryRun = log.dryRun === true || (detail.ok && detail.data.dryRun === true);
+        await renderReportResult(reportPaths, exitCode, log.status, dryRun);
       } catch (error) {
         stopLogPoll();
         showRunBanner('fail', '轮询中断', error instanceof Error ? error.message : String(error));
+      } finally {
+        logPollBusy = false;
       }
     }, 800);
   }
@@ -534,6 +813,8 @@ if (typeof document !== 'undefined') {
       }
       return;
     }
+    // 清掉可能残留的旧轮询/状态（正常 UI 下按钮禁用，此处只防御脚本或异常路径的重复启动）
+    stopLogPoll();
     if (runError) runError.setAttribute('hidden', '');
     if (runBanner) runBanner.setAttribute('hidden', '');
     if (runLog) {
@@ -542,8 +823,28 @@ if (typeof document !== 'undefined') {
     }
     byId('report-result')?.setAttribute('hidden', '');
     btnRun.disabled = true;
-    const res = await api('/api/test', { method: 'POST', body: JSON.stringify(form) });
+    startRunStatus(Number(form.timeout));
+    // 输入即用：key 栏有值则随请求提交（服务端持久化到本会话），随后清空输入并回读真实状态；响应不含 key 值
+    const typedKey = inputValue('f-key').trim();
+    const payload = typedKey === '' ? form : { ...form, key: typedKey };
+    let res;
+    try {
+      res = await api('/api/test', { method: 'POST', body: JSON.stringify(payload) });
+    } catch (error) {
+      stopRunStatus();
+      btnRun.disabled = false;
+      if (runError) {
+        runError.textContent = error instanceof Error ? error.message : String(error);
+        runError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (typedKey !== '') {
+      if (byId('f-key')) byId('f-key').value = '';
+      await loadKeyStatus();
+    }
     if (!res.ok) {
+      stopRunStatus();
       btnRun.disabled = false;
       if (runError) {
         runError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
@@ -554,79 +855,7 @@ if (typeof document !== 'undefined') {
     pollJob(res.data.id);
   });
 
-  // —— Tab ②：常驻监控 ——
-  const guardError = byId('guard-error');
-  const guardStateEl = byId('guard-state');
-  const guardLog = byId('guard-log');
-  let guardPollTimer = null;
-  let guardLogNext = 0;
-  function renderGuardStatus(st) {
-    if (guardStateEl === null) return;
-    guardStateEl.dataset.running = st?.running === true ? 'true' : 'false';
-    if (st?.running === true) {
-      guardStateEl.textContent = `状态：运行中（本地代理 http://127.0.0.1:${String(st.port)}/v1 → ${String(st.baseUrl)}）`;
-    } else if (st?.status === 'exited') {
-      guardStateEl.textContent = `状态：已退出（exit ${String(st.exitCode)}）；输出见下方日志。`;
-    } else {
-      guardStateEl.textContent = '状态：未启动';
-    }
-  }
-  async function pollGuardOnce() {
-    try {
-      const [statusRes, logRes] = await Promise.all([
-        api('/api/guard/status'),
-        api(`/api/guard/log?after=${guardLogNext}`),
-      ]);
-      if (statusRes.ok) renderGuardStatus(statusRes.data);
-      if (logRes.ok) {
-        appendLogLines(guardLog, logRes.data.lines);
-        guardLogNext = logRes.data.next;
-      }
-    } catch {
-      /* 轮询失败静默重试 */
-    }
-  }
-  function ensureGuardPoll() {
-    if (guardPollTimer === null) guardPollTimer = setInterval(() => void pollGuardOnce(), 1000);
-  }
-  byId('btn-guard-start')?.addEventListener('click', async () => {
-    if (isOffline()) {
-      if (guardError) {
-        guardError.textContent = '未连接本地服务：请在仓库目录运行 npm run ui。';
-        guardError.removeAttribute('hidden');
-      }
-      return;
-    }
-    if (guardError) guardError.setAttribute('hidden', '');
-    const body = {
-      baseUrl: inputValue('f-guard-base-url'),
-      port: inputValue('f-guard-port'),
-      priceInput: inputValue('f-guard-price-in'),
-      priceOutput: inputValue('f-guard-price-out'),
-    };
-    const res = await api('/api/guard/start', { method: 'POST', body: JSON.stringify(body) });
-    if (!res.ok) {
-      if (guardError) {
-        guardError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
-        guardError.removeAttribute('hidden');
-      }
-      return;
-    }
-    guardLogNext = 0;
-    if (guardLog) {
-      guardLog.classList.remove('placeholder');
-      guardLog.textContent = '';
-    }
-    void pollGuardOnce();
-    ensureGuardPoll();
-  });
-  byId('btn-guard-stop')?.addEventListener('click', async () => {
-    if (isOffline()) return;
-    await api('/api/guard/stop', { method: 'POST', body: '{}' });
-    await pollGuardOnce();
-  });
-
-  // —— Tab ③：多渠道 OpenAI API 聚合入口（上游凭证仅驻留本机服务内存） ——
+  // —— Tab ②：聚合与实时监控（渠道 + 模型价格；上游凭证仅驻留本机服务内存） ——
   const gatewayError = byId('gateway-error');
   const channelForm = byId('channel-form');
   const channelList = byId('channel-list');
@@ -635,15 +864,79 @@ if (typeof document !== 'undefined') {
   const gatewayKeyState = byId('gateway-client-key-state');
   const gatewayClientKey = byId('f-gateway-client-key');
   const gatewayCopyUrl = byId('gateway-copy-url');
+  const gatewayCopyRoot = byId('gateway-copy-root');
+  const modelRows = byId('channel-model-rows');
+  const probeStatus = byId('channel-probe-status');
   const ledgerBanner = byId('ledger-degraded-banner');
   /** 渠道 id → 渠道名（用量表的渠道列用名称展示，缺失时兜底 id）。 */
   const channelLabels = new Map();
   let gatewayRunning = false;
 
-  function showGatewayError(message = '') {
+  // 错误来源：后台轮询（refresh）的错误在恢复时自动清除；用户动作的错误不得被并发轮询静默清掉
+  // （实测竞态：快速重复点击「启动」时，首次启动成功后的 refreshGateway 完成会清掉 409 提示）。
+  let gatewayErrorSource = null;
+  function showGatewayError(message = '', source = 'action') {
     if (gatewayError === null) return;
     gatewayError.textContent = message;
     gatewayError.toggleAttribute('hidden', message === '');
+    gatewayErrorSource = message === '' ? null : source;
+  }
+  function setProbeStatus(message = '', isError = false) {
+    if (probeStatus === null) return;
+    probeStatus.textContent = message;
+    probeStatus.classList.toggle('probe-error', isError);
+    probeStatus.toggleAttribute('hidden', message === '');
+  }
+  /** 构建一行「上游模型名 → 对外别名」；别名未被手动改过时跟随上游名。 */
+  function buildModelRow(upstream = '', alias = '') {
+    const row = document.createElement('div');
+    row.className = 'model-row';
+    const upstreamInput = document.createElement('input');
+    upstreamInput.type = 'text';
+    upstreamInput.dataset.role = 'upstream';
+    upstreamInput.placeholder = '上游模型名，例如 gpt-4o';
+    upstreamInput.value = upstream;
+    const arrow = document.createElement('span');
+    arrow.className = 'model-arrow';
+    arrow.textContent = '→';
+    const aliasInput = document.createElement('input');
+    aliasInput.type = 'text';
+    aliasInput.dataset.role = 'alias';
+    aliasInput.placeholder = '对外别名（默认同名）';
+    aliasInput.value = alias;
+    if (alias !== '' && alias !== upstream) aliasInput.dataset.touched = 'true';
+    aliasInput.addEventListener('input', () => { aliasInput.dataset.touched = 'true'; });
+    upstreamInput.addEventListener('input', () => {
+      if (aliasInput.dataset.touched !== 'true') aliasInput.value = upstreamInput.value.trim();
+    });
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'secondary';
+    remove.textContent = '移除';
+    remove.addEventListener('click', () => row.remove());
+    row.append(upstreamInput, arrow, aliasInput, remove);
+    return row;
+  }
+  /** 汇总模型行：{ models, modelMap, error }；两栏全空的行跳过，别名重复/单栏缺失在此拦下。 */
+  function collectModelRows() {
+    const models = [];
+    const modelMap = {};
+    const seen = new Set();
+    if (modelRows === null) return { models, modelMap, error: '模型清单容器缺失。' };
+    for (const row of modelRows.querySelectorAll('.model-row')) {
+      const upstream = row.querySelector('input[data-role="upstream"]')?.value.trim() ?? '';
+      const alias = row.querySelector('input[data-role="alias"]')?.value.trim() ?? '';
+      if (upstream === '' && alias === '') continue;
+      if (upstream === '' || alias === '') {
+        return { models, modelMap, error: `模型行不完整：上游名 ${JSON.stringify(upstream)}、别名 ${JSON.stringify(alias)}。两栏都需填写（或点「移除」删掉该行）。` };
+      }
+      if (seen.has(alias)) return { models, modelMap, error: `别名重复：${JSON.stringify(alias)}。每个别名只能出现一次。` };
+      seen.add(alias);
+      models.push(alias);
+      if (alias !== upstream) modelMap[alias] = upstream;
+    }
+    if (models.length === 0) return { models, modelMap, error: '模型清单为空：请「一键获取模型」或「手动添加一行」。' };
+    return { models, modelMap, error: null };
   }
   function setChannelForm(channel = null) {
     if (!(channelForm instanceof HTMLFormElement)) return;
@@ -655,10 +948,30 @@ if (typeof document !== 'undefined') {
     byId('f-channel-key').value = '';
     byId('f-channel-key').required = !editing;
     byId('channel-key-help').textContent = editing ? '（留空保持原密钥不变）' : '*';
-    const modelMap = editing && channel.modelMap !== null && typeof channel.modelMap === 'object' ? channel.modelMap : {};
-    const models = editing ? channel.models : [];
-    byId('f-channel-models').value = Array.isArray(models) ? models.join(', ') : '';
-    byId('f-channel-map').value = Object.entries(modelMap).map(([alias, model]) => `${alias}=${String(model)}`).join('\n');
+    const protocolSelect = byId('f-channel-protocol');
+    if (protocolSelect instanceof HTMLSelectElement) {
+      const protocol = editing && typeof channel.protocol === 'string' ? channel.protocol : 'unified';
+      protocolSelect.value = ['unified', 'openai', 'anthropic'].includes(protocol) ? protocol : 'unified';
+    }
+    const privateCheck = byId('f-channel-private');
+    if (privateCheck instanceof HTMLInputElement) {
+      privateCheck.checked = editing && channel.allowPrivateUpstream === true;
+    }
+    if (modelRows !== null) {
+      modelRows.textContent = '';
+      const modelMap = editing && channel.modelMap !== null && typeof channel.modelMap === 'object' ? channel.modelMap : {};
+      const models = editing && Array.isArray(channel.models) ? channel.models : [];
+      for (const alias of models) {
+        modelRows.appendChild(buildModelRow(typeof modelMap[alias] === 'string' ? modelMap[alias] : alias, String(alias)));
+      }
+      if (!editing) modelRows.appendChild(buildModelRow('', ''));
+    }
+    const storedPrices = editing && channel.modelPrices !== null && typeof channel.modelPrices === 'object' ? channel.modelPrices : null;
+    // reset() 只清空价格输入的值、不清理行元素：先清行，避免「空草稿快照」掩盖 seed 导致编辑回填空白（保存还会静默清价）。
+    if (priceRows !== null) priceRows.textContent = '';
+    syncPriceRows(storedPrices, true);
+    if (priceDetails !== null) priceDetails.open = storedPrices !== null && Object.keys(storedPrices).length > 0;
+    setProbeStatus('');
     channelForm.hidden = false;
     byId('f-channel-label')?.focus();
   }
@@ -693,7 +1006,13 @@ if (typeof document !== 'undefined') {
       endpoint.textContent = String(channel.baseUrl);
       const models = document.createElement('div');
       models.className = 'channel-models';
-      models.innerHTML = channelModelTags(channel);
+      const protocolLabel = channel.protocol === 'unified'
+        ? '统一'
+        : channel.protocol === 'anthropic' || channel.protocol === 'openai' ? channel.protocol : '';
+      const protocolTag = protocolLabel === ''
+        ? ''
+        : `<span class="channel-model channel-tag-protocol">${protocolLabel}</span>`;
+      models.innerHTML = protocolTag + channelModelTags(channel);
       main.append(title, endpoint, models);
       const actions = document.createElement('div');
       actions.className = 'channel-actions';
@@ -738,7 +1057,7 @@ if (typeof document !== 'undefined') {
       ]);
       if (!statusResponse.ok || !channelResponse.ok) {
         const problem = statusResponse.ok ? channelResponse : statusResponse;
-        showGatewayError(String(problem.data?.error ?? `HTTP ${problem.status}`));
+        showGatewayError(String(problem.data?.error ?? `HTTP ${problem.status}`), 'refresh');
         return;
       }
       const status = statusResponse.data;
@@ -746,13 +1065,30 @@ if (typeof document !== 'undefined') {
       // 账本降级横幅（页面顶部）：写入失败必须显式披露数据缺口，绝不静默；转发不受影响（fail-open）
       const degraded = gatewayRunning && status !== null && typeof status === 'object' ? status.degraded : null;
       const writeErrors = Number(degraded?.writeErrors ?? 0);
+      const recovered = Number(degraded?.recovered ?? 0);
       const showDegraded = gatewayRunning && (degraded?.degraded === true || writeErrors > 0);
       if (ledgerBanner) {
-        ledgerBanner.textContent = showDegraded
-          ? `账本降级：写入失败 ${writeErrors} 次（数据缺口，统计不含被丢弃请求）`
-          : '';
-        ledgerBanner.toggleAttribute('hidden', !showDegraded);
+        const bannerParts = [];
+        if (showDegraded) bannerParts.push(`账本降级：写入失败 ${writeErrors} 次（数据缺口，统计不含被丢弃请求）`);
+        if (recovered > 0) bannerParts.push(`账本恢复：已自动补结 ${recovered} 条中断请求（归因 gateway，结算态 interrupted）`);
+        ledgerBanner.textContent = bannerParts.join('；');
+        ledgerBanner.toggleAttribute('hidden', bannerParts.length === 0);
       }
+      // 告警披露（静默期/冷却抑制）：防「暂无告警 = 无异常」的假安心（S3-lite 诚实条款）
+      const silenceMs = gatewayRunning && status !== null && typeof status === 'object' ? Number(status.alertSilenceRemainingMs ?? 0) : 0;
+      const suppressedCount = gatewayRunning && status !== null && typeof status === 'object' ? Number(status.alertSuppressed ?? 0) : 0;
+      const disclosureParts = [];
+      if (silenceMs > 0) {
+        disclosureParts.push(
+          `启动静默期中（剩余 ${Math.ceil(silenceMs / 1000)} 秒）：此间不评估任何告警，「暂无告警」不代表「无异常」`,
+        );
+      } else if (gatewayRunning && status?.alertSilenceWasActive === true) {
+        disclosureParts.push('启动静默期已结束：静默期间流量从未被评估');
+      }
+      if (suppressedCount > 0) {
+        disclosureParts.push(`已有 ${suppressedCount} 条告警因 30 分钟冷却被抑制未展示（持续异常只保留最早一条）`);
+      }
+      alertDisclosure = disclosureParts.join('；');
       if (gatewayState) {
         gatewayState.textContent = gatewayRunning
           ? `运行中 · ${Number(status.enabledChannelCount ?? 0)} 个模型 · 请求 ${Number(status.requests?.total ?? 0)} 次（错 ${Number(status.requests?.error ?? 0)}）`
@@ -763,6 +1099,7 @@ if (typeof document !== 'undefined') {
       const base = gatewayRunning ? `http://127.0.0.1:${String(status.port)}/v1` : '等待启动';
       if (gatewayBaseUrl) gatewayBaseUrl.textContent = base;
       if (gatewayCopyUrl) gatewayCopyUrl.textContent = base;
+      if (gatewayCopyRoot) gatewayCopyRoot.textContent = gatewayRunning ? `http://127.0.0.1:${String(status.port)}` : '等待启动';
       if (gatewayClientKey && gatewayRunning && gatewayClientKey.value === '') {
         const keyResponse = await api('/api/gateway/virtual-key');
         if (keyResponse.ok) gatewayClientKey.value = String(keyResponse.data?.virtualKey ?? '');
@@ -775,9 +1112,9 @@ if (typeof document !== 'undefined') {
         renderUsage([]);
         renderAlerts([]);
       }
-      showGatewayError();
+      if (gatewayErrorSource === 'refresh') showGatewayError();
     } catch (error) {
-      showGatewayError(error instanceof Error ? error.message : String(error));
+      showGatewayError(error instanceof Error ? error.message : String(error), 'refresh');
     }
   }
   byId('btn-channel-new')?.addEventListener('click', () => setChannelForm());
@@ -785,23 +1122,20 @@ if (typeof document !== 'undefined') {
   channelForm?.addEventListener('submit', async (event) => {
     event.preventDefault();
     const id = inputValue('f-channel-id');
-    const models = inputValue('f-channel-models').split(',').map((item) => item.trim()).filter(Boolean);
-    const modelMap = {};
-    for (const line of inputValue('f-channel-map').split(/\r?\n/)) {
-      if (line.trim() === '') continue;
-      const split = line.indexOf('=');
-      if (split < 1 || line.slice(split + 1).trim() === '') {
-        showGatewayError(`模型映射格式无效：${JSON.stringify(line)}。示例：fast-model=gpt-4o-mini`);
-        return;
-      }
-      modelMap[line.slice(0, split).trim()] = line.slice(split + 1).trim();
-    }
+    const gathered = collectModelRows();
+    if (gathered.error !== null) { showGatewayError(gathered.error); return; }
+    const priced = collectModelPrices();
+    if (priced.error !== null) { showGatewayError(priced.error); return; }
+    const protocolSelect = byId('f-channel-protocol');
     const body = {
       label: inputValue('f-channel-label'), baseUrl: inputValue('f-channel-base-url'),
-      apiKey: inputValue('f-channel-key'), models, modelMap,
+      protocol: protocolSelect instanceof HTMLSelectElement ? protocolSelect.value : 'unified',
+      models: gathered.models, modelMap: gathered.modelMap,
+      modelPrices: priced.modelPrices,
+      allowPrivateUpstream: checkedValue('f-channel-private'),
     };
-    if (id !== '') delete body.apiKey; // 编辑时空 key 表示保留；非空 key 显式轮换
-    if (id !== '' && inputValue('f-channel-key') !== '') body.apiKey = inputValue('f-channel-key');
+    const key = inputValue('f-channel-key');
+    if (id === '' || key !== '') body.apiKey = key; // 编辑时空 key 表示保留；非空 key 显式轮换
     const response = await api(id === '' ? '/api/gateway/channels' : `/api/gateway/channels/${encodeURIComponent(id)}`, {
       method: 'POST', body: JSON.stringify(body),
     });
@@ -810,6 +1144,141 @@ if (typeof document !== 'undefined') {
     showGatewayError();
     await refreshGateway();
   });
+  // —— 一键获取模型：服务端代取该渠道 /models（Key 不出本机；编辑已有渠道可复用已保存的 Key） ——
+  byId('btn-channel-probe')?.addEventListener('click', async () => {
+    if (modelRows === null) return;
+    const baseUrl = inputValue('f-channel-base-url').trim();
+    if (baseUrl === '') { setProbeStatus('请先填写上游 API Base URL，再获取模型列表。', true); return; }
+    const id = inputValue('f-channel-id');
+    const apiKey = inputValue('f-channel-key');
+    if (apiKey === '' && id === '') {
+      setProbeStatus('请先填写上游 API Key（编辑已有渠道时可留空，改用已保存的 Key）。', true);
+      return;
+    }
+    const protocolSelect = byId('f-channel-protocol');
+    const button = byId('btn-channel-probe');
+    if (button instanceof HTMLButtonElement) button.disabled = true;
+    setProbeStatus('正在请求该渠道的模型列表…');
+    try {
+      const body = {
+        baseUrl,
+        protocol: protocolSelect instanceof HTMLSelectElement ? protocolSelect.value : 'unified',
+        allowPrivateUpstream: checkedValue('f-channel-private'),
+      };
+      if (apiKey !== '') body.apiKey = apiKey; else body.channelId = id;
+      const response = await api('/api/gateway/probe-models', { method: 'POST', body: JSON.stringify(body) });
+      if (!response.ok) { setProbeStatus(scrubSecrets(String(response.data?.error ?? `HTTP ${response.status}`), [apiKey]), true); return; }
+      const models = Array.isArray(response.data?.models) ? response.data.models.filter((item) => typeof item === 'string' && item.trim() !== '') : [];
+      if (models.length === 0) { setProbeStatus('该渠道 /models 返回空列表：请手动添加模型行。', true); return; }
+      const existing = new Set();
+      for (const row of modelRows.querySelectorAll('.model-row')) {
+        for (const role of ['upstream', 'alias']) {
+          const value = row.querySelector(`input[data-role="${role}"]`)?.value.trim() ?? '';
+          if (value !== '') existing.add(value);
+        }
+      }
+      let added = 0;
+      let skipped = 0;
+      for (const item of models) {
+        const name = String(item).trim();
+        if (existing.has(name)) { skipped += 1; continue; }
+        existing.add(name);
+        modelRows.appendChild(buildModelRow(name, name));
+        added += 1;
+      }
+      setProbeStatus(`获取成功：共 ${models.length} 个模型，新增 ${added} 行，跳过重复 ${skipped} 个。别名默认同名，可按需修改后保存。`);
+      syncPriceRows();
+    } catch (error) {
+      setProbeStatus(`获取失败：${error instanceof Error ? error.message : String(error)}`, true);
+    } finally {
+      if (button instanceof HTMLButtonElement) button.disabled = false;
+    }
+  });
+  byId('btn-model-add')?.addEventListener('click', () => { modelRows?.appendChild(buildModelRow('', '')); syncPriceRows(); });
+
+  // —— 模型价格编辑：按别名行渲染（别名集合变化才重建，已填值按别名保留；不填=只统计 token） ——
+  const priceDetails = byId('channel-price-details');
+  const priceRows = byId('channel-price-rows');
+  const PRICE_FIELDS = ['input', 'output', 'cachedRead', 'threshold', 'input2', 'output2', 'cachedRead2'];
+  const PRICE_FIELD_TEXTS = {
+    input: '输入 $/1M', output: '输出 $/1M', cachedRead: '缓存读 $/1M',
+    threshold: '阶梯阈值 tok', input2: '阶梯·输入', output2: '阶梯·输出', cachedRead2: '阶梯·缓存',
+  };
+  /** 构建一行价格输入；values 为 { field: string }（缺省空串）。 */
+  function buildPriceRow(alias, values = {}) {
+    const row = document.createElement('div');
+    row.className = 'price-row';
+    row.dataset.alias = alias;
+    const name = document.createElement('code');
+    name.className = 'price-alias';
+    name.textContent = alias;
+    name.title = alias;
+    row.appendChild(name);
+    for (const field of PRICE_FIELDS) {
+      const wrap = document.createElement('label');
+      wrap.className = 'price-field';
+      wrap.textContent = PRICE_FIELD_TEXTS[field];
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.inputMode = field === 'threshold' ? 'numeric' : 'decimal';
+      input.dataset.priceField = field;
+      input.placeholder = field === 'cachedRead' || field === 'cachedRead2' ? '= 输入价' : field === 'threshold' ? '1000000' : '';
+      input.value = typeof values[field] === 'string' ? values[field] : '';
+      wrap.appendChild(input);
+      row.appendChild(wrap);
+    }
+    return row;
+  }
+  let priceAliasKey = null;
+  /**
+   * 价格行与模型别名同步：仅在别名集合变化（或 force）时重建；重建前按别名快照已填值回填，
+   * 因此增删/改名其他模型行不会丢已填价格。seedPrices 为编辑渠道时的已存价格（modelPrices）。
+   */
+  function syncPriceRows(seedPrices = null, force = false) {
+    if (priceRows === null || modelRows === null) return;
+    const aliases = [];
+    for (const input of modelRows.querySelectorAll('input[data-role="alias"]')) {
+      const alias = input.value.trim();
+      if (alias !== '' && !aliases.includes(alias)) aliases.push(alias);
+    }
+    const key = aliases.join('\u0000');
+    if (!force && key === priceAliasKey) return;
+    const draft = new Map();
+    for (const row of priceRows.querySelectorAll('.price-row')) {
+      const fields = {};
+      for (const input of row.querySelectorAll('input[data-price-field]')) fields[String(input.dataset.priceField)] = input.value;
+      draft.set(String(row.dataset.alias ?? ''), fields);
+    }
+    const seed = seedPrices !== null && typeof seedPrices === 'object' ? seedPrices : {};
+    priceRows.textContent = '';
+    for (const alias of aliases) {
+      let values = draft.get(alias);
+      if (values === undefined) {
+        const stored = seed[alias];
+        if (stored !== null && typeof stored === 'object') {
+          values = {};
+          for (const field of PRICE_FIELDS) values[field] = typeof stored[field] === 'number' ? String(stored[field]) : '';
+        }
+      }
+      priceRows.appendChild(buildPriceRow(alias, values ?? {}));
+    }
+    priceAliasKey = key;
+  }
+  /** 汇总价格行 → buildModelPrices 的 entries（校验与成对语义在纯函数内完成）。 */
+  function collectModelPrices() {
+    const entries = [];
+    if (priceRows !== null) {
+      for (const row of priceRows.querySelectorAll('.price-row')) {
+        const entry = { alias: String(row.dataset.alias ?? '') };
+        for (const input of row.querySelectorAll('input[data-price-field]')) entry[String(input.dataset.priceField)] = input.value;
+        entries.push(entry);
+      }
+    }
+    return buildModelPrices(entries);
+  }
+  // 模型行增删/别名改动 → 价格行跟随（别名集合未变则不动，输入焦点不丢）
+  modelRows?.addEventListener('input', () => syncPriceRows());
+  modelRows?.addEventListener('click', () => syncPriceRows());
   byId('btn-gateway-start')?.addEventListener('click', async () => {
     showGatewayError();
     const port = inputValue('f-gateway-port').trim();
@@ -820,19 +1289,54 @@ if (typeof document !== 'undefined') {
     await refreshGateway();
   });
   byId('btn-gateway-rotate')?.addEventListener('click', async () => {
+    showGatewayError();
     const response = await api('/api/gateway/virtual-key/rotate', { method: 'POST', body: '{}' });
     if (!response.ok) { showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`)); return; }
     if (gatewayClientKey) gatewayClientKey.value = String(response.data?.virtualKey ?? '');
     await refreshGateway();
   });
   byId('btn-gateway-stop')?.addEventListener('click', async () => {
+    showGatewayError();
     const response = await api('/api/gateway/stop', { method: 'POST', body: '{}' });
     if (!response.ok) showGatewayError(String(response.data?.error ?? `HTTP ${response.status}`));
     else await refreshGateway();
   });
   byId('f-gateway-client-key')?.addEventListener('focus', (event) => event.currentTarget.select());
+  // —— 接入信息复制：OpenAI Base URL（/v1）、Anthropic 根地址、虚拟 Key（均仅在网关运行时可复制） ——
+  function flashButton(button, text) {
+    if (!(button instanceof HTMLButtonElement)) return;
+    if (button.dataset.originalLabel === undefined) button.dataset.originalLabel = button.textContent ?? '';
+    button.textContent = text;
+    const original = button.dataset.originalLabel;
+    window.setTimeout(() => { button.textContent = original; }, 1500);
+  }
+  function bindCopyButton(button, read) {
+    if (!(button instanceof HTMLButtonElement)) return;
+    button.addEventListener('click', async () => {
+      const text = read();
+      if (text === '') { flashButton(button, '暂无可复制内容'); return; }
+      if (navigator.clipboard === undefined) { flashButton(button, '复制不可用，请手动选择'); return; }
+      try {
+        await navigator.clipboard.writeText(text);
+        flashButton(button, '已复制 ✓');
+      } catch {
+        flashButton(button, '复制失败，请手动选择');
+      }
+    });
+  }
+  function runningBaseUrl() {
+    const text = gatewayBaseUrl?.textContent ?? '';
+    return text.startsWith('http') ? text : '';
+  }
+  bindCopyButton(byId('btn-gateway-copy-url'), () => runningBaseUrl());
+  bindCopyButton(byId('btn-gateway-copy-root'), () => runningBaseUrl().replace(/\/v1$/, ''));
+  bindCopyButton(byId('btn-gateway-copy-key'), () => gatewayClientKey?.value ?? '');
 
   // —— 用量与异常面板（S2/S3 实时口径）：3 秒轮询，仅当网关运行中且本标签可见 ——
+  // 告警披露状态：静默期/冷却抑制来自 status（refreshGateway 维护）；轮询失败标记陈旧。
+  let alertDisclosure = '';
+  let ledgerStaleAt = null;
+  let lastAlertEvents = [];
   const usageBody = byId('gateway-usage-body');
   const alertsList = byId('gateway-alerts');
   const ALERT_KIND_LABELS = {
@@ -840,7 +1344,15 @@ if (typeof document !== 'undefined') {
     error_rate: '错误率异常',
     truncated: '响应截断',
     usage_invalid: 'usage 异常',
+    ttft_high: 'TTFT 偏高',
   };
+  /** 告警披露行（静默期/冷却抑制/陈旧）：防「没告警 = 没异常」的假安心；与事件同列表展示。 */
+  function alertDisclosureParts() {
+    const parts = [];
+    if (alertDisclosure !== '') parts.push(alertDisclosure);
+    if (ledgerStaleAt !== null) parts.push(`最近一次用量轮询失败于 ${new Date(ledgerStaleAt).toLocaleTimeString()}：以下数据可能陈旧`);
+    return parts;
+  }
   function formatLatency(value) {
     const ms = Number(value);
     if (!Number.isFinite(ms)) return '—';
@@ -853,7 +1365,7 @@ if (typeof document !== 'undefined') {
     if (rows.length === 0) {
       const tr = document.createElement('tr');
       const td = document.createElement('td');
-      td.colSpan = 10;
+      td.colSpan = 14;
       td.className = 'placeholder';
       td.textContent = '暂无实时用量（网关未运行或尚无已结算请求）。';
       tr.appendChild(td);
@@ -869,11 +1381,15 @@ if (typeof document !== 'undefined') {
         String(Number(row.error ?? 0)),
         String(Number(row.tokenPrompt ?? 0)),
         String(Number(row.tokenCompletion ?? 0)),
+        String(Number(row.tokenCached ?? 0)),
+        formatCostUsd(row.costUsd),
         row.ttftP50Ms === null || row.ttftP50Ms === undefined ? '—' : formatLatency(row.ttftP50Ms),
         row.provisional === true
           ? `样本不足 n=${Number(row.ttftSamples ?? 0)}`
           : row.ttftP95Ms === null || row.ttftP95Ms === undefined ? '—' : formatLatency(row.ttftP95Ms),
+        String(Number(row.ttftContaminated ?? 0)),
         row.usageValidRate === null || row.usageValidRate === undefined ? '—' : `${(Number(row.usageValidRate) * 100).toFixed(1)}%`,
+        `${Number(row.usageMissing ?? 0)} / ${Number(row.usageInvalid ?? 0)}`,
       ];
       const tr = document.createElement('tr');
       for (const text of cells) {
@@ -888,12 +1404,19 @@ if (typeof document !== 'undefined') {
     if (alertsList === null) return;
     alertsList.textContent = '';
     const list = Array.isArray(events) ? events : [];
-    if (list.length === 0) {
+    const disclosure = alertDisclosureParts();
+    if (list.length === 0 && disclosure.length === 0) {
       const li = document.createElement('li');
       li.className = 'placeholder';
       li.textContent = '暂无告警（网关未运行或窗口未达阈值）。';
       alertsList.appendChild(li);
       return;
+    }
+    for (const note of disclosure) {
+      const li = document.createElement('li');
+      li.className = 'placeholder alert-disclosure';
+      li.textContent = note;
+      alertsList.appendChild(li);
     }
     for (const event of list) {
       const kind = String(event.kind ?? '');
@@ -901,12 +1424,16 @@ if (typeof document !== 'undefined') {
       const observed =
         kind === 'model_mismatch' || kind === 'truncated'
           ? `${Number(event.observed ?? 0)} 次`
-          : `${(Number(event.observed ?? 0) * 100).toFixed(0)}%`;
-      const evidenceCount = Array.isArray(event.evidence_request_ids) ? event.evidence_request_ids.length : 0;
+          : kind === 'ttft_high'
+            ? formatLatency(event.observed ?? 0)
+            : `${(Number(event.observed ?? 0) * 100).toFixed(0)}%`;
+      const ids = Array.isArray(event.evidence_request_ids) ? event.evidence_request_ids.map((id) => String(id)) : [];
       const li = document.createElement('li');
       li.textContent =
         `${new Date(Number(event.ts)).toLocaleTimeString()} · ${channelLabels.get(String(event.channel)) ?? String(event.channel)}` +
-        ` · ${label} · 窗口 ${Number(event.n ?? 0)} 条 / 观测 ${observed} · 证据请求 ${evidenceCount} 条（账本可下钻）`;
+        ` · ${label} · 窗口 ${Number(event.n ?? 0)} 条 / 观测 ${observed}` +
+        ` · 证据请求 ${ids.length} 条${ids.length > 0 ? `（首条 ${String(ids[0]).slice(0, 8)}…）` : '（账本可下钻）'}`;
+      if (ids.length > 0) li.title = `证据请求 id（可用于账本下钻）：\n${ids.join('\n')}`;
       alertsList.appendChild(li);
     }
   }
@@ -914,10 +1441,18 @@ if (typeof document !== 'undefined') {
     if (isOffline() || !gatewayRunning) return;
     try {
       const [usageResponse, eventsResponse] = await Promise.all([api('/api/gateway/usage'), api('/api/gateway/events')]);
-      if (usageResponse.ok) renderUsage(usageResponse.data?.usage);
-      if (eventsResponse.ok) renderAlerts(eventsResponse.data?.events);
+      if (!usageResponse.ok || !eventsResponse.ok) {
+        ledgerStaleAt = Date.now();
+        renderAlerts(lastAlertEvents);
+        return;
+      }
+      ledgerStaleAt = null;
+      lastAlertEvents = Array.isArray(eventsResponse.data?.events) ? eventsResponse.data.events : [];
+      renderUsage(usageResponse.data?.usage);
+      renderAlerts(lastAlertEvents);
     } catch {
-      /* 面板局部失败静默：主刷新已负责错误提示 */
+      ledgerStaleAt = Date.now(); // 请求级失败同样标注陈旧，绝不静默假装数据新鲜
+      renderAlerts(lastAlertEvents);
     }
   }
   window.setInterval(() => {
@@ -931,7 +1466,7 @@ if (typeof document !== 'undefined') {
     if (tabs.gateway?.getAttribute('aria-selected') === 'true') void refreshGateway();
   }, 2500);
 
-  // —— Tab ④：历史报告 ——
+  // —— Tab ③：历史报告 ——
   const historyError = byId('history-error');
   const historyOut = byId('history-out');
   async function refreshReports() {
@@ -963,17 +1498,23 @@ if (typeof document !== 'undefined') {
       return;
     }
     for (const item of reports) {
+      // 类型分流：只有 report-*.json 可渲染评分卡；baseline-*/未识别文件只给「打开」链接
+      // （否则点基线文件会报「报告缺少 outcomes 数组……」，见 I2 回归）
+      const kind = item.kind === 'report' ? 'report' : item.kind === 'baseline' ? 'baseline' : 'other';
+      const kindPrefix = kind === 'baseline' ? '基线 · ' : kind === 'other' ? '其他 · ' : '';
+      const clickable = kind === 'report' && String(item.name).endsWith('.json');
       const li = document.createElement('li');
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = String(item.name);
-      name.title = '点击查看';
+      if (clickable) name.title = '点击查看';
+      else name.style.cursor = 'default';
       const meta = document.createElement('span');
       meta.className = 'meta';
-      meta.textContent = `${new Date(Number(item.mtimeMs)).toLocaleString()} · ${(Number(item.size) / 1024).toFixed(1)} KB`;
+      meta.textContent = `${kindPrefix}${new Date(Number(item.mtimeMs)).toLocaleString()} · ${(Number(item.size) / 1024).toFixed(1)} KB`;
       li.appendChild(name);
       li.appendChild(meta);
-      if (String(item.name).endsWith('.json')) {
+      if (clickable) {
         name.addEventListener('click', async () => {
           const fileRes = await fetch(`/api/reports/file?name=${encodeURIComponent(String(item.name))}`);
           if (!fileRes.ok || historyOut === null) return;
@@ -997,4 +1538,83 @@ if (typeof document !== 'undefined') {
     }
   }
   byId('btn-reports-refresh')?.addEventListener('click', () => void refreshReports());
+
+  const CLEAR_HINT = {
+    'keep-latest': '清理历史报告：保留最新一套报告与最新基线，删除其余报告/基线文件（不可撤销）。',
+    'reports-root': '删除 reports/ 下全部报告与基线文件（保留子目录与运行时数据；不可撤销）。',
+    all: '清空 reports/ 全部内容（含 guard 审计、网关账本等子目录数据；不可撤销）。',
+  };
+  async function clearReports(scope) {
+    if (isOffline()) {
+      if (historyError) {
+        historyError.textContent = '未连接本地服务：报告清理需要 npm run ui 启动的本地服务。';
+        historyError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (historyError) historyError.setAttribute('hidden', '');
+    const res = await api('/api/reports/clear', { method: 'POST', body: JSON.stringify({ scope }) });
+    if (!res.ok) {
+      if (historyError) {
+        historyError.textContent = String(res.data?.error ?? `HTTP ${res.status}`);
+        historyError.removeAttribute('hidden');
+      }
+      return;
+    }
+    if (historyOut !== null) {
+      const deleted = Number(res.data?.deleted ?? 0);
+      const keep = Array.isArray(res.data?.keep) ? res.data.keep : [];
+      const keepText =
+        keep.length === 0 ? '' : '；保留：' + keep.map((item) => `${String(item.name)}（${String(item.reason)}）`).join('、');
+      historyOut.innerHTML =
+        deleted === 0
+          ? `<p>无需清理：没有更旧的报告/基线可删（最新一套已保留）${escapeHtml(keepText)}。</p><p class="hint">列表已刷新。</p>`
+          : `<p>已删除 ${escapeHtml(String(deleted))} 项，文件体积释放约 ` +
+            `${escapeHtml((Number(res.data?.freedBytes ?? 0) / (1024 * 1024)).toFixed(1))} MB` +
+            `${escapeHtml(keepText)}。</p><p class="hint">列表已刷新。</p>`;
+    }
+    await refreshReports();
+  }
+  // 两步点击确认（替代 window.confirm：内嵌浏览器/webview 会静默吞掉原生对话框，表现为「点击没反应」）。
+  // 第一次点击进入待确认态（按钮文字变化 + 提示文案），限时内再点一次执行；点其他位置或超时自动取消。
+  const CLEAR_ARM_MS = 5000;
+  let armedClear = null;
+  function disarmClear() {
+    if (armedClear === null) return;
+    clearTimeout(armedClear.timer);
+    armedClear.button.textContent = armedClear.label;
+    armedClear.button.classList.remove('armed');
+    armedClear.button.removeAttribute('aria-pressed');
+    armedClear = null;
+  }
+  function armOrRunClear(scope) {
+    if (armedClear !== null && armedClear.scope === scope) {
+      const confirmedScope = armedClear.scope;
+      disarmClear();
+      void clearReports(confirmedScope);
+      return;
+    }
+    disarmClear();
+    const button = scope === 'all' ? byId('btn-reports-clear-all') : byId('btn-reports-clear-keep');
+    if (!button) return;
+    const label = button.textContent;
+    button.textContent = scope === 'all' ? '再点一次＝清空全部' : '再点一次＝清理';
+    button.classList.add('armed');
+    button.setAttribute('aria-pressed', 'true');
+    const timer = setTimeout(disarmClear, CLEAR_ARM_MS);
+    armedClear = { scope, button, label, timer };
+    if (historyOut !== null) {
+      const buttonName = scope === 'all' ? '清空全部' : '清理（保留最新）';
+      historyOut.innerHTML = `<p class="hint">${escapeHtml(CLEAR_HINT[scope] ?? '')}请在 ${CLEAR_ARM_MS / 1000} 秒内再点一次「${escapeHtml(buttonName)}」确认；点其他位置自动取消。</p>`;
+    }
+  }
+  byId('btn-reports-clear-keep')?.addEventListener('click', () => armOrRunClear('keep-latest'));
+  byId('btn-reports-clear-all')?.addEventListener('click', () => armOrRunClear('all'));
+  document.addEventListener(
+    'click',
+    (event) => {
+      if (armedClear !== null && !armedClear.button.contains(event.target)) disarmClear();
+    },
+    true,
+  );
 }

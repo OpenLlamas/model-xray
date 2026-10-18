@@ -1,15 +1,50 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { createMockServer, type MockServer } from './mock-server.js';
 import { runAudit } from '../src/runner.js';
 import { buildBaseline } from '../src/baseline.js';
+import { loadTokenReference } from '../src/token-reference.js';
 import { ASSETS_VERSION, PROBESET_VERSION } from '../src/assets.js';
 import type { AuditReport, ProbeId, RunConfig } from '../src/types.js';
 
-async function audit(mock: MockServer, overrides: Partial<RunConfig> = {}): Promise<AuditReport> {
+const CLI = fileURLToPath(new URL('../src/cli.js', import.meta.url));
+
+function runCli(
+  args: string[],
+  timeoutMs = 60000,
+): Promise<{ status: number | null; stdout: string; stderr: string; elapsedMs: number }> {
+  return new Promise((resolve, reject) => {
+    const started = Date.now();
+    const child = spawn(process.execPath, [CLI, ...args], { windowsHide: true });
+    let stdout = '';
+    let stderr = '';
+    const timer = setTimeout(() => {
+      child.kill();
+      reject(new Error(`CLI timeout after ${timeoutMs}ms.\nstdout: ${stdout}\nstderr: ${stderr}`));
+    }, timeoutMs);
+    child.stdout.on('data', (chunk: Buffer) => (stdout += chunk.toString('utf8')));
+    child.stderr.on('data', (chunk: Buffer) => (stderr += chunk.toString('utf8')));
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ status: code, stdout, stderr, elapsedMs: Date.now() - started });
+    });
+    child.on('error', (error) => {
+      clearTimeout(timer);
+      reject(error);
+    });
+  });
+}
+
+async function audit(
+  mock: MockServer,
+  overrides: Partial<RunConfig> = {},
+  onActivity?: (message: string) => void,
+): Promise<AuditReport> {
   const cfg: RunConfig = {
     baseUrl: mock.baseUrl,
     apiKey: 'test-key',
@@ -26,7 +61,7 @@ async function audit(mock: MockServer, overrides: Partial<RunConfig> = {}): Prom
     quiet: true,
     ...overrides,
   };
-  return runAudit(cfg);
+  return runAudit(cfg, undefined, undefined, onActivity);
 }
 
 function scoreOf(report: AuditReport, id: ProbeId) {
@@ -71,6 +106,25 @@ test('e2e honest endpoint scores 100 with no failures', async () => {
   }
 });
 
+test('runner activity: every phase logs start and completion with level/score/duration', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  try {
+    const lines: string[] = [];
+    await audit(mock, { claimedContext: 4000 }, (message) => lines.push(message));
+    for (const phase of ['identity', 'context', 'billing', 'capability', 'decoy', 'quality', 'ttft']) {
+      assert.ok(
+        lines.some((line) => line.includes(`[RUN] 阶段 ${phase}（`)),
+        `missing start line for ${phase}`,
+      );
+      const done = lines.find((line) => line.includes(`[RUN] 阶段 ${phase}（`) && line.includes('完成'));
+      assert.ok(done !== undefined, `missing completion line for ${phase}`);
+      assert.match(done, /完成 · (PASS|WARN|FAIL|UNKNOWN) · 得分 (—|\d+\/100) · \d+\.\d+s/);
+    }
+  } finally {
+    mock.server.close();
+  }
+});
+
 test('e2e same seed + fresh endpoint yields identical scores', async () => {
   const first = await createMockServer({ mode: 'honest' });
   const second = await createMockServer({ mode: 'honest' });
@@ -102,15 +156,27 @@ test('e2e relabeled endpoint (GLM pretending to be gpt-4o) fails identity', asyn
   }
 });
 
-test('e2e silently truncating endpoint fails context probe', async () => {
+test('e2e silently truncating endpoint fails context probe (deep)', async () => {
+  // --deep 走 boundaryTruncated 二分定罪（确定性证据）；非 --deep 仅统计信号 → warn 不指控
   const mock = await createMockServer({ mode: 'truncate', truncateTokens: 7000 });
   try {
-    const report = await audit(mock, { claimedContext: 32000 });
+    const report = await audit(mock, { claimedContext: 32000, deep: true });
     assert.equal(levelOf(report, 'context'), 'fail');
     const headline = headlineOf(report, 'context');
     assert.ok(/截断|回显|窗口不实/.test(headline), headline);
     assert.ok(report.total !== null && report.total <= 45);
     assert.equal(report.overall, 'fail');
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e silently truncating endpoint without --deep is warn, not fail (零误报口径)', async () => {
+  const mock = await createMockServer({ mode: 'truncate', truncateTokens: 7000 });
+  try {
+    const report = await audit(mock, { claimedContext: 32000 });
+    assert.equal(levelOf(report, 'context'), 'warn', headlineOf(report, 'context'));
+    assert.ok(!report.outcomes.find((o) => o.id === 'context')?.findings.some((f) => f.level === 'fail'));
   } finally {
     mock.server.close();
   }
@@ -122,6 +188,45 @@ test('e2e oversize-rejecting endpoint is reported as explicit reject, not silent
     const report = await audit(mock, { claimedContext: 32000 });
     assert.equal(levelOf(report, 'context'), 'fail');
     assert.ok(/显式拒绝/.test(headlineOf(report, 'context')), headlineOf(report, 'context'));
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e transport-failed needle samples are excluded, not counted as truncation misses', async () => {
+  // 回归（2026-10-17 官方 1M 标称实测实证）：深度 25% 的 1/3 needle 样本「network：fetch failed」
+  // 被计入分母 → depth_hits 2/3 → 误判「标称窗口不实（15 分 fail）」，而排除后该深度 2/2 全命中。
+  const mock = await createMockServer({ mode: 'auth-required' });
+  try {
+    const report = await audit(mock, { claimedContext: 32000 });
+    const outcome = report.outcomes.find((o) => o.id === 'context');
+    assert.ok(outcome, 'context outcome missing');
+    assert.equal(levelOf(report, 'context'), 'unknown', `全部样本请求失败必须诚实不可判定：${headlineOf(report, 'context')}`);
+    assert.equal(outcome?.score, null, '证据不足不得给 0 分');
+    assert.ok(Number(outcome?.metrics['errored_samples'] ?? 0) > 0, 'errored_samples 应被记录');
+    assert.ok(
+      outcome?.findings.some((f) => /不计入截断判定/.test(f.message)),
+      '必须披露被排除的传输故障样本',
+    );
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e 200+error-payload endpoint: capability/context degrade to N/A, never accused of missing ability or unreadable context', async () => {
+  // 层 3 审查实证的诬告路径：HTTP 200 + `{"error":{...}}` 此前被解析为「成功但空正文」，
+  // capability 会判「未发起工具调用」fail、context 会判「内容不可读」fail。
+  const mock = await createMockServer({ mode: 'error-payload' });
+  try {
+    const report = await audit(mock, { expect: ['vision', 'tool'], claimedContext: 8000 });
+    assert.equal(levelOf(report, 'capability'), 'unknown', `${headlineOf(report, 'capability')}：上游错误载荷不得判能力缺失`);
+    assert.equal(scoreOf(report, 'capability')?.score, null);
+    assert.equal(levelOf(report, 'context'), 'unknown', `${headlineOf(report, 'context')}：上游错误载荷不得判内容不可读`);
+    assert.equal(scoreOf(report, 'context')?.score, null);
+    assert.ok(
+      !report.scores.some((s) => (s.id === 'capability' || s.id === 'context') && s.level !== 'unknown'),
+      'capability/context 只能是 unknown，不得有 fail/warn 指控',
+    );
   } finally {
     mock.server.close();
   }
@@ -240,7 +345,7 @@ test('e2e price flags produce measured-ratio metrics from balance delta', async 
     assert.equal(billing?.metrics['ratio_dropped'], 0);
     assert.ok(typeof billing?.metrics['measured_ratio'] === 'number');
     assert.ok(typeof billing?.metrics['expected_cost'] === 'number');
-    // 余额查询不是 chat 调用：billing 探针 evidence 仅含 10 次请求
+    // 余额查询不是 chat 调用：billing 探针 evidence 仅含 10 次请求（5 档 × 2 语言，默认档位）
     assert.equal(report.evidence.filter((e) => e.probe === 'billing').length, 10);
   } finally {
     mock.server.close();
@@ -485,5 +590,227 @@ test('e2e thinking-starve: 401 endpoint makes no starvation retries (request-cou
     assert.ok(!report.evidence.some((e) => /retry@/.test(e.label)), JSON.stringify(report.evidence.map((e) => e.label)));
   } finally {
     mock.server.close();
+  }
+});
+
+// --- F1 复采样抗噪 / 防洗白（v0.2.2）：mock retry-fix 端到端 ---
+
+test('e2e retry-fix (perturb=3): first-answer noise recovered by resample → quality pass 100 (two-chance rule)', async () => {
+  // 端点对前 3 个主题首答 +1 扰动、同题面重放返回正确答案——复采样答对按两次机会口径计为正确。
+  const mock = await createMockServer({ mode: 'retry-fix' });
+  try {
+    const report = await audit(mock, { expect: ['vision', 'tool'] });
+    const quality = report.outcomes.find((o) => o.id === 'quality');
+    assert.ok(quality);
+    assert.equal(quality?.level, 'pass', quality?.headline);
+    assert.equal(quality?.score, 100);
+    assert.equal(quality?.metrics['main'], '12/12');
+    assert.equal(quality?.metrics['retried'], 3);
+    assert.equal(quality?.metrics['recovered'], 3);
+    // 复采样请求（temperature 0.7）必须以证据形式留痕：首答 + 复采样双证据
+    assert.ok(
+      quality?.findings.some((f) => f.level === 'info' && /首答错误、复采样/.test(f.message)),
+      JSON.stringify(quality?.findings),
+    );
+    const resampleEvidence = report.evidence.filter((e) => e.request.temperature === 0.7 && e.probe === 'quality');
+    assert.equal(resampleEvidence.length, 3, '复采样必须逐题 recordCall（3 题）');
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e retry-fix whitewash guard (perturb=12): all topics first-wrong → quality warn capped 80 with recovery disclosure', async () => {
+  const mock = await createMockServer({ mode: 'retry-fix', retryFixPerturb: 12 });
+  try {
+    const report = await audit(mock, { expect: [] });
+    const quality = report.outcomes.find((o) => o.id === 'quality');
+    assert.ok(quality);
+    assert.equal(quality?.level, 'warn', quality?.headline);
+    assert.equal(quality?.score, 80);
+    assert.equal(quality?.metrics['main'], '12/12');
+    assert.equal(quality?.metrics['recovered'], 12);
+    assert.match(quality?.headline ?? '', /过半主题需复采样才对/);
+    assert.ok(quality?.findings.some((f) => f.level === 'warn' && /过半主题依赖复采样才答对/.test(f.message)));
+    assert.ok(quality?.findings.some((f) => f.level === 'info' && /恢复率异常高/.test(f.message)));
+    assert.equal(report.overall, 'warn', '质量防洗白告警必须传导到 overall');
+  } finally {
+    mock.server.close();
+  }
+});
+
+// --- F2 人格注入检测（v0.2.2）：mock persona-inject 端到端 ---
+
+test('e2e persona-inject endpoint: brand persona in self-description → identity warn capped 80, findings disclose', async () => {
+  const mock = await createMockServer({ mode: 'persona-inject' });
+  try {
+    const report = await audit(mock, { expect: [] });
+    const identity = report.outcomes.find((o) => o.id === 'identity');
+    assert.ok(identity);
+    assert.equal(identity?.level, 'warn', identity?.headline);
+    assert.equal(identity?.score, 80);
+    assert.ok(
+      identity?.findings.some((f) => f.level === 'warn' && /自述出现非模型族人格名/.test(f.message) && /NovaRelay/.test(f.message)),
+      JSON.stringify(identity?.findings),
+    );
+    assert.match(String(identity?.metrics['persona_hits']), /NovaRelay×2/);
+    // 其余样本照常声明目标族：族指纹不受污染、回显正常（人格信号必须独立于族判定）
+    assert.equal(identity?.metrics['families'], 'gpt');
+    assert.match(String(identity?.metrics['model_echo']), /^6\/6$/);
+    assert.equal(report.overall, 'warn');
+  } finally {
+    mock.server.close();
+  }
+});
+
+// --- F3 token-reference：全量等比虚增（线性回归不可见）的端到端识别 ---
+
+test('e2e usage-scale 1.3 without --token-reference stays pass with honest limitation disclosure', async () => {
+  // 全量等比虚增对回归/常量检测不可见（形状不变）——无参考时只能诚实披露检测边界，不得谎报识别能力
+  const mock = await createMockServer({ mode: 'usage-scale', usageScale: 1.3 });
+  try {
+    const report = await audit(mock);
+    const billing = report.outcomes.find((o) => o.id === 'billing');
+    assert.ok(billing);
+    assert.equal(billing?.level, 'pass', billing?.headline);
+    assert.equal(billing?.score, 100);
+    assert.ok(
+      billing?.findings.some((f) => f.level === 'info' && /--token-reference/.test(f.message)),
+      JSON.stringify(billing?.findings),
+    );
+  } finally {
+    mock.server.close();
+  }
+});
+
+test('e2e token-reference: scale-1.0 report as reference catches scale-1.3 inflation (fail, cap 30)', async () => {
+  const honestScale = await createMockServer({ mode: 'usage-scale', usageScale: 1.0 });
+  const inflated = await createMockServer({ mode: 'usage-scale', usageScale: 1.3 });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-token-ref-e2e-'));
+  try {
+    const first = await audit(honestScale, { seed: 4321 });
+    const refPath = join(dir, 'reference.json');
+    // 最小参考报告形状：{ meta, outcomes }（本工具报告同构即可被 loadTokenReference 消费）
+    writeFileSync(refPath, JSON.stringify({ meta: first.meta, outcomes: first.outcomes }));
+    const reference = loadTokenReference(refPath);
+    const report = await audit(inflated, { seed: 4321, tokenReference: reference });
+    const billing = report.outcomes.find((o) => o.id === 'billing');
+    assert.ok(billing);
+    assert.equal(billing?.level, 'fail', billing?.headline);
+    assert.ok((billing?.score ?? 100) <= 30);
+    const maxEn = billing?.metrics['reference_ratio_max_en'];
+    assert.ok(typeof maxEn === 'number' && Math.abs(maxEn - 1.3) <= 0.05, `reference_ratio_max_en=${String(maxEn)}`);
+    assert.ok(
+      billing?.findings.some((f) => f.level === 'fail' && /参考报告/.test(f.message)),
+      JSON.stringify(billing?.findings),
+    );
+    assert.match(String(billing?.metrics['reference_source']), /reference\.json \| gpt-4o \|/);
+  } finally {
+    honestScale.server.close();
+    inflated.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('e2e usage-scale 1.3 with honest baseline flags billing slope drift (regression guard)', async () => {
+  // 现有 --baseline 机制对全量等比虚增的兜底：斜率相对基线漂移 → warn 级告警
+  const honest = await createMockServer({ mode: 'honest' });
+  const inflated = await createMockServer({ mode: 'usage-scale', usageScale: 1.3 });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-scale-baseline-'));
+  try {
+    const first = await audit(honest, { seed: 4321 });
+    const baseline = buildBaseline(first.outcomes, {
+      model: 'gpt-4o',
+      seed: 4321,
+      probesetVersion: PROBESET_VERSION,
+      assetsVersion: ASSETS_VERSION,
+    });
+    const baselinePath = join(dir, 'base.json');
+    writeFileSync(baselinePath, JSON.stringify(baseline));
+    const report = await audit(inflated, { seed: 4321, baselineIn: baselinePath });
+    const billing = report.outcomes.find((o) => o.id === 'billing');
+    assert.ok(billing);
+    assert.equal(billing?.level, 'warn', billing?.headline);
+    assert.ok(
+      billing?.findings.some((f) => f.level === 'warn' && /计费斜率相对基线漂移/.test(f.message)),
+      JSON.stringify(billing?.findings),
+    );
+  } finally {
+    honest.server.close();
+    inflated.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// --- F3 CLI 子进程：fail-fast 零请求 + 正常审计退出契约 ---
+
+test('cli: --token-reference to a missing file exits 2 with zero requests', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-ref-'));
+  try {
+    const missing = join(dir, 'nope.json');
+    const result = await runCli([
+      'test',
+      '--base-url',
+      mock.baseUrl,
+      '--key',
+      'k',
+      '--model',
+      'gpt-4o',
+      '--token-reference',
+      missing,
+      '--out',
+      dir,
+    ]);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /--token-reference 文件不存在或不可读/);
+    assert.ok(result.stderr.includes(missing));
+    assert.equal(mock.state.served, 0, 'fail-fast 阶段不得发起任何请求');
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cli: --token-reference with malformed JSON exits 2 with zero requests', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-ref-bad-'));
+  try {
+    const bad = join(dir, 'bad.json');
+    writeFileSync(bad, '{ definitely not json');
+    const result = await runCli([
+      'test',
+      '--base-url',
+      mock.baseUrl,
+      '--key',
+      'k',
+      '--model',
+      'gpt-4o',
+      '--token-reference',
+      bad,
+      '--out',
+      dir,
+    ]);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /--token-reference 参考报告非法/);
+    assert.equal(mock.state.served, 0, 'fail-fast 阶段不得发起任何请求');
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cli: honest audit subprocess exits within 20s with the right exit code', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-audit-'));
+  try {
+    const result = await runCli(
+      ['test', '--base-url', mock.baseUrl, '--key', 'k', '--model', 'gpt-4o', '--seed', '7', '--out', dir],
+      60000,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.elapsedMs < 20000, `审计子进程耗时 ${result.elapsedMs}ms，超过 20s`);
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });

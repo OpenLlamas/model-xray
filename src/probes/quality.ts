@@ -1,5 +1,6 @@
-import type { ChatMessage, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
-import { PROBE_BUDGETS, chatWithStarveRetry } from './starve.js';
+import type { ChatMessage, ChatRequest, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
+import { recordCall } from '../evidence.js';
+import { PROBE_BUDGETS, chatWithStarveRetry, isStarved, isBlankAnswer } from './starve.js';
 
 export interface Question {
   id: string;
@@ -183,7 +184,18 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let controlCorrect = 0;
   let mainCorrect = 0;
   let excluded = 0;
+  let unavailableSamples = 0;
+  let emptySamples = 0;
+  let mainEmpty = 0;
+  let controlEmpty = 0;
   let controlStarved = 0;
+  // v0.2.2 两次机会口径：retriedCount = 触发复采样的主问题数（含复采样失败/starved 的），
+  // recoveredCount = 复采样答对（按正确计）的主问题数。
+  let retriedCount = 0;
+  let recoveredCount = 0;
+  let blankRetriedCount = 0;
+  let streamFallbackCount = 0;
+  const streamFallbackEvidenceIds: string[] = [];
   const wrong: string[] = [];
 
   for (const question of questions) {
@@ -196,23 +208,55 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
       budget: PROBE_BUDGETS.quality,
       retryBudget: PROBE_BUDGETS.qualityRetry,
     });
+    if (call.blankRetried) blankRetriedCount += 1;
+    if (call.streamFallback) {
+      streamFallbackCount += 1;
+      streamFallbackEvidenceIds.push(...call.evidenceIds);
+    }
     // 判定契约：
     // ① starved（finish=length）但答案已出现在（截断）正文中 → 正常计对；
     // ② 重试后仍 starved 且无答案 → 该题剔除分母 + warn（证据不足，不得按答错计 0）；
-    // ③ 非 starved 的答错/请求失败 → 维持原语义（主问题计错、控制题触发 insufficient）。
+    // ③ 请求未成功（传输故障/5xx/上游错误载荷/非尺寸类 4xx）→ 同样剔除分母（证据不足），
+    //    只有「拿到答案且答错」才计错。历史缺陷（层 3 审查）：请求失败原被计为答错，
+    //    在有效样本刚过 MIN_USABLE_RATIO 的窄带里（n=15 时可用 12~14）可把正确率压到 <40
+    //    触发质量硬红线封顶 45 —— 用「没答上来」冒充「答错了」属诬告。
+    //    （控制题全对只能排除整体故障，不能排除「长题被拒/长题网络失败」的选择性失败。）
     const starved = call.starved;
+    const unavailable = !call.result.ok;
+    const blank = isBlankAnswer(call.result);
     const hit = checkAnswer(call.result.text, question);
     const label = `${question.control ? '控制题' : '题'} ${question.id}`;
     if (question.control) {
-      if (hit) {
-        controlCorrect += 1;
-      } else if (starved) {
-        controlStarved += 1;
+      if (starved) {
+        if (hit) {
+          controlCorrect += 1;
+        } else {
+          controlStarved += 1;
+          findings.push({
+            level: 'warn',
+            message: `控制题 ${question.id} 因推理占满预算未作答（升预算重试仍截断，期望 ${question.answer}）：证据不足，本次质量结论不可信。`,
+            evidenceIds: call.evidenceIds,
+          });
+        }
+      } else if (unavailable) {
+        // 请求失败时即使上游残留正文碰巧含答案，也不得把「未成功响应」当成控制题通过——
+        // 否则端点故障会被残缺证据洗白，控制题失去「排除整体故障」的作用。
         findings.push({
           level: 'warn',
-          message: `控制题 ${question.id} 因推理占满预算未作答（升预算重试仍截断，期望 ${question.answer}）：证据不足，本次质量结论不可信。`,
+          message: `控制题 ${question.id} 未通过（期望 ${question.answer}，请求失败 ${call.result.error ?? 'unknown'}）：端点当前不可用或严重异常，本次质量结论不可信。`,
           evidenceIds: call.evidenceIds,
         });
+      } else if (blank) {
+        // HTTP 200 空文本不是「答错」：没有答案可判，控制题同样不能算通过。
+        emptySamples += 1;
+        controlEmpty += 1;
+        findings.push({
+          level: 'warn',
+          message: `控制题 ${question.id} 返回空响应（HTTP 200，无 content${call.blankRetried ? '，已自动改用流式回退仍为空' : ''}；期望 ${question.answer}）：未获得答案，本次质量结论不可信（空响应 ≠ 答错）。`,
+          evidenceIds: call.evidenceIds,
+        });
+      } else if (hit) {
+        controlCorrect += 1;
       } else {
         findings.push({
           level: 'warn',
@@ -220,29 +264,92 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
           evidenceIds: call.evidenceIds,
         });
       }
+    } else if (starved) {
+      // 截断正文已含答案仍按计对（思考型模型常见：答案先出、后续推理被 max_tokens 截断）。
+      if (hit) {
+        mainCorrect += 1;
+      } else {
+        excluded += 1;
+        findings.push({
+          level: 'warn',
+          message: `题 ${question.id} 因推理占满预算未作答（升预算重试仍截断）：该题剔除分母，不计入答错。`,
+          evidenceIds: call.evidenceIds,
+        });
+      }
+    } else if (unavailable) {
+      unavailableSamples += 1;
+      findings.push({
+        level: 'warn',
+        message: `题 ${question.id} 请求未成功（${call.result.error ?? 'unknown'}${call.result.attempts > 1 ? `；已尝试 ${call.result.attempts} 次` : ''}）：该题剔除分母（未获得答案 ≠ 答错）。`,
+        evidenceIds: call.evidenceIds,
+      });
+    } else if (blank) {
+      // 200 空文本：未获得答案，剔除分母且不触发复采样（复采样只会放大请求量，不能把空响应当答错）。
+      emptySamples += 1;
+      mainEmpty += 1;
+      findings.push({
+        level: 'warn',
+        message: `题 ${question.id} 返回空响应（HTTP 200，无 content${call.blankRetried ? '，已自动改用流式回退仍为空' : ''}）：该题剔除分母（空响应 ≠ 答错）。`,
+        evidenceIds: call.evidenceIds,
+      });
     } else if (hit) {
       mainCorrect += 1;
-    } else if (starved) {
-      excluded += 1;
-      findings.push({
-        level: 'warn',
-        message: `题 ${question.id} 因推理占满预算未作答（升预算重试仍截断）：该题剔除分母，不计入答错。`,
-        evidenceIds: call.evidenceIds,
-      });
     } else {
-      wrong.push(question.id);
-      findings.push({
-        level: 'warn',
-        message: `题 ${question.id} 答错（期望 ${question.answer}，响应：${preview(call.result.text)}）`,
-        evidenceIds: call.evidenceIds,
+      // v0.2.2 抗噪（F1）：干净答错 = 拿到答案（ok 且非 starved）但判错。仅对主问题复采样一次
+      // （同题同 messages、temperature 0.7），复采样答对按两次机会口径计为正确；复采样仍错或
+      // 未产出可用答案则维持判错。控制题/starved/请求失败分支不触发（不得扩大复采样面）。
+      retriedCount += 1;
+      const resampleBudget = call.retried ? PROBE_BUDGETS.qualityRetry : PROBE_BUDGETS.quality;
+      const resampleRequest: ChatRequest = { model: ctx.cfg.model, messages, temperature: 0.7, max_tokens: resampleBudget };
+      const resample = await ctx.client.chat(resampleRequest);
+      const resampleEvidence = recordCall(ctx.evidence, {
+        probe: 'quality',
+        label: `${question.id} (resample@0.7)`,
+        request: { model: ctx.cfg.model, stream: false, temperature: 0.7, maxTokens: resampleBudget, messages },
+        result: resample,
       });
+      // 与 ① 判定契约一致：复采样 starved（截断）但截断正文已含答案可按计对；
+      // 但请求失败（ok=false）的残缺正文不得洗白——失败样本绝不能因 partial 文本碰巧含答案而计对。
+      const recovered = resample.ok && checkAnswer(resample.text, question);
+      if (recovered) {
+        mainCorrect += 1;
+        recoveredCount += 1;
+        findings.push({
+          level: 'info',
+          message: `题 ${question.id} 首答错误、复采样（temperature 0.7）答对，按两次机会口径计为正确；首答响应：${preview(call.result.text)}`,
+          evidenceIds: [...call.evidenceIds, resampleEvidence.id],
+        });
+      } else {
+        wrong.push(question.id);
+        const resampleClean = resample.ok && !isStarved(resample);
+        findings.push({
+          level: 'warn',
+          message: resampleClean
+            ? `题 ${question.id} 答错（复采样仍错；期望 ${question.answer}，首答响应：${preview(call.result.text)}）`
+            : `题 ${question.id} 答错（复采样未产出可用答案；期望 ${question.answer}，响应：${preview(call.result.text)}）`,
+          evidenceIds: [...call.evidenceIds, resampleEvidence.id],
+        });
+      }
     }
   }
 
-  const usable = main.length - excluded;
+  const usable = main.length - excluded - unavailableSamples - mainEmpty;
   metrics['main'] = `${mainCorrect}/${usable}`;
   metrics['controls'] = `${controlCorrect}/${controls.length}`;
   metrics['excluded'] = excluded;
+  if (unavailableSamples > 0) metrics['unavailable'] = unavailableSamples;
+  if (emptySamples > 0) metrics['empty'] = emptySamples;
+  if (retriedCount > 0) metrics['retried'] = retriedCount;
+  if (recoveredCount > 0) metrics['recovered'] = recoveredCount;
+  if (blankRetriedCount > 0) metrics['blank_retried'] = blankRetriedCount;
+  if (streamFallbackCount > 0) metrics['stream_fallbacks'] = streamFallbackCount;
+  if (streamFallbackCount > 0) {
+    findings.push({
+      level: 'info',
+      message: `质量探针有 ${streamFallbackCount} 题非流式空响应，已自动改用流式回退并取得答案（空响应 ≠ 答错）。`,
+      evidenceIds: streamFallbackEvidenceIds,
+    });
+  }
 
   if (controlCorrect < controls.length) {
     return {
@@ -253,7 +360,9 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
       headline:
         controlStarved > 0
           ? `控制题未产出答案（${controlStarved} 题推理占满预算未作答）：证据不足，质量评分不可信`
-          : `控制题未全对（${controlCorrect}/${controls.length}）：端点异常或拒答，质量评分不可信`,
+          : controlEmpty > 0
+            ? `控制题未获得有效答案（${controlEmpty} 题空响应${blankRetriedCount > 0 ? '，已自动重试/流式回退仍为空' : ''}）：端点异常，质量评分不可信`
+            : `控制题未全对（${controlCorrect}/${controls.length}）：端点异常或拒答，质量评分不可信`,
       findings,
       metrics,
     };
@@ -264,37 +373,68 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: `主问题全部因推理占满预算被剔除（0/${main.length} 有效）：证据不足，无法评分`,
+      headline: `主问题全部被剔除（0/${main.length} 有效：推理占满预算/请求失败/空响应${blankRetriedCount > 0 ? '，空响应已重试/流式回退' : ''}）：证据不足，无法评分`,
       findings,
       metrics,
     };
   }
   if (usable < main.length * MIN_USABLE_RATIO) {
+    const reasons = [
+      excluded > 0 ? `${excluded} 题推理占满预算` : '',
+      unavailableSamples > 0 ? `${unavailableSamples} 题请求未成功` : '',
+      mainEmpty > 0 ? `${mainEmpty} 题空响应${blankRetriedCount > 0 ? '（已重试/流式回退）' : ''}` : '',
+    ]
+      .filter((s) => s !== '')
+      .join('、');
     return {
       id: 'quality',
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: `有效样本不足（${usable}/${main.length}，其余因推理占满预算剔除）：证据不足，无法评分`,
+      headline: `有效样本不足（${usable}/${main.length}，其余因${reasons || '证据不足'}剔除）：证据不足，无法评分`,
       findings,
       metrics,
     };
   }
 
   const accuracy = mainCorrect / usable;
-  const score = Math.round(accuracy * 100);
+  let score = Math.round(accuracy * 100);
   let level: ProbeOutcome['level'];
   if (accuracy >= 0.9) level = 'pass';
   else if (accuracy >= 0.6) level = 'warn';
   else level = 'fail';
 
   const excludedNote = excluded > 0 ? `，另有 ${excluded} 题因推理占满预算剔除分母` : '';
-  const headline =
+  let headline =
     level === 'pass'
       ? `质量题集通过：主题 ${mainCorrect}/${usable}（控制题全对${excludedNote}）`
       : level === 'warn'
         ? `质量可疑：主题 ${mainCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}`
         : `疑似降智：主题仅 ${mainCorrect}/${usable} 正确（控制题全对），已答错 ${wrong.length} 题${excludedNote}`;
+
+  // 恢复率防洗白（F1 裁决口径）：端点识别「重复提问」后策略性作答时，复采样恢复率会异常高。
+  // ① 恢复率异常高：只披露、不出分（首答正确数少 + 复采样几乎全对 = 可疑模式）；
+  // ② 过半主题依赖复采样才答对：按可疑处理（分数封顶 80、pass 降 warn），headline 同步改写。
+  const firstCorrect = mainCorrect - recoveredCount;
+  if (retriedCount > 0) {
+    if (recoveredCount >= 3 && recoveredCount / retriedCount >= 0.9 && firstCorrect <= 6) {
+      findings.push({
+        level: 'info',
+        message: `复采样恢复率异常高（${recoveredCount}/${retriedCount}，首答正确 ${firstCorrect}/${main.length}）：不排除端点识别重复提问后策略性作答，建议人工复核。`,
+        evidenceIds: [],
+      });
+    }
+    if (recoveredCount / main.length >= 0.5) {
+      findings.push({
+        level: 'warn',
+        message: `过半主题依赖复采样才答对（${recoveredCount}/${main.length}）：疑似端点识别重复提问后二次作答。`,
+        evidenceIds: [],
+      });
+      score = Math.min(score, 80);
+      if (level === 'pass') level = 'warn';
+      headline = `质量可疑：过半主题需复采样才对（${mainCorrect}/${usable}）`;
+    }
+  }
 
   findings.push({
     level: 'info',

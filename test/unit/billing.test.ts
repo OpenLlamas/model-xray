@@ -1,9 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { applyRatioDecision, decideRatio, probeBilling, type RatioArgs, type RatioDecision } from '../../src/probes/billing.js';
 import type { BalanceReading, } from '../../src/balance.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
+import { estimateMessageTokens } from '../../src/tokens.js';
+import { PROBESET_VERSION } from '../../src/assets.js';
+import type { TokenReference } from '../../src/token-reference.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
 
 function reading(patch: Partial<BalanceReading> = {}): BalanceReading {
@@ -245,6 +250,7 @@ function usageResult(promptTokens: number): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'stop',
+    model: null,
     text: 'ok',
     reasoning: null,
     usage: { prompt_tokens: promptTokens, completion_tokens: 16, total_tokens: promptTokens + 16 },
@@ -263,6 +269,7 @@ function errorResult(): ChatResult {
     ok: false,
     status: 500,
     finishReason: null,
+    model: null,
     text: '',
     reasoning: null,
     usage: null,
@@ -284,6 +291,7 @@ function billingCtx(client: OpenAIClient): ProbeCtx {
     claimedContext: null,
     expect: [],
     deep: false,
+    billingLevels: [2000, 4000, 8000, 16000, 24000],
     seed: 1,
     timeoutMs: 1000,
     retries: 0,
@@ -332,6 +340,21 @@ test('probeBilling: total samples >=3 but every track <3 → insufficient (zero-
   assert.ok(!outcome.findings.some((f) => /线性关系正常/.test(f.message)));
 });
 
+test('probeBilling: 仅一条轨道 ≥3 个有效样本 → insufficient（不得凭单轨道 pass 100）', async () => {
+  // en 5 档全成功，zh 仅前 2 档成功：旧实现 some() 只跑 en 回归并给出「线性正常」pass 100，
+  // 但中文轨道的 tokenizer/计数差异完全未验证。
+  const { client } = billingClient((track, index) => {
+    if (track === 'en') return usageResult(100 + 100 * index);
+    return index < 2 ? usageResult(300 + 300 * index) : errorResult();
+  });
+  const ctx = billingCtx(client);
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.match(outcome.headline, /单轨道样本 <3/);
+});
+
 test('probeBilling: non-positive english slope → zh_en_slope_ratio is N/A (no astronomical fake ratio)', async () => {
   // en 斜率为负（usage 随长度递减）：旧实现 Math.max(enRatio,0.001) 会造出天文数字比值
   const { client } = billingClient((track, index) =>
@@ -343,3 +366,365 @@ test('probeBilling: non-positive english slope → zh_en_slope_ratio is N/A (no 
   // en 斜率异常本身仍出 fail finding（<0.05 区间），不被 ratio 修复吞掉
   assert.ok(outcome.findings.some((f) => f.level === 'fail' && /斜率/.test(f.message)), JSON.stringify(outcome.findings));
 });
+
+test('probeBilling: R²<0.9 → fail 分项判定（finding 与 level 一致，证据可回溯）', async () => {
+  // ys 尾部大离群：slope≈0.76 在合理区间内、R²≈0.78 <0.9——旧实现只 escalate warn，
+  // 却 push fail finding（报表出现 FAIL 徽标 + 可疑判定的自相矛盾），且 fail 分支不可达
+  const { client } = billingClient((track, index) =>
+    track === 'en' ? usageResult([5000, 6000, 7000, 8000, 24000][Math.min(index, 4)]!) : usageResult(1000 + 1000 * index),
+  );
+  const ctx = billingCtx(client);
+  const outcome = await probeBilling(ctx);
+  const r2Finding = outcome.findings.find((f) => f.level === 'fail' && /非线性|R²/.test(f.message));
+  assert.ok(r2Finding, JSON.stringify(outcome.findings));
+  assert.ok((r2Finding.evidenceIds ?? []).length >= 3, 'fail finding 必须携带回归样本证据 id');
+  assert.equal(outcome.level, 'fail');
+  assert.ok((outcome.score ?? 100) <= 40, `score=${outcome.score}`);
+});
+
+test('probeBilling: R² 在 0.9~0.98 之间 → warn 55（不把轻微非线性定性为计数造假）', async () => {
+  // 2026-10-18 真机复盘：3 点回归 R²=0.962 曾被判 fail 40 + 「疑似计数造假」；
+  // 单点 tokenizer/缓存差异即可造成该量级的偏离，应只报疑似并建议复测。
+  const multipliers: Record<'en' | 'zh', number[]> = { en: [0.91, 0.91, 0.91], zh: [0.83, 0.85, 0.53] };
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const index = Math.min(counters[track], multipliers[track].length - 1);
+      counters[track] += 1;
+      return usageResult(Math.round(estimateMessageTokens(req.messages) * multipliers[track][index]!));
+    },
+  };
+  const ctx = billingCtx(client);
+  ctx.cfg.billingLevels = [2000, 8000, 24000];
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn');
+  assert.ok((outcome.score ?? 100) <= 55, `score=${outcome.score}`);
+  assert.match(outcome.headline, /线性度偏低/);
+  const warnFinding = outcome.findings.find((f) => f.level === 'warn' && /R²/.test(f.message));
+  assert.ok(warnFinding, JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail' && /R²|非线性/.test(f.message)));
+});
+
+test('probeBilling: 默认 5 档覆盖 4k/16k，采样点之间的非线性不得报「线性正常」（3 档会漏）', async () => {
+  // 3 档（2k/8k/24k）时，异常可以只落在未采样的 4k/16k 上：三点完美共线 → pass 100。
+  // 默认恢复 5 档后必须把中间档纳入回归，否则「全部正常」可能是采样盲区而非端点诚实。
+  const multipliers = [0.8, 1.2, 0.8, 1.2, 0.8];
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const index = Math.min(counters[track], multipliers.length - 1);
+      counters[track] += 1;
+      return usageResult(Math.round(estimateMessageTokens(req.messages) * multipliers[index]!));
+    },
+  };
+  const ctx = billingCtx(client);
+  ctx.cfg.billingLevels = undefined;
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'fail', `score=${outcome.score} headline=${outcome.headline}`);
+  assert.ok((outcome.score ?? 100) <= 40, `score=${outcome.score}`);
+  assert.ok(!outcome.headline.includes('线性关系正常'), outcome.headline);
+  assert.ok(outcome.metrics['prompt_tokens_en_4000'] != null, '默认档位必须包含 4k');
+  assert.ok(outcome.metrics['prompt_tokens_en_16000'] != null, '默认档位必须包含 16k');
+});
+
+test('probeBilling: 窗口内存在失败请求 → 实测倍率作废（不得用不完整分母指控虚高）', async () => {
+  const expectedCost = 28292 / 1e6;
+  let balanceReads = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/v1/dashboard/billing/usage') {
+      balanceReads += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? expectedCost * 100 * 20 : 0 }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl,
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const index = counters[track];
+      counters[track] += 1;
+      // zh 第 2 档失败：该请求可能已被上游计费，但 usage 缺失使 expectedCost 分母不完整
+      if (track === 'zh' && index === 1) return errorResult();
+      const prompt = 1000 + index * 100;
+      return {
+        ok: true,
+        status: 200,
+        finishReason: 'stop',
+        model: null,
+        text: 'ok',
+        reasoning: null,
+        usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
+        usageRejected: null,
+        attempts: 1,
+        toolCalls: [],
+        ttftMs: null,
+        durationMs: 1,
+        error: null,
+        raw: '',
+      };
+    },
+  };
+  try {
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = 2;
+    ctx.cfg.priceOutput = 8;
+    ctx.cfg.priceCachedRead = 0.5;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.metrics['ratio_contaminated'], 1);
+    assert.equal(outcome.metrics['measured_ratio'], 'N/A');
+    // 样本面已有缺口：不得仍报 PASS 100（否则 PASS 徽标与「部分请求失败」warn 自相矛盾）
+    assert.notEqual(outcome.level, 'pass');
+    assert.ok((outcome.score ?? 100) <= 70, `score=${outcome.score}`);
+    assert.ok(outcome.findings.some((f) => f.level === 'warn' && /部分计费探针请求失败/.test(f.message)), JSON.stringify(outcome.findings));
+    assert.ok(!outcome.findings.some((f) => f.level === 'fail' && /实测倍率/.test(f.message)), JSON.stringify(outcome.findings));
+    assert.ok(outcome.findings.some((f) => f.level === 'info' && /失败请求/.test(f.message)), JSON.stringify(outcome.findings));
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+// ---------- F3 token-reference 集成（probeBilling 级） ----------
+
+/**
+ * 参考计数 client：按 (轨道, 档位序号) 返回 honest×ratio 的 usage，并同步把 honest 值
+ * 写进 tokenReference.promptTokens（key 与 billing 的 `${lang}_${level}` 同形状）。
+ * ratio=1.0 即「与历史报告完全一致」，ratio=1.3 即「全量等比虚增 30%（回归不可见）」。
+ */
+function referenceClient(
+  ratio: number,
+  opts: { model?: string; probesetVersion?: string } = {},
+): { client: OpenAIClient; tokenReference: TokenReference } {
+  const levels = [2000, 4000, 8000, 16000, 24000];
+  const promptTokens: Record<string, number> = {};
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const tokenReference: TokenReference = {
+    sourceFile: 'reports/ref.json',
+    model: opts.model ?? 'gpt-4o',
+    probesetVersion: opts.probesetVersion ?? PROBESET_VERSION,
+    baseUrl: 'https://relay.example.com/v1',
+    startedAt: '2026-01-01T00:00:00.000Z',
+    promptTokens,
+  };
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const index = Math.min(counters[track], levels.length - 1);
+      counters[track] += 1;
+      const level = levels[index] as number;
+      const honest = estimateMessageTokens(req.messages);
+      promptTokens[`${track}_${level}`] = honest;
+      return usageResult(Math.round(honest * ratio));
+    },
+  };
+  return { client, tokenReference };
+}
+
+async function auditWithReference(
+  ratio: number,
+  opts: { model?: string; probesetVersion?: string } = {},
+): Promise<Awaited<ReturnType<typeof probeBilling>>> {
+  const { client, tokenReference } = referenceClient(ratio, opts);
+  const ctx = billingCtx(client);
+  ctx.cfg.tokenReference = tokenReference;
+  return probeBilling(ctx);
+}
+
+test('probeBilling + token-reference: uniform ×1.3 inflation → fail, score capped 30, reference headline', async () => {
+  const outcome = await auditWithReference(1.3);
+  assert.equal(outcome.level, 'fail');
+  assert.equal(outcome.score, 30);
+  assert.match(outcome.headline, /token 计数与参考报告系统偏离/);
+  assert.equal(outcome.metrics['reference_ratio_max_en'], 1.3);
+  assert.equal(outcome.metrics['reference_ratio_max_zh'], 1.3);
+  assert.match(String(outcome.metrics['reference_source']), /ref\.json \| gpt-4o \|/);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /参考报告/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('probeBilling + token-reference: ×1.15 → warn capped 70 with reference headline', async () => {
+  const outcome = await auditWithReference(1.15);
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 70);
+  assert.match(outcome.headline, /token 计数与参考报告偏离（最高 ×1\.15）/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /参考报告偏离/.test(f.message)));
+});
+
+test('probeBilling + token-reference: matching counts → pass 100 with consistency info', async () => {
+  const outcome = await auditWithReference(1.0);
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['reference_ratio_max_en'], 1);
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /参考报告一致/.test(f.message)));
+});
+
+test('probeBilling + token-reference: model mismatch → comparison skipped, N/A metrics, no cap', async () => {
+  const outcome = await auditWithReference(1.3, { model: 'glm-4.6' });
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['reference_ratio_max_en'], 'N/A');
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /不一致，跳过 token 计数对比/.test(f.message)));
+});
+
+test('probeBilling + token-reference: probeset version mismatch → comparison skipped (context uses PROBESET_VERSION)', async () => {
+  const outcome = await auditWithReference(1.3, { probesetVersion: 'v0.0.1-old' });
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['reference_ratio_median_en'], 'N/A');
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /题集版本（v0\.0\.1-old）与本次/.test(f.message)));
+});
+
+test('probeBilling：缓存读 + 二档阶梯价按 computeCostUsd 累计并如实披露', async () => {
+  // 10 笔请求（5 档 × en/zh），prompt 1000..1400；阈值 1000 严格「大于」才切二档：
+  // 1000 仍按一档（700×2 + 300×0.5 + 16×8 = 1678），1100..1400 走二档
+  // （(p-300)×3 + 300×0.25 + 16×12 = 3p-633）。两轨合计 2×14146 = 28292 → 0.028292。
+  const expectedCost = 28292 / 1e6;
+  let balanceReads = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/v1/dashboard/billing/usage') {
+      balanceReads += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? expectedCost * 100 : 0 }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl,
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const prompt = 1000 + counters[track] * 100;
+      counters[track] += 1;
+      return {
+        ok: true,
+        status: 200,
+        finishReason: 'stop',
+        model: null,
+        text: 'ok',
+        reasoning: null,
+        usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
+        usageRejected: null,
+        attempts: 1,
+        toolCalls: [],
+        ttftMs: null,
+        durationMs: 1,
+        error: null,
+        raw: '',
+      };
+    },
+  };
+  try {
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = 2;
+    ctx.cfg.priceOutput = 8;
+    ctx.cfg.priceCachedRead = 0.5;
+    ctx.cfg.priceThreshold = 1000;
+    ctx.cfg.priceInput2 = 3;
+    ctx.cfg.priceOutput2 = 12;
+    ctx.cfg.priceCachedRead2 = 0.25;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.metrics['price_input2'], 3);
+    assert.equal(outcome.metrics['price_cached_read2'], 0.25);
+    assert.equal(outcome.metrics['ratio_samples'], 10);
+    assert.ok(Math.abs((outcome.metrics['spend_delta'] as number) - expectedCost) < 1e-12);
+    assert.ok(Math.abs((outcome.metrics['expected_cost'] as number) - 0.028) < 1e-12, `expected_cost=${outcome.metrics['expected_cost']}`);
+    assert.equal(outcome.metrics['measured_ratio'], 1);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('probeBilling：实测倍率 fail 时 headline 同步为扣费异常，且 >10 倍追加账户级口径提示', async () => {
+  // 与上一条用例相同的 10 笔 usage 序列，但余额差值放大到 238.569 倍：
+  // 回归本身正常（level 仍可为 pass），ratio 判定必须把 score 封顶 30、level=fail，
+  // 并把 headline 从「线性正常」同步为扣费异常（否则报表出现 FAIL 30 + 标题说正常）。
+  const expectedCost = 28292 / 1e6;
+  const measuredRatio = 238.569;
+  let balanceReads = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/v1/dashboard/billing/usage') {
+      balanceReads += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? expectedCost * 100 * measuredRatio : 0 }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl,
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const prompt = 1000 + counters[track] * 100;
+      counters[track] += 1;
+      return {
+        ok: true,
+        status: 200,
+        finishReason: 'stop',
+        model: null,
+        text: 'ok',
+        reasoning: null,
+        usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
+        usageRejected: null,
+        attempts: 1,
+        toolCalls: [],
+        ttftMs: null,
+        durationMs: 1,
+        error: null,
+        raw: '',
+      };
+    },
+  };
+  try {
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = 2;
+    ctx.cfg.priceOutput = 8;
+    ctx.cfg.priceCachedRead = 0.5;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.level, 'fail');
+    assert.equal(outcome.score, 30);
+    assert.match(outcome.headline, /实测扣费|实测倍率/);
+    assert.ok(!outcome.headline.includes('线性关系正常'), outcome.headline);
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'info' && /账户级口径/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('probeBilling：库调用方传入半组阶梯价 → warn 且不计算实测倍率', async () => {
+  const { client } = billingClient(() => usageResult(1000));
+  const ctx = billingCtx(client);
+  ctx.cfg.priceInput = 2;
+  ctx.cfg.priceOutput = 8;
+  ctx.cfg.priceThreshold = 1000000;
+  // 缺 priceInput2/priceOutput2：CLI 入口会拒收，库调用方必须被探针自检拦下
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.metrics['expected_cost'], undefined);
+  assert.equal(outcome.metrics['measured_ratio'], undefined);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /阶梯阈值、二档输入价、二档输出价必须同时提供/.test(f.message)));
+});
+

@@ -29,6 +29,13 @@ test('guard anomaly：模型一致或响应模型未知 → 无异常', () => {
   assert.equal(buildAnomalies(anomalyInput({ modelReq: null, modelResp: 'GLM-4' })).length, 0);
 });
 
+test('guard anomaly：仅大小写不同 → 不告警（与网关 S1-S3「大小写不敏感」裁决口径一致）', () => {
+  assert.equal(buildAnomalies(anomalyInput({ modelResp: 'GPT-4O' })).length, 0);
+  assert.equal(buildAnomalies(anomalyInput({ modelReq: 'GLM-4.6', modelResp: 'glm-4.6' })).length, 0);
+  // 真实换壳仍必报
+  assert.equal(buildAnomalies(anomalyInput({ modelReq: 'glm-4.6', modelResp: 'GLM-4' })).length, 1);
+});
+
 test('guard anomaly：validateUsage 三类拒绝 → error 级 usage_invalid', () => {
   const bad: Array<{ usage: unknown; reason: string }> = [
     { usage: { prompt_tokens: 10, total_tokens: 15 }, reason: 'missing' },

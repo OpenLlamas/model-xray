@@ -4,7 +4,8 @@ import { renderJson } from '../../src/report/json.js';
 import { renderMarkdown } from '../../src/report/markdown.js';
 import { renderHtml } from '../../src/report/html.js';
 import { renderConsole } from '../../src/report/console.js';
-import type { AuditReport, ProbeOutcome, ScoreEntry } from '../../src/types.js';
+import { createEvidenceRecorder, recordCall } from '../../src/evidence.js';
+import type { AuditReport, ChatResult, ProbeOutcome, ScoreEntry } from '../../src/types.js';
 
 function sampleReport(textPreview: string): AuditReport {
   return {
@@ -49,11 +50,13 @@ function sampleReport(textPreview: string): AuditReport {
           maxTokens: 10,
           messageCount: 1,
           lastUserPreview: 'hello <img src=x onerror=alert(1)>',
+          lastUserTailPreview: '',
           lastUserChars: 10,
           totalChars: 10,
         },
         response: {
           status: 200,
+          model: null,
           textPreview,
           textChars: textPreview.length,
           usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
@@ -62,6 +65,8 @@ function sampleReport(textPreview: string): AuditReport {
           toolCallCount: 0,
           finishReason: 'length',
           error: null,
+          raw: '',
+          rawChars: 0,
         },
         ttftMs: null,
         durationMs: 5,
@@ -78,6 +83,57 @@ test('html escapes model output and metadata (no raw script tags)', () => {
   assert.ok(html.includes('&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;'));
   assert.ok(!html.includes('gpt-4o<script>'));
   assert.ok(html.includes('&quot;'));
+});
+
+test('recordCall：长请求保留尾部摘要（按 code point 截断），短请求为空', () => {
+  const recorder = createEvidenceRecorder();
+  const result: ChatResult = {
+    ok: true,
+    status: 200,
+    finishReason: 'stop',
+    model: null,
+    text: 'ok',
+    reasoning: null,
+    usage: null,
+    usageRejected: null,
+    attempts: 1,
+    toolCalls: [],
+    ttftMs: null,
+    durationMs: 1,
+    error: null,
+    raw: '',
+  };
+  const tail = '编号ABC123';
+  const long = recordCall(recorder, {
+    probe: 'context',
+    label: 'long',
+    request: { model: 'm', stream: false, messages: [{ content: `${'头'.repeat(900)}${tail}` }] },
+    result,
+  });
+  assert.ok(long.request.lastUserTailPreview.startsWith('…'));
+  assert.ok(long.request.lastUserTailPreview.endsWith(tail));
+  assert.equal(Array.from(long.request.lastUserTailPreview).length, 401);
+  const short = recordCall(recorder, {
+    probe: 'context',
+    label: 'short',
+    request: { model: 'm', stream: false, messages: [{ content: '短请求' }] },
+    result,
+  });
+  assert.equal(short.request.lastUserTailPreview, '');
+});
+
+test('长请求：HTML/Markdown 保留结尾摘要，且同样转义', () => {
+  const report = sampleReport('ok');
+  const request = report.evidence[0]!.request;
+  request.lastUserChars = 5000;
+  request.lastUserTailPreview = '结尾问题：编号ABC123 <script>alert(1)</script>';
+  const html = renderHtml(report);
+  assert.ok(html.includes('请求结尾'));
+  assert.ok(!html.includes('<script>alert(1)</script>'));
+  assert.ok(html.includes('&lt;script&gt;alert(1)&lt;/script&gt;'));
+  const md = renderMarkdown(report);
+  assert.ok(md.includes('请求结尾'));
+  assert.ok(md.includes('编号ABC123'));
 });
 
 test('html escapes attribute-context payloads', () => {
@@ -113,6 +169,8 @@ test('report json serializes evidence finish_reason in snake_case (explicit mapp
   assert.ok(!json.includes('finishReason'), 'camelCase finishReason must not leak into report JSON');
   const parsed = JSON.parse(json) as { evidence: Array<{ response: Record<string, unknown> }> };
   assert.equal(parsed.evidence[0]?.response['finish_reason'], 'length');
+  assert.equal(parsed.evidence[0]?.response['raw'], '');
+  assert.equal(parsed.evidence[0]?.response['rawChars'], 0);
 });
 
 // ---------- 异常要点 / 权重列 / dark mode / 控制台着色 ----------
