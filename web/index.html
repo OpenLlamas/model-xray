@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>model-xray 控制台</title>
+<link rel="icon" href="/favicon.svg">
 <style>
   :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0a0c10; color: #e8eaf0; font-synthesis: none; }
   * { box-sizing: border-box; }
@@ -52,7 +53,7 @@
   .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #686b75; vertical-align: middle; }
   .dot.on { background: #77d9b0; box-shadow: 0 0 9px #77d9b066; }
   .keybar input { flex: 1 1 260px; min-width: 120px; padding: 9px 11px; border: 1px solid transparent; border-radius: 7px; outline: none; background: #0e1016; color: #e6e3ee; font-size: 12px; transition: border-color .15s ease; }
-  .keybar input:focus, input[type="text"]:focus, input[type="password"]:focus { border-color: #a58bff80; box-shadow: 0 0 0 3px #a58bff12; }
+  .keybar input:focus, input[type="text"]:focus, input[type="password"]:focus, select:focus { border-color: #a58bff80; box-shadow: 0 0 0 3px #a58bff12; }
   .banner { margin: 13px 0; padding: 11px 14px; border: 1px solid; border-radius: 9px; font-size: 12px; line-height: 1.6; }
   .banner-offline { border-color: #c09a4a40; background: #d5a84310; color: #e2c681; }
   .banner-warn { border-color: #c09a4a45; background: #d5a84312; color: #efca72; font-weight: 570; }
@@ -67,7 +68,8 @@
   .row { display: flex; gap: 13px; flex-wrap: wrap; }
   .row > div { flex: 1 1 235px; min-width: 0; }
   label { display: block; margin: 13px 0 7px; color: #a5a5b1; font-size: 11px; }
-  input[type="text"], input[type="password"], textarea { width: 100%; min-height: 39px; padding: 9px 11px; border: 1px solid #292b35; border-radius: 7px; outline: none; background: #0d0f14; color: #e4e1eb; font-size: 12px; transition: border-color .15s ease, box-shadow .15s ease; }
+  input[type="text"], input[type="password"], textarea, select { width: 100%; min-height: 39px; padding: 9px 11px; border: 1px solid #292b35; border-radius: 7px; outline: none; background: #0d0f14; color: #e4e1eb; font-size: 12px; transition: border-color .15s ease, box-shadow .15s ease; }
+  select { appearance: none; -webkit-appearance: none; background-image: linear-gradient(45deg, transparent 50%, #6d7180 50%), linear-gradient(135deg, #6d7180 50%, transparent 50%); background-position: calc(100% - 17px) 17px, calc(100% - 12px) 17px; background-size: 5px 5px, 5px 5px; background-repeat: no-repeat; }
   input::placeholder { color: #565a66; }
   textarea { min-height: 120px; }
   .checks { display: flex; min-height: 39px; align-items: center; gap: 14px; flex-wrap: wrap; margin: 4px 0; }
@@ -85,6 +87,23 @@
   pre.log { min-height: 70px; max-height: 360px; }
   .log-line-warn { color: #efca72; }
   .log-line-fail { color: #ff8989; }
+  .log-line-pass { color: #7ee787; }
+  .log-line-unknown { color: #9aa0b5; }
+  .log-line-info { color: #79c0ff; }
+  .log-line-phase-identity { color: #8ab4ff; }
+  .log-line-phase-context { color: #c792ea; }
+  .log-line-phase-billing { color: #ffd479; }
+  .log-line-phase-capability { color: #7ee787; }
+  .log-line-phase-decoy { color: #ff9e64; }
+  .log-line-phase-quality { color: #67d8ef; }
+  .log-line-phase-ttft { color: #f78c6c; }
+  .log-line-phase-start { margin-top: 6px; padding-top: 4px; border-top: 1px solid #2b2d3a; font-weight: 600; }
+  .log-line-phase-done { font-weight: 700; }
+  .log-line-request { opacity: .82; }
+  .run-status { display: flex; align-items: center; gap: 8px; margin-top: 12px; padding: 8px 12px; border: 1px solid #2b2d3a; border-radius: 8px; background: #11121a; color: #c4c4cf; font-size: 12px; }
+  .run-status[hidden] { display: none; }
+  .run-status .spinner { flex: none; width: 12px; height: 12px; border: 2px solid #3a3c4a; border-top-color: #9b8cff; border-radius: 50%; animation: mx-spin .9s linear infinite; }
+  @keyframes mx-spin { to { transform: rotate(360deg); } }
   .hints { color: #9295a2; font-size: 11px; line-height: 1.7; }
   .placeholder { color: #747885; }
   details { margin-top: 13px; }
@@ -106,15 +125,23 @@
   .report-links a, #report-list a { color: #baaaff; font-size: 11px; text-decoration: none; }
   .report-links a:hover, #report-list a:hover { color: #e0d7ff; text-decoration: underline; }
   #report-list { margin: 14px 0 0; padding: 0; list-style: none; }
+.panel-actions { display: flex; gap: 8px; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; }
+.panel-actions button.secondary { margin-top: 0; }
+button.danger { display: inline-flex; min-height: 37px; align-items: center; justify-content: center; gap: 8px; padding: 0 14px; border-radius: 7px; cursor: pointer; font-size: 11px; font-weight: 570; border: 1px solid #63404a; background: #241a20; color: #ff9fae; transition: transform .15s ease, background .15s ease, border-color .15s ease; }
+button.danger:hover { border-color: #a46072; background: #33202a; color: #ffd4dc; }
+button.armed { outline: 2px solid #f0b64d; outline-offset: 1px; border-color: #f0b64d; color: #ffe3a8; }
+button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8; }
   #report-list li { display: flex; min-height: 46px; align-items: center; gap: 12px; padding: 8px 10px; border-bottom: 1px solid #ffffff0a; }
   #report-list .name { flex: 1; overflow-wrap: anywhere; color: #c3b5ff; cursor: pointer; font-size: 11px; }
   #report-list .name:hover { text-decoration: underline; }
   #report-list .meta { color: #747885; font-size: 10px; white-space: nowrap; }
   fieldset.optional { margin: 17px 0 0; padding: 7px 13px 14px; border: 1px solid #31303c; border-radius: 9px; }
   fieldset.optional legend { padding: 0 6px; color: #a6a1b7; font-size: 10px; }
-  .guard-state { display: flex; align-items: center; gap: 9px; margin: 17px 0 4px; padding: 12px 13px; border: 1px solid #ffffff0b; border-radius: 8px; background: #ffffff04; color: #a6a7b2; font-size: 11px; }
-  .guard-state::before { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; background: #737680; content: ""; }
-  .guard-state[data-running="true"]::before { background: #73d5aa; box-shadow: 0 0 10px #73d5aa88; }
+  .price-rows { display: grid; gap: 10px; margin: 10px 0 4px; }
+  .price-row { display: flex; align-items: flex-end; gap: 8px 10px; flex-wrap: wrap; padding: 9px 10px; border: 1px solid #ffffff0d; border-radius: 8px; background: #ffffff03; }
+  .price-row .price-alias { flex: 0 0 auto; max-width: 180px; align-self: center; overflow: hidden; color: #beb2e4; font-family: "Cascadia Code", Consolas, monospace; font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+  .price-field { display: flex; flex-direction: column; gap: 3px; margin: 0; color: #838793; font-size: 10px; }
+  .price-field input { width: 92px; min-height: 32px; padding: 5px 8px; font-size: 11px; }
   .channel-list { display: grid; gap: 9px; margin-top: 13px; }
   .channel-card { display: flex; align-items: center; gap: 13px; padding: 13px; border: 1px solid #ffffff0d; border-radius: 9px; background: #ffffff03; }
   .channel-indicator { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #727580; }
@@ -126,6 +153,17 @@
   .channel-model { padding: 3px 7px; border: 1px solid #9b85e51c; border-radius: 5px; background: #a18cff0a; color: #beb2e4; font-family: "Cascadia Code", Consolas, monospace; font-size: 9px; }
   .channel-actions { display: flex; gap: 6px; flex: 0 0 auto; }
   .channel-actions button { min-height: 30px; margin: 0; padding: 0 9px; font-size: 10px; }
+  .action-row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 15px; }
+  .action-row button, .channel-form-actions button, .copy-row button { margin-top: 0; }
+  .model-rows { display: grid; gap: 8px; margin: 10px 0 4px; }
+  .model-row { display: flex; align-items: center; gap: 8px; }
+  .model-row input { flex: 1 1 0; min-width: 0; }
+  .model-row .model-arrow { flex: 0 0 auto; color: #6d7180; font-size: 11px; }
+  .model-row button { flex: 0 0 auto; min-height: 32px; margin: 0; padding: 0 10px; font-size: 10px; }
+  .copy-row { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; margin: 9px 0; }
+  .copy-row code { padding: 5px 9px; border: 1px solid #292b38; border-radius: 6px; background: #0e1016; color: #cbc6e6; font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; font-size: 11px; }
+  .channel-tag-protocol { border-color: #e0b84e40; background: #e0b84e12; color: #e8c46e; }
+  #channel-probe-status.probe-error { color: #ff9a9a; }
   .channel-form { margin-top: 15px; padding: 16px; border: 1px solid #a58bff24; border-radius: 10px; background: #a58bff06; }
   .channel-form-actions { display: flex; gap: 7px; }
   .split-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 23px; }
@@ -148,7 +186,6 @@
     <div class="nav-label">工作区</div>
     <nav class="tabs" aria-label="工作区导航">
       <button id="tab-test" type="button" aria-selected="true"><span class="nav-icon">◈</span>模型检测</button>
-      <button id="tab-guard" type="button" aria-selected="false"><span class="nav-icon">⌁</span>实时监控</button>
       <button id="tab-gateway" type="button" aria-selected="false"><span class="nav-icon">⛓</span>API 聚合</button>
       <button id="tab-reports" type="button" aria-selected="false"><span class="nav-icon">▤</span>检测报告</button>
     </nav>
@@ -160,73 +197,79 @@
     <header class="topbar"><div class="crumb">工作区 <span>/</span> <strong>模型可信度</strong></div><div class="top-actions"><span class="local-pill">LOCAL ONLY</span><span class="hints">v0.2 · 本机运行</span></div></header>
     <main>
       <div class="page-heading"><div><p class="eyebrow">Model observability</p><h1>看清每一次 <span>模型交付</span></h1><p class="privacy">用可复现的探针核验模型身份、能力、上下文与用量。<strong>发现证据，而不只是相信标签。</strong></p></div></div>
-      <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测与监控不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
+      <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测、聚合与报告列表不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
       <div id="ledger-degraded-banner" class="banner banner-warn" hidden></div>
-      <div class="keybar">
-        <span class="state"><span id="key-dot" class="dot"></span>上游凭证 <span id="key-state">检测中…</span></span>
-        <input id="f-key" type="password" placeholder="粘贴 API key，仅暂存于本机内存" autocomplete="off">
-        <button id="btn-key-save" class="secondary" type="button">保存到本次会话</button>
-        <button id="btn-key-clear" class="secondary" type="button">清除</button>
-      </div>
       <section id="panel-test" class="panel">
         <div class="panel-head"><div><p class="eyebrow">01 / 一次性审计</p><h2>验证一个模型端点</h2><p>执行独立探针并生成带原始证据的评分报告。深度测试会产生真实 API 请求及费用。</p></div><span class="panel-kicker">AUDIT RUN</span></div>
         <div class="metric-strip"><div class="metric"><div class="metric-label">默认检查</div><div class="metric-value">6 个维度</div></div><div class="metric"><div class="metric-label">证据输出</div><div class="metric-value">可复测基线</div></div><div class="metric"><div class="metric-label">计费核价</div><div class="metric-value">按需启用</div></div></div>
         <div class="note"><strong>检测默认启用。</strong> 身份真伪、输出质量、能力矩阵、上下文长度与首字时延会按可用信息自动评估；计费核价只在录入宣称价格后运行。</div>
+        <div class="keybar">
+          <span class="state"><span id="key-dot" class="dot"></span>上游凭证 <span id="key-state">检测中…</span></span>
+          <input id="f-key" type="password" placeholder="粘贴 API key，直接点「开始检测」即生效（仅存本机内存）" autocomplete="off">
+          <button id="btn-key-save" class="secondary" type="button">保存到本次会话</button>
+          <button id="btn-key-clear" class="secondary" type="button">清除</button>
+        </div>
         <div class="row"><div><label for="f-base-url">API 端点 *</label><input id="f-base-url" type="text" placeholder="https://relay.example.com/v1"></div><div><label for="f-model">模型 ID *</label><input id="f-model" type="text" placeholder="gpt-4o"></div></div>
         <div class="row"><div><label for="f-claimed-context">宣称上下文窗口（tokens，可选）</label><input id="f-claimed-context" type="text" inputmode="numeric" placeholder="例如 128000"></div><div><label>该端点宣称支持的能力</label><div class="checks"><label><input id="f-expect-vision" type="checkbox">视觉</label><label><input id="f-expect-tool" type="checkbox">工具调用</label><label><input id="f-expect-thinking" type="checkbox">推理</label></div></div></div>
-        <fieldset class="optional"><legend>计费校验 · 可选</legend><div class="hints">只有同时填写输入和输出单价后才会核验账单倍率，不填不会显示误导性的 $0。</div><div class="row"><div><label for="f-price-input">输入单价（$/百万 tokens）</label><input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-price-output">输出单价（$/百万 tokens）</label><input id="f-price-output" type="text" inputmode="decimal" placeholder="10"></div></div></fieldset>
+        <fieldset class="optional"><legend>计费校验 · 可选</legend><div class="hints">同时填写输入与输出单价后才会核验账单倍率（不填不显示误导性的 $0）。缓存读不填按输入价；二档阶梯须同时填写阈值、二档输入与二档输出，二档缓存不填按二档输入价；单次请求 prompt tokens 超过阈值时整单按二档价计。</div><div class="row"><div><label for="f-price-input">输入单价（$/百万 tokens）</label><input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-price-output">输出单价（$/百万 tokens）</label><input id="f-price-output" type="text" inputmode="decimal" placeholder="10"></div></div><div class="row"><div><label for="f-price-cached-read">缓存读单价（$/百万 tokens，可选）</label><input id="f-price-cached-read" type="text" inputmode="decimal" placeholder="留空 = 按输入价"></div><div><label for="f-price-threshold">长上下文二档阈值（prompt tokens）</label><input id="f-price-threshold" type="text" inputmode="numeric" placeholder="例如 1000000"></div></div><div class="row"><div><label for="f-price-input2">二档输入单价（$/百万 tokens）</label><input id="f-price-input2" type="text" inputmode="decimal" placeholder="6"></div><div><label for="f-price-output2">二档输出单价（$/百万 tokens）</label><input id="f-price-output2" type="text" inputmode="decimal" placeholder="22.5"></div><div><label for="f-price-cached-read2">二档缓存读单价（可选）</label><input id="f-price-cached-read2" type="text" inputmode="decimal" placeholder="留空 = 按二档输入价"></div></div></fieldset>
         <div class="row"><div><label for="f-seed">随机种子（可选，复测时固定）</label><input id="f-seed" type="text" inputmode="numeric" placeholder="12345"></div><div><label for="f-timeout">单次请求超时（秒）</label><input id="f-timeout" type="text" inputmode="numeric" placeholder="60"></div></div>
         <div class="row"><div><label for="f-out">报告目录</label><input id="f-out" type="text" placeholder="reports"></div><div><label for="f-baseline">对照基线（可选）</label><input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json"></div></div>
         <div class="checks"><label><input id="f-deep" type="checkbox">增强样本（耗时和费用更高）</label><label><input id="f-dry-run" type="checkbox">仅预演，不发送请求</label></div>
-        <button id="btn-run" class="primary" type="button">开始检测 <span aria-hidden="true">→</span></button>
+        <button id="btn-run" class="primary" type="button"><span id="run-button-label">开始检测</span> <span aria-hidden="true">→</span></button>
         <div id="run-error" class="error" hidden></div><div id="run-banner" hidden></div>
+        <div id="run-status" class="run-status" role="status" aria-live="polite" hidden>
+          <span class="spinner" aria-hidden="true"></span>
+          <span id="run-status-text">检测中…</span>
+        </div>
         <div class="split-heading"><h4>任务实时输出</h4><span class="hints">密钥自动脱敏 · 报告仅写入本机</span></div>
         <pre id="run-log" class="log placeholder">等待检测任务。填写端点与模型 ID 后即可开始。</pre>
         <div id="report-result" hidden><h4>可信度评分卡</h4><div id="report-links" class="report-links"></div><div id="report-out"></div></div>
         <details><summary>查看可复制的 CLI 命令</summary><pre id="command-out" class="command"></pre><pre id="hints-out" class="hints"></pre></details>
       </section>
-      <section id="panel-guard" class="panel" hidden>
-        <div class="panel-head"><div><p class="eyebrow">02 / 被动观测</p><h2>监控真实模型流量</h2><p>将客户端接入本机透明代理，逐请求检查响应模型、token 用量与首字时延。</p></div><span class="panel-kicker">LIVE GUARD</span></div>
-        <div class="note">监控按客户端真实请求工作，不会重放对话内容。日志只保留请求元数据。启动后，将客户端 API Base URL 指向 <code>http://127.0.0.1:&lt;port&gt;/v1</code>。</div>
-        <div class="row"><div><label for="f-guard-base-url">上游 API 端点 *</label><input id="f-guard-base-url" type="text" placeholder="https://relay.example.com/v1"></div><div><label for="f-guard-port">本机代理端口（默认 8621）</label><input id="f-guard-port" type="text" inputmode="numeric" placeholder="8621"></div></div>
-        <fieldset class="optional"><legend>余额对账 · 可选</legend><div class="hints">仅在渠道提供兼容的余额端点并填写价格时启用。</div><div class="row"><div><label for="f-guard-price-in">输入单价（$/百万 tokens）</label><input id="f-guard-price-in" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-guard-price-out">输出单价（$/百万 tokens）</label><input id="f-guard-price-out" type="text" inputmode="decimal" placeholder="10"></div></div></fieldset>
-        <button id="btn-guard-start" class="primary" type="button">启动实时监控</button><button id="btn-guard-stop" class="secondary" type="button">停止监控</button>
-        <div id="guard-error" class="error" hidden></div><div class="guard-state" id="guard-state">状态：未启动</div>
-        <div class="split-heading"><h4>流量事件</h4><span class="hints">实时更新 · 滚动评分窗口</span></div><pre id="guard-log" class="log placeholder">启动后，告警与请求摘要会显示在这里。</pre>
-      </section>
       <section id="panel-gateway" class="panel" hidden>
-        <div class="panel-head"><div><p class="eyebrow">03 / 本地聚合路由</p><h2>连接并整理多个模型端点</h2><p>将多个 OpenAI 兼容渠道统一映射到一个本地 API Base URL，模型别名决定请求路由。</p></div><span class="panel-kicker">LOCAL GATEWAY</span></div>
-        <div class="metric-strip"><div class="metric"><div class="metric-label">路由方式</div><div class="metric-value">模型别名直达</div></div><div class="metric"><div class="metric-label">上游密钥</div><div class="metric-value">仅内存保管</div></div><div class="metric"><div class="metric-label">失败回退</div><div class="metric-value">首版关闭</div></div></div>
-        <div class="note"><strong>明确的首版边界。</strong> 暂支持 OpenAI Chat Completions 与 models 列表；每个模型别名固定路由到一个渠道，不自动重试或跨渠道回退。所有渠道密钥仅在应用运行期间保存在本机服务内存，重启后需重新录入。</div>
-        <div class="split-heading"><h4>本地 API 状态</h4><span class="hints">仅本机回环监听</span></div>
-        <div class="metric-strip"><div class="metric"><div class="metric-label">网关状态</div><div id="gateway-status" class="metric-value">未启动</div></div><div class="metric"><div class="metric-label">Base URL</div><div id="gateway-base-url" class="metric-value">等待启动</div></div><div class="metric"><div class="metric-label">虚拟客户端 Key</div><div id="gateway-client-key-state" class="metric-value">未生成</div></div></div>
-        <div class="row"><div><label for="f-gateway-port">本机监听端口（留空则自动分配）</label><input id="f-gateway-port" type="text" inputmode="numeric" placeholder="自动分配，或例如 8630"></div><div><label for="f-gateway-client-key">客户端虚拟 Key（仅启动期间可见）</label><input id="f-gateway-client-key" type="password" autocomplete="off" readonly placeholder="启动后生成；勿与任何上游 Key 混用"></div></div>
-        <button id="btn-gateway-start" class="primary" type="button">启动本地 API</button><button id="btn-gateway-rotate" class="secondary" type="button">轮换客户端 Key</button><button id="btn-gateway-stop" class="secondary" type="button">停止网关</button>
-        <div id="gateway-error" class="error" hidden></div>
-        <div class="split-heading"><h4>渠道与模型别名</h4><button id="btn-channel-new" class="secondary" type="button">添加渠道</button></div>
-        <p class="hints">别名（alias）是客户端请求使用的模型名；上游模型名不同可单独填写映射。新密钥不会保留到本地磁盘。</p>
+        <div class="panel-head"><div><p class="eyebrow">02 / 聚合与实时监控</p><h2>聚合多个渠道，盯住每一次转发</h2><p>把多个渠道（OpenAI 兼容、Anthropic Messages 或统一中转站）映射到一个本地 API Base URL（模型别名决定路由），并实时监控每个渠道：模型自述不符、响应截断、usage 异常、错误率与 TTFT 偏高都会告警；每个模型可配置价格，费用按已结算用量累计（账本保留逐笔记录）。</p></div><span class="panel-kicker">LOCAL GATEWAY</span></div>
+        <div class="metric-strip"><div class="metric"><div class="metric-label">路由方式</div><div class="metric-value">模型别名直达</div></div><div class="metric"><div class="metric-label">支持协议</div><div class="metric-value">OpenAI · Anthropic · 统一</div></div><div class="metric"><div class="metric-label">上游密钥</div><div class="metric-value">仅内存保管</div></div></div>
+        <div class="note"><strong>四步启用：</strong>① 添加渠道并配置模型与可选价格（可一键获取模型或手动添加，网关启动前也可完成）；② 点「启动本地 API」生成接入地址与虚拟客户端 Key；③ 在下方实时监控每个渠道的用量、费用与异常；④ 复制 Base URL 与虚拟 Key 完成客户端接入。每个模型别名固定路由到一个渠道，不自动重试或跨渠道回退。</div>
+        <div class="split-heading"><h4>① 渠道与模型</h4><div class="channel-form-actions"><button id="btn-channel-new" class="secondary" type="button">添加渠道</button></div></div>
+        <p class="hints">别名（alias）是客户端请求使用的模型名。上游 Base URL 需包含版本段（如 /v1；Anthropic 官方为 https://api.anthropic.com/v1），网关按协议在其后拼接 /chat/completions、/responses 或 /messages。协议选「统一」适配同时支持 OpenAI 与 Anthropic 格式的中转站：按客户端请求格式原样转发，无需区分两者。渠道配置保存在本控制台进程内存中：网关启停不清空，重启控制台需重新录入。</p>
         <div id="channel-list" class="channel-list"></div>
         <form id="channel-form" class="channel-form" hidden>
           <input id="f-channel-id" type="hidden">
-          <div class="row"><div><label for="f-channel-label">渠道名称 *</label><input id="f-channel-label" type="text" required placeholder="例如：主力中转站"></div><div><label for="f-channel-base-url">上游 OpenAI API Base URL *</label><input id="f-channel-base-url" type="text" required placeholder="https://api.example.com/v1"></div></div>
-          <div class="row"><div><label for="f-channel-key">上游 API Key <span id="channel-key-help">*</span></label><input id="f-channel-key" type="password" autocomplete="new-password" placeholder="sk-…；仅在本机服务内存中保管"></div><div><label for="f-channel-models">对外模型别名 *</label><input id="f-channel-models" type="text" required placeholder="例如：fast-model,reasoning-model"></div></div>
-          <div class="row"><div><label for="f-channel-map">上游模型映射（选填，每行 alias=upstream-model）</label><textarea id="f-channel-map" placeholder="fast-model=gpt-4o-mini&#10;reasoning-model=claude-sonnet-4"></textarea></div></div>
-          <div class="channel-form-actions"><button id="btn-channel-save" class="primary" type="submit">保存渠道</button><button id="btn-channel-cancel" class="secondary" type="button">取消</button></div>
+          <div class="row"><div><label for="f-channel-label">渠道名称 *</label><input id="f-channel-label" type="text" required placeholder="例如：主力中转站"></div><div><label for="f-channel-protocol">协议 *</label><select id="f-channel-protocol"><option value="unified">统一中转站（OpenAI 与 Anthropic 格式均支持）</option><option value="openai">OpenAI 兼容（Chat Completions / Responses）</option><option value="anthropic">Anthropic Messages</option></select></div></div>
+          <div class="row"><div><label for="f-channel-base-url">上游 API Base URL *</label><input id="f-channel-base-url" type="text" required placeholder="https://api.example.com/v1"></div><div><label for="f-channel-key">上游 API Key <span id="channel-key-help">*</span></label><input id="f-channel-key" type="password" autocomplete="new-password" placeholder="sk-…；仅在本机服务内存中保管"></div></div>
+          <div class="checks"><label><input id="f-channel-private" type="checkbox">允许本机/内网上游（本地模型、自建服务）</label></div>
+          <p class="hints">默认关闭：开启后该渠道可指向 127.0.0.1/内网地址（仅限字面量 IP）；公网域名解析到本机/内网仍会被拒绝（防 DNS rebinding）。</p>
+          <div class="split-heading"><h4>模型清单</h4><div class="channel-form-actions"><button id="btn-channel-probe" class="secondary" type="button">一键获取模型</button><button id="btn-model-add" class="secondary" type="button">手动添加一行</button></div></div>
+          <p class="hints">「一键获取」由本机服务端请求该渠道的 /models 列表（Key 不出本机）。每行左栏填上游模型名，右栏填对外别名（默认同名，可修改）。</p>
+          <div id="channel-model-rows" class="model-rows"></div>
+          <p id="channel-probe-status" class="hints" hidden></p>
+          <details id="channel-price-details"><summary>模型价格（可选 · 用于费用统计）</summary>
+            <p class="hints">不填价格：只统计 token。填写输入与输出单价（$/百万 tokens）后，「实时监控」会按模型累计费用（未配价的模型显示「—」）；缓存读取不填按输入价计。单次请求输入 tokens 超过阶梯阈值（如 1000000）时，整单按第二档价计（长上下文阶梯价）。价格随渠道保存，改价后仅新请求按新价计。</p>
+            <div id="channel-price-rows" class="price-rows"></div>
+          </details>
+          <div class="action-row"><button id="btn-channel-save" class="primary" type="submit">保存渠道</button><button id="btn-channel-cancel" class="secondary" type="button">取消</button></div>
         </form>
-        <div class="split-heading"><h4>用量与异常（实时）</h4><span class="hints">3 秒刷新 · 账本 reports/gateway-ledger.db</span></div>
+        <div class="split-heading"><h4>② 启动本地 API</h4><span class="hints">仅本机回环监听</span></div>
+        <div class="metric-strip"><div class="metric"><div class="metric-label">网关状态</div><div id="gateway-status" class="metric-value">未启动</div></div><div class="metric"><div class="metric-label">Base URL</div><div id="gateway-base-url" class="metric-value">等待启动</div></div><div class="metric"><div class="metric-label">虚拟客户端 Key</div><div id="gateway-client-key-state" class="metric-value">未生成</div></div></div>
+        <div class="row"><div><label for="f-gateway-port">本机监听端口（留空则自动分配）</label><input id="f-gateway-port" type="text" inputmode="numeric" placeholder="自动分配，或例如 8630"></div><div><label for="f-gateway-client-key">客户端虚拟 Key（仅启动期间可见）</label><input id="f-gateway-client-key" type="password" autocomplete="off" readonly placeholder="启动后生成；勿与任何上游 Key 混用"></div></div>
+        <div class="action-row"><button id="btn-gateway-start" class="primary" type="button">启动本地 API</button><button id="btn-gateway-rotate" class="secondary" type="button">轮换客户端 Key</button><button id="btn-gateway-stop" class="secondary" type="button">停止网关</button></div>
+        <div id="gateway-error" class="error" hidden></div>
+        <div class="split-heading"><h4>③ 实时监控 · 用量与异常</h4><span class="hints">3 秒刷新 · 账本 reports/gateway-ledger.db · 费用按渠道内配置的模型价格累计（usage 缺失的请求不计入费用）</span></div>
         <table id="gateway-usage" class="probes">
-          <thead><tr><th>模型别名</th><th>渠道</th><th>请求数</th><th>正常</th><th>错误</th><th>Prompt</th><th>Completion</th><th>TTFT p50</th><th>TTFT p95</th><th>usage 有效率</th></tr></thead>
+          <thead><tr><th>模型别名</th><th>渠道</th><th>请求数</th><th>正常</th><th>错误</th><th>Prompt</th><th>Completion</th><th>缓存</th><th>费用</th><th>TTFT p50</th><th>TTFT p95</th><th>TTFT 剔除</th><th>usage 有效率</th><th>usage 缺失/无效</th></tr></thead>
           <tbody id="gateway-usage-body"></tbody>
         </table>
-        <div class="split-heading"><h4>异常告警</h4><span class="hints">模型自述不符 / 错误率 / 截断 / usage 异常（每类 30 分钟冷却）</span></div>
+        <div class="split-heading"><h4>异常告警</h4><span class="hints">模型自述不符 / 错误率 / 截断 / usage 异常 / TTFT 偏高（每类 30 分钟冷却）</span></div>
         <ul id="gateway-alerts" class="findings"></ul>
-        <div class="split-heading"><h4>OpenAI 客户端接入</h4></div>
-        <div class="note">Base URL：<code id="gateway-copy-url">启动网关后显示</code>　·　客户端模型：查看上方已启用的别名　·　鉴权：使用本页显示的虚拟客户端 Key</div>
+        <div class="split-heading"><h4>④ 客户端接入</h4><span class="hints">Key 一律使用上方虚拟客户端 Key</span></div>
+        <div class="copy-row"><span class="hints">OpenAI 兼容客户端 Base URL（含 /v1）</span><code id="gateway-copy-url">启动网关后显示</code><button id="btn-gateway-copy-url" class="secondary" type="button">复制</button></div>
+        <div class="copy-row"><span class="hints">Anthropic 客户端 ANTHROPIC_BASE_URL（不带 /v1，如 Claude Code）</span><code id="gateway-copy-root">启动网关后显示</code><button id="btn-gateway-copy-root" class="secondary" type="button">复制</button></div>
+        <div class="copy-row"><span class="hints">可用模型：上方已启用渠道的别名（OpenAI 走 /v1/chat/completions 或 /v1/responses，Anthropic 走 /v1/messages）</span><button id="btn-gateway-copy-key" class="secondary" type="button">复制虚拟 Key</button></div>
       </section>
-      <section id="panel-reports" class="panel" hidden>
-        <div class="panel-head"><div><p class="eyebrow">04 / 可追溯结果</p><h2>检测历史与证据</h2><p>查看本机保存的报告、评分结果与版本化模型指纹基线。</p></div><button id="btn-reports-refresh" class="secondary" type="button">刷新列表</button></div>
+<section id="panel-reports" class="panel" hidden>
+<div class="panel-head"><div><p class="eyebrow">03 / 可追溯结果</p><h2>检测历史与证据</h2><p>查看本机保存的报告、评分结果与版本化模型指纹基线。</p></div><div class="panel-actions"><button id="btn-reports-refresh" class="secondary" type="button">刷新列表</button><button id="btn-reports-clear-keep" class="secondary" type="button">清理（保留最新）</button><button id="btn-reports-clear-all" class="danger" type="button">清空全部</button></div></div>
         <div class="note">报告保存在本机 <code>reports/</code> 目录。JSON 报告可直接展开评分卡；HTML 和 Markdown 报告保留为可分享的完整证据记录。</div>
-        <div class="hints">选择 JSON 查看检测维度与异常发现；其他格式通过本机报告查看器打开。</div><ul id="report-list"></ul><div id="history-error" class="error" hidden></div><div id="history-out"></div>
+        <div class="hints">选择 report-*.json 查看检测维度与异常发现；基线（baseline-*）与其他格式通过本机报告查看器打开。</div><ul id="report-list"></ul><div id="history-error" class="error" hidden></div><div id="history-out"></div>
       </section>
     </main>
   </div>

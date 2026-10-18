@@ -70,6 +70,29 @@ export function isPublicIpv4(ip: string): boolean {
   return true;
 }
 
+/** 渠道级 opt-in（allowPrivateUpstream）允许的本机/内网上游 IPv4 段：仅回环 + RFC1918 私网。
+ *  不放行 0.0.0.0/8、100.64.0.0/10（CGNAT）、169.254.0.0/16（含云元数据 169.254.169.254）、
+ *  保留/文档/评测段、组播/广播段与任何 IPv6——「允许本地模型」不扩展为「允许任意非公网」。 */
+export const ALLOWED_PRIVATE_IPV4_RANGES: ReadonlyArray<readonly [string, number]> = [
+  ['10.0.0.0', 8],
+  ['127.0.0.0', 8],
+  ['172.16.0.0', 12],
+  ['192.168.0.0', 16],
+];
+
+/** 是否为 opt-in 白名单内的私网 IPv4（见 ALLOWED_PRIVATE_IPV4_RANGES）。非法字面量返回 false。 */
+export function isAllowedPrivateIpv4(ip: string): boolean {
+  const value = ipv4ToInt(ip);
+  if (value === null) return false;
+  for (const [base, bits] of ALLOWED_PRIVATE_IPV4_RANGES) {
+    const baseValue = ipv4ToInt(base);
+    if (baseValue === null) continue;
+    const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+    if ((value & mask) >>> 0 === (baseValue & mask) >>> 0) return true;
+  }
+  return false;
+}
+
 export interface UpstreamUrlCheck {
   ok: boolean;
   url: URL | null;
@@ -79,8 +102,10 @@ export interface UpstreamUrlCheck {
 /**
  * baseUrl 语法/形状校验（不含 DNS 解析，DNS 在每个请求时重解析）：协议、凭证、query/fragment、
  * IPv6 字面量与私网 IPv4 字面量在此拒绝；域名型主机由请求时重解析再判。
+ * options.allowPrivate=true（渠道级 opt-in）时，IPv4 字面量额外接受回环 + RFC1918 白名单段。
  */
-export function validateUpstreamBaseUrl(raw: unknown): UpstreamUrlCheck {
+export function validateUpstreamBaseUrl(raw: unknown, options?: { allowPrivate?: boolean }): UpstreamUrlCheck {
+  const allowPrivate = options?.allowPrivate === true;
   const fail = (message: string): UpstreamUrlCheck => ({ ok: false, url: null, message });
   if (typeof raw !== 'string' || raw.trim() === '') {
     return fail(`baseUrl 非法：收到值 ${JSON.stringify(raw ?? null)}（空或非字符串）。示例：https://relay.example.com/v1`);
@@ -105,8 +130,14 @@ export function validateUpstreamBaseUrl(raw: unknown): UpstreamUrlCheck {
   if (host.startsWith('[') || host.includes(':')) {
     return fail(`baseUrl 的 IPv6 上游暂不支持（IPv6 未完整处理，按安全策略拒绝）：收到值 ${JSON.stringify(value)}。示例：https://relay.example.com/v1`);
   }
-  if (isIpv4Literal(host) && !isPublicIpv4(host)) {
-    return fail(`baseUrl 指向私网/保留/回环 IPv4（防 SSRF 拒绝）：收到值 ${JSON.stringify(value)}。示例：https://relay.example.com/v1`);
+  if (isIpv4Literal(host)) {
+    // opt-in 只放行白名单私网段；公网地址两种模式都放行（白名单判定不得反过来误伤公网字面量）
+    const allowed = isPublicIpv4(host) || (allowPrivate && isAllowedPrivateIpv4(host));
+    if (!allowed) {
+      return allowPrivate
+        ? fail(`baseUrl 的 IPv4 不在允许的私网范围（仅 127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、192.168.0.0/16；云元数据/链路本地/CGNAT/0.0.0.0 等一律拒绝）：收到值 ${JSON.stringify(value)}。示例：http://127.0.0.1:1234/v1`)
+        : fail(`baseUrl 指向私网/保留/回环 IPv4（防 SSRF 拒绝）：收到值 ${JSON.stringify(value)}。示例：https://relay.example.com/v1（本机/内网上游需在渠道勾选「允许本机/内网上游」）`);
+    }
   }
   return { ok: true, url, message: '' };
 }
@@ -120,19 +151,29 @@ export interface PinnedResult {
 /**
  * 每请求解析并校验：全部结果为公网 IPv4 才通过，返回钉定的具体 IP。
  * IPv6 结果、私网/保留地址、解析空结果或解析失败一律安全拒绝。
+ * allowPrivate=true（渠道级 opt-in）只放宽 IPv4 字面量（回环 + RFC1918 白名单）；
+ * 域名解析结果仍必须全部为公网 IPv4——防「公网域名重绑定到 127.0.0.1/内网」。
  */
 export async function resolvePinnedUpstream(input: {
   hostname: string;
   lookup: DnsLookup;
+  allowPrivate?: boolean;
 }): Promise<PinnedResult> {
+  const allowPrivate = input.allowPrivate === true;
   const host = input.hostname.endsWith('.') ? input.hostname.slice(0, -1) : input.hostname;
   if (host.startsWith('[') || host.includes(':')) {
     return { ok: false, ip: null, message: 'IPv6 上游暂不支持（未完整处理，按安全策略拒绝）' };
   }
   if (isIpv4Literal(host)) {
-    return isPublicIpv4(host)
-      ? { ok: true, ip: host, message: '' }
-      : { ok: false, ip: null, message: `上游主机 ${host} 为私网/保留/回环 IPv4，已拒绝（防 SSRF）` };
+    const allowed = isPublicIpv4(host) || (allowPrivate && isAllowedPrivateIpv4(host));
+    if (allowed) return { ok: true, ip: host, message: '' };
+    return allowPrivate
+      ? {
+          ok: false,
+          ip: null,
+          message: `上游主机 ${host} 不是允许的私网地址（仅 127.0.0.0/8、10.0.0.0/8、172.16.0.0/12、192.168.0.0/16；云元数据/链路本地/CGNAT/0.0.0.0 等一律拒绝），已拒绝（防 SSRF）`,
+        }
+      : { ok: false, ip: null, message: `上游主机 ${host} 为私网/保留/回环 IPv4，已拒绝（防 SSRF；本机/内网上游需在渠道勾选「允许本机/内网上游」）` };
   }
   let results: ResolvedAddress[];
   try {
@@ -150,7 +191,10 @@ export async function resolvePinnedUpstream(input: {
   }
   for (const entry of results) {
     if (entry.family !== 4 || !isPublicIpv4(entry.address)) {
-      return { ok: false, ip: null, message: `上游域名 ${host} 解析到非公网/保留地址 ${entry.address}，已拒绝（防 SSRF/DNS rebinding）` };
+      const hint = allowPrivate
+        ? '（该渠道已允许本机/内网上游：请改用字面量 IP（如 http://127.0.0.1:1234/v1）；域名解析结果仍须为公网地址）'
+        : '';
+      return { ok: false, ip: null, message: `上游域名 ${host} 解析到非公网/保留地址 ${entry.address}，已拒绝（防 SSRF/DNS rebinding）${hint}` };
     }
   }
   const first = results[0];

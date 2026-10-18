@@ -4,17 +4,19 @@ import { parseArgs } from 'node:util';
 import { runAudit } from './runner.js';
 import { createRng } from './random.js';
 import { buildBaseline, loadBaseline } from './baseline.js';
+import { loadTokenReference, type TokenReference } from './token-reference.js';
 import { writeReports, makeFileStamp } from './report/files.js';
 import { renderConsole } from './report/console.js';
 import { supportsColor } from './color.js';
 import { runGuard } from './guard/cli.js';
+import { parsePriceFlags } from './price-flags.js';
 import type { AuditReport, RunConfig } from './types.js';
 
 const HELP = `model-xray — audit OpenAI-compatible endpoints for fake or watered-down models
 
 Usage:
   model-xray test  --base-url <url> --key <key> --model <model> [options]
-      一次性审计：主动跑一轮探针（身份/上下文/计费/能力/质量/TTFT），产出评分报告后退出。
+      一次性审计：主动跑一轮探针（身份/上下文/计量/能力/质量/TTFT），产出评分报告后退出。
   model-xray guard --base-url <url> [options]
       常驻监控：本地透明转发代理，逐请求监听真实流量（模型一致性/token 统计/余额滚动对账），
       异常即时告警并写 JSONL 审计日志；详见 model-xray guard --help。
@@ -27,11 +29,19 @@ test Options:
   --expect <list>           Claimed capabilities, comma-separated from: vision,tool,thinking (or "none"; default: vision,tool)
   --price-input <n>         Claimed input price per 1M tokens, must be > 0 (with --price-output, enables measured-rate probe)
   --price-output <n>        Claimed output price per 1M tokens, must be > 0 (must appear with --price-input)
-  --retries <n>             Retries per request on 408/409/429/5xx, integer in [0, 3] (default: 0)
-                            注意：每次重试都会真实计费，默认不重试；开了重试会令实测倍率判定作废（防重复计费污染）
+  --price-cached-read <n>   Claimed cache-read price per 1M tokens, must be >= 0 (default: input price)
+  --price-threshold <n>     Long-context tier threshold in prompt tokens, positive integer (requires --price-input2/--price-output2)
+  --price-input2 <n>        Claimed input price per 1M tokens above the tier threshold, must be > 0
+  --price-output2 <n>       Claimed output price per 1M tokens above the tier threshold, must be > 0
+  --price-cached-read2 <n>  Claimed cache-read price above the tier threshold, must be >= 0 (default: input2 price)
+  --retries <n>             Retries per request on 408/409/429/5xx and 200 empty bodies, integer in [0, 3] (default: 1)
+                            注意：每次重试都会真实计费；默认重试 1 次以应对瞬时 5xx/空流，重试会令实测倍率判定作废（防重复计费污染）
   --baseline <path>         Compare fingerprints against a baseline file (seed is reused unless --seed)
   --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json)
+  --token-reference <path>  Compare prompt token counts against a prior audit report of the SAME model（识别全量等比虚增：线性回归对此不可见；须为同名模型、同题集版本的本工具 JSON 报告）
   --deep                    More samples (slower, more tokens)
+  --context-samples <n>     Context needle samples per depth, integer in [1, 5] (default: 1; --deep: 5;
+                            3 = statistical mode with confirmation resampling; higher = more confidence/cost)
   --seed <n>                Random seed, integer in [1, 2147483646] (default: time-based; with --baseline defaults to baseline seed)
   --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 60)
   --out <dir>               Report output directory (default: reports)
@@ -42,7 +52,7 @@ test Options:
   --version                 Print version
 
 Notes:
-  价格为「每百万 tokens 的宣称价格」，必须为正数；单位需与该站余额显示单位一致（美元/quota 均可），工具只算比值，不做单位换算。
+  价格为「每百万 tokens 的宣称价格」，核心输入/输出必须成对且为正数；缓存读可留空（按输入价），二档阶梯须同时提供阈值/二档输入/二档输出，二档缓存读留空按二档输入价。单位需与该站余额显示单位一致（美元/quota 均可），工具只算比值，不做单位换算。
   数值参数均按严格整数校验（不接受 "12abc"、前导空白等）；非法输入立即 exit 2 并给出正确示例。
   guard 子命令只读环境变量 MODEL_XRAY_KEY 作为密钥，且不提供 --key 旗标。
 
@@ -66,11 +76,18 @@ async function main(argv: string[]): Promise<number> {
         key: { type: 'string' },
         model: { type: 'string' },
         'claimed-context': { type: 'string' },
+        'context-samples': { type: 'string' },
         expect: { type: 'string' },
         'price-input': { type: 'string' },
         'price-output': { type: 'string' },
+        'price-cached-read': { type: 'string' },
+        'price-threshold': { type: 'string' },
+        'price-input2': { type: 'string' },
+        'price-output2': { type: 'string' },
+        'price-cached-read2': { type: 'string' },
         baseline: { type: 'string' },
         'baseline-out': { type: 'string' },
+        'token-reference': { type: 'string' },
         deep: { type: 'boolean', default: false },
         seed: { type: 'string' },
         timeout: { type: 'string' },
@@ -133,6 +150,13 @@ async function main(argv: string[]): Promise<number> {
     if (claimedContext === null) return 2;
   }
 
+  let contextSamples: number | undefined;
+  if (values['context-samples'] !== undefined) {
+    const parsed = strictInt(values['context-samples'], 1, 5, 'context-samples', '1');
+    if (parsed === null) return 2;
+    contextSamples = parsed;
+  }
+
   const expectAllowed = ['vision', 'tool', 'thinking'] as const;
   const expectRaw = (values.expect ?? 'vision,tool').trim();
   let expect: string[] = [];
@@ -147,22 +171,20 @@ async function main(argv: string[]): Promise<number> {
     expect = [...new Set(tokens)];
   }
 
-  const priceInputRaw = values['price-input'];
-  const priceOutputRaw = values['price-output'];
-  let priceInput: number | null = null;
-  let priceOutput: number | null = null;
-  if (priceInputRaw !== undefined || priceOutputRaw !== undefined) {
-    if (priceInputRaw === undefined || priceOutputRaw === undefined) {
-      console.error('--price-input 与 --price-output 必须成对出现。');
-      console.error('示例：--price-input 2.5 --price-output 10');
-      return 2;
-    }
-    const parsedInput = positiveNumber(priceInputRaw, 'price-input');
-    const parsedOutput = positiveNumber(priceOutputRaw, 'price-output');
-    if (parsedInput === null || parsedOutput === null) return 2;
-    priceInput = parsedInput;
-    priceOutput = parsedOutput;
+  const priceFlags = parsePriceFlags({
+    'price-input': values['price-input'],
+    'price-output': values['price-output'],
+    'price-cached-read': values['price-cached-read'],
+    'price-threshold': values['price-threshold'],
+    'price-input2': values['price-input2'],
+    'price-output2': values['price-output2'],
+    'price-cached-read2': values['price-cached-read2'],
+  });
+  if (priceFlags.error !== null) {
+    console.error(priceFlags.error);
+    return 2;
   }
+  const price = priceFlags.price;
 
   // --baseline fail-fast：文件不存在 / 基线畸形都立即 exit 2，不发起任何请求（runner 内的 catch 降级仅供库调用方）
   let baselineData: ReturnType<typeof loadBaseline> | null = null;
@@ -187,6 +209,29 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
+  // --token-reference fail-fast：文件不存在 / 参考报告非法都立即 exit 2，不发起任何请求
+  let tokenReference: TokenReference | null = null;
+  if (values['token-reference'] !== undefined) {
+    let readable = false;
+    try {
+      readable = statSync(values['token-reference']).isFile();
+    } catch {
+      readable = false;
+    }
+    if (!readable) {
+      console.error(`--token-reference 文件不存在或不可读：${values['token-reference']}`);
+      console.error('示例：--token-reference reports/report-2026-01-01T00-00-00-000Z.json');
+      return 2;
+    }
+    try {
+      tokenReference = loadTokenReference(values['token-reference']);
+    } catch (error) {
+      console.error(`--token-reference 参考报告非法：${error instanceof Error ? error.message : String(error)}`);
+      console.error('下一步：用本工具生成的报告 JSON（含 meta 与 billing outcomes），或重新生成参考后重试。');
+      return 2;
+    }
+  }
+
   // seed 沿用：提供 --baseline 且未显式 --seed 时，用基线文件的 seed（保证题集可比）；显式 --seed 优先。
   let seed: number;
   if (values.seed !== undefined) {
@@ -200,7 +245,7 @@ async function main(argv: string[]): Promise<number> {
   }
   const timeoutSeconds = values.timeout !== undefined ? strictInt(values.timeout, 1, 3600, 'timeout', '60') : 60;
   if (timeoutSeconds === null) return 2;
-  const retries = values.retries !== undefined ? strictInt(values.retries, 0, 3, 'retries', '1') : 0;
+  const retries = values.retries !== undefined ? strictInt(values.retries, 0, 3, 'retries', '1') : 1;
   if (retries === null) return 2;
 
   const cfg: RunConfig = {
@@ -210,6 +255,7 @@ async function main(argv: string[]): Promise<number> {
     claimedContext,
     expect,
     deep: values.deep === true,
+    contextSamples,
     seed,
     timeoutMs: timeoutSeconds * 1000,
     retries,
@@ -217,16 +263,25 @@ async function main(argv: string[]): Promise<number> {
     html: true,
     yes: values.yes === true,
     quiet: values.quiet === true,
-    priceInput,
-    priceOutput,
+    priceInput: price?.input ?? null,
+    priceOutput: price?.output ?? null,
+    priceCachedRead: price?.cachedRead ?? null,
+    priceThreshold: price?.threshold ?? null,
+    priceInput2: price?.input2 ?? null,
+    priceOutput2: price?.output2 ?? null,
+    priceCachedRead2: price?.cachedRead2 ?? null,
     baselineIn: values.baseline ?? null,
     baselineOut: values['baseline-out'] ?? null,
+    tokenReference,
   };
 
   const cost = estimateCost(cfg);
   console.error(
     `预估：约 ${cost.calls} 次请求 / ~${cost.inputTokens.toLocaleString('en-US')} 输入 tokens（不含输出与重试；seed=${seed}）。`,
   );
+  if (cost.inputTokens >= 500000) {
+    console.error('提示：本轮预估输入 tokens 较大；低成本筛查可先用默认档（或 --claimed-context 32000），定论再用 --deep。');
+  }
 
   if (values['dry-run']) {
     console.error('dry-run：未发送任何请求。');
@@ -248,10 +303,24 @@ async function main(argv: string[]): Promise<number> {
   }
 
   let report: AuditReport;
+  // WebUI 由 serve.mjs 注入 MODEL_XRAY_PROGRESS=1：输出阶段与每请求进度，避免长上下文探针看起来「卡死」。
+  // 直接跑 CLI 时保持原有简洁输出；需要进度可自行设置该环境变量。
+  const onActivity =
+    process.env.MODEL_XRAY_PROGRESS === '1' && !cfg.quiet
+      ? (message: string) => {
+          console.error(message);
+        }
+      : undefined;
   try {
-    report = await runAudit(cfg, (id, outcome) => {
-      if (!cfg.quiet) console.error(`[${outcome.level.toUpperCase()}] ${id} — ${outcome.headline}`);
-    });
+    report = await runAudit(
+      cfg,
+      (id, outcome) => {
+        if (!cfg.quiet) console.error(`[${outcome.level.toUpperCase()}] ${id} — ${outcome.headline}`);
+      },
+      // 复用 fail-fast 阶段已校验的基线：探针执行后不再重读磁盘（文件中途损坏不至于静默丢指纹对比）
+      baselineData ?? undefined,
+      onActivity,
+    );
   } catch (error) {
     console.error(`审计失败：${error instanceof Error ? error.message : String(error)}`);
     console.error('下一步：检查端点可达性与 --base-url 拼写（通常以 /v1 结尾），或加大 --timeout 后重试。');
@@ -262,14 +331,18 @@ async function main(argv: string[]): Promise<number> {
   const stamp = makeFileStamp(new Date(), cfg.model);
   let written;
   try {
-    // 每轮审计默认落盘指纹基线（可用 --baseline-out 指定路径），供后续 --baseline 复测对比
-    const baseline = buildBaseline(report.outcomes, {
-      model: report.meta.model,
-      seed: report.meta.seed,
-      probesetVersion: report.meta.probesetVersion,
-      assetsVersion: report.meta.assetsVersion,
-      createdAt: report.meta.startedAt,
-    });
+    // 每轮审计默认落盘指纹基线（可用 --baseline-out 指定路径），供后续 --baseline 复测对比。
+    // 零可评分项（配额耗尽/端点全挂）不写基线：空指纹会被后续 --baseline 当成有效参照，产生假漂移。
+    const hasScorableOutcome = report.outcomes.some((outcome) => outcome.score !== null);
+    const baseline = hasScorableOutcome
+      ? buildBaseline(report.outcomes, {
+          model: report.meta.model,
+          seed: report.meta.seed,
+          probesetVersion: report.meta.probesetVersion,
+          assetsVersion: report.meta.assetsVersion,
+          createdAt: report.meta.startedAt,
+        })
+      : null;
     written = writeReports(report, cfg.outDir, stamp, baseline, cfg.baselineOut);
   } catch (error) {
     console.error(`报告写入失败：${error instanceof Error ? error.message : String(error)}`);
@@ -286,7 +359,9 @@ async function main(argv: string[]): Promise<number> {
   if (written.baselinePath) console.error(`  ${written.baselinePath}`);
 
   if (report.overall === 'fail') return 1;
-  if (report.overall === 'unknown') {
+  // total=null 表示没有任何足够的可评分证据（哪怕个别维度给出 warn 线索）——按契约属于「未得出结论」，
+  // 退出码必须是 2，避免配额耗尽/端点全挂的一轮被脚本误当成「可疑但已完成」。
+  if (report.total === null || report.overall === 'unknown') {
     console.error('审计未能得出结论（可评分项不足）。请核对 API key、端点可达性与模型名后重试；详见报告 notes。');
     return 2;
   }
@@ -303,21 +378,31 @@ export function isLocalEndpoint(rawUrl: string): boolean {
 }
 
 export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: number } {
-  const contextSamples = cfg.deep ? 5 : 3;
-  const contextDepths = 4;
+  const contextSamples = cfg.contextSamples ?? (cfg.deep ? 5 : 1);
   const claimed = cfg.claimedContext ?? 32000;
-  const contextCalls = contextSamples * contextDepths + 2;
-  const contextTokens = Math.round(contextCalls * claimed * 0.41);
+  // context：samples × 4 深度 + 结尾回显 1。标准低成本档不复采；3 样本统计档最多复核
+  // 3 档 × 2 样本；deep 边界扫描最多 18 发。按各深度实际比例累加，不再用 0.41 的低估系数。
+  const confirmSamples = cfg.deep ? 3 : (cfg.contextConfirmSamples ?? 2);
+  const confirmCalls = cfg.deep ? 18 : contextSamples >= 3 ? 3 * confirmSamples : 0;
+  const contextCalls = contextSamples * 4 + 1 + confirmCalls;
+  const contextUnits = contextSamples * 2.4 + 0.9 + (cfg.deep ? 18 * 0.55 : contextSamples >= 3 ? 3 * confirmSamples * 0.65 : 0);
+  const contextTokens = Math.round(contextUnits * claimed);
+  // billing：2 语言 × 目标长度档位，逐档累加（标准 5 档 2k/4k/8k/16k/24k；deep 6 档含 32k）
+  const billingLevels = cfg.billingLevels ?? (cfg.deep ? [2000, 4000, 8000, 16000, 24000, 32000] : [2000, 4000, 8000, 16000, 24000]);
+  const billingCalls = 2 * billingLevels.length;
+  const billingInputTokens = Math.round(2 * billingLevels.reduce((sum, n) => sum + n, 0) * 1.1);
   const calls =
     contextCalls +
+    billingCalls +
     // identity 自述 5 次（deep 8 次）+ 1 次格式合规 + 1 次诱饵
     (cfg.deep ? 10 : 7) +
-    10 +
     (cfg.expect.includes('vision') ? 3 : 0) +
     (cfg.expect.includes('tool') ? 2 : 0) +
-    (cfg.deep ? 24 : 16) +
-    17;
-  const inputTokens = contextTokens + 20000 + (cfg.expect.includes('vision') ? 1200 : 0);
+    15 + // quality 题集（与模式无关，恒 15 题）
+    // quality 主问题复采样上限（仅干净答错时触发；最坏 +12）
+    12 +
+    9; // ttft 观测：5 串行 + 1 轮 4 并发（重试不计入）
+  const inputTokens = contextTokens + billingInputTokens + 15000 + (cfg.expect.includes('vision') ? 1200 : 0);
   return { calls, inputTokens };
 }
 
@@ -359,30 +444,31 @@ export function strictInt(raw: string, min: number, max: number, name: string, e
   return value;
 }
 
-/** 严格正数解析（价格）：必须形如数字、Number() 后有限且 > 0；空串/0/负数/非数字一律报错。 */
-export function positiveNumber(raw: string, name: string): number | null {
-  const fail = (): null => {
-    console.error(`--${name} 必须为正数（每百万 tokens 宣称价格）。收到：${JSON.stringify(raw)}。`);
-    console.error(`示例：--${name === 'price-input' ? 'price-input 2.5' : 'price-output 10'}（与另一价格 flag 成对使用）`);
-    return null;
-  };
-  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return fail();
-  const value = Number(raw);
-  if (!Number.isFinite(value) || value <= 0) return fail();
-  return value;
-}
-
 const invokedDirectly = process.argv[1] !== undefined && process.argv[1].replace(/\\/g, '/').endsWith('/cli.js');
 if (invokedDirectly) {
   main(process.argv.slice(2))
     .then((code) => {
       process.exitCode = code;
+      scheduleExitGuard(code);
     })
     .catch((error) => {
       console.error(`未捕获错误：${error instanceof Error ? error.stack : String(error)}`);
       console.error('下一步：带上完整命令与该堆栈反馈问题；重跑时可先 --dry-run 验证参数。');
       process.exitCode = 2;
+      scheduleExitGuard(2);
     });
+}
+
+/**
+ * F4 退出兜底：main 已返回、报告已同步写盘，但未知句柄（socket keep-alive/连接池等）可能挂住事件循环，
+ * 令进程迟迟不退出、退出码契约失守。10s 后仍存活即强制 exit(code)。
+ * timer.unref()：健康路径不等这个定时器（进程自然退出），只有被挂住时它才生效。
+ */
+export function scheduleExitGuard(code: number, delayMs = 10_000): void {
+  const timer = setTimeout(() => {
+    process.exit(code);
+  }, delayMs);
+  timer.unref();
 }
 
 export { main };

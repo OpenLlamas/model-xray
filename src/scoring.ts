@@ -7,7 +7,8 @@ export const WEIGHTS: Record<ProbeId, number> = {
   identity: 15,
   context: 15,
   capability: 10,
-  ttft: 10,
+  // TTFT 仅观测，不参与总分；权重必须为 0，避免未来误接分数时把观测项算进可信度。
+  ttft: 0,
   decoy: 0,
 };
 
@@ -16,6 +17,16 @@ export const PROBE_ORDER: readonly ProbeId[] = ['identity', 'context', 'billing'
 export const HARD_RED: ReadonlySet<ProbeId> = new Set<ProbeId>(['billing', 'capability', 'context', 'quality']);
 
 const HARD_RED_CAP = 45;
+
+/** 最低评分覆盖率：低于该比例不出总分（避免「只测了 billing 就报 96」）。 */
+export const MIN_COVERAGE = 0.6;
+
+export interface ScoreScope {
+  /** 本轮是否提供 --claimed-context（未提供时 context 不计入覆盖率分母）。 */
+  claimedContext?: boolean;
+  /** 本轮声明需要核验的能力（空数组=未声明，capability 不计入覆盖率分母）。 */
+  expectedCapabilities?: readonly string[];
+}
 
 /** capability 被证伪（存在 fail 级异常）时的可信度总分上限：标称能力实测答错/被明确拒绝，一票压制。 */
 export const CAPABILITY_FALSIFIED_CAP = 60;
@@ -27,7 +38,7 @@ export interface ScoreResult {
   notes: string[];
 }
 
-export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
+export function computeTotal(outcomes: readonly ProbeOutcome[], scope: ScoreScope = {}): ScoreResult {
   const notes: string[] = [];
   const scores: ScoreEntry[] = [];
 
@@ -44,10 +55,23 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
     });
   }
 
+  // 覆盖率分母只包含「本轮实际声称/应测」的维度：未提供 --claimed-context、--expect none
+  // 属于用户主动不测，不应被当成「证据缺失」；反之 quality/billing 是每轮必测的核心维度。
+  const contextInScope = scope.claimedContext ?? true;
+  const capabilityInScope = scope.expectedCapabilities === undefined ? true : scope.expectedCapabilities.length > 0;
+  const inScope = (id: ProbeId): boolean => {
+    if (id === 'context') return contextInScope;
+    if (id === 'capability') return capabilityInScope;
+    return WEIGHTS[id] > 0;
+  };
+  const scopedScores = scores.filter((s) => inScope(s.id));
+
   // Number.isFinite 守卫：NaN/Infinity 一旦混入按未判定处理（入 unscorable note），
   // 绝不让其进入对数聚合后被 clampScore 洗成总分 0 的静默错误。
-  const scorable = scores.filter((s) => s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score));
-  const unscorable = scores.filter((s) => !(s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score)));
+  const isScorable = (s: ScoreEntry): boolean =>
+    s.status === 'ok' && typeof s.score === 'number' && Number.isFinite(s.score);
+  const scorable = scopedScores.filter(isScorable);
+  const unscorable = scopedScores.filter((s) => !isScorable(s));
 
   // 标称能力被证伪：capability findings 存在 fail 级异常（真实答错或端点明确拒绝）。
   // fail 只由实测证据产生（429/超时/5xx/starved 全走 warn/na），故此条件足以定「证伪」。
@@ -55,27 +79,51 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
     (o) => o.id === 'capability' && o.findings.some((f) => f.level === 'fail'),
   );
 
+  const anyFail = scores.some((s) => s.level === 'fail');
+  const anyWarn = scores.some((s) => s.level === 'warn');
+  const inconclusiveLevel: Level = anyFail || capabilityFalsified ? 'fail' : anyWarn ? 'warn' : 'unknown';
+
   if (scorable.length < 2) {
     notes.push('可评分项不足（<2），总分未判定，仅展示分项结论。');
-    const anyFail = scores.some((s) => s.level === 'fail');
-    const anyWarn = scores.some((s) => s.level === 'warn');
-    return {
-      total: null,
-      overall: anyFail || capabilityFalsified ? 'fail' : anyWarn ? 'warn' : 'unknown',
-      scores,
-      notes,
-    };
-  }
-
-  if (unscorable.length > 0) {
-    notes.push(
-      `未判定项（不参与总分，权重已重新归一化）：${unscorable.map((s) => `${s.id}(${s.headline})`).join('、')}`,
-    );
+    return { total: null, overall: inconclusiveLevel, scores, notes };
   }
 
   if (scorable.some((s) => (s.score as number) <= 0)) {
     notes.push('存在 0 分项，总分直接判定为 0（不做对数平滑兜底）。');
     return { total: 0, overall: 'fail', scores, notes };
+  }
+
+  // 核心维度（billing/quality）不可测时不出总分：端点连控制题/用量都无法给出有效证据，
+  // 其余维度的高分不能外推为整体可信度（真机实证：quality 全空 + billing 100 曾报 96）。
+  const unscorableById = new Map(unscorable.map((s) => [s.id, s]));
+  const missingCore = (['billing', 'quality'] as const)
+    .map((id) => unscorableById.get(id))
+    .filter((s): s is ScoreEntry => s !== undefined);
+  if (missingCore.length > 0) {
+    notes.push(
+      `总分不出：核心维度 ${missingCore.map((s) => `${s.id}（${s.headline}）`).join('、')} 未获得有效证据；核心维度不可测时，其余维度的分数不能外推为整体可信度。`,
+    );
+    return { total: null, overall: inconclusiveLevel, scores, notes };
+  }
+
+  const totalWeight = scopedScores.reduce((acc, s) => acc + s.weight, 0);
+  const scoredWeight = scorable.reduce((acc, s) => acc + s.weight, 0);
+  const coverage = totalWeight > 0 ? scoredWeight / totalWeight : 0;
+  const coveragePct = Math.round(coverage * 100);
+  const unscorableList = unscorable.map((s) => `${s.id}(${s.headline})`).join('、');
+
+  if (unscorable.length > 0) {
+    notes.push(`未判定项（不参与总分）：${unscorableList}`);
+    notes.push(
+      `评分覆盖：已判定 ${scoredWeight}/${totalWeight} 权重（${coveragePct}%）；总分仅在已判定维度内归一化，未判定维度不能视为通过。`,
+    );
+  }
+
+  if (coverage < MIN_COVERAGE) {
+    notes.push(
+      `总分不出：评分覆盖不足（${scoredWeight}/${totalWeight} 权重，${coveragePct}% < ${Math.round(MIN_COVERAGE * 100)}%）。`,
+    );
+    return { total: null, overall: inconclusiveLevel, scores, notes };
   }
 
   const weightSum = scorable.reduce((acc, s) => acc + s.weight, 0);
@@ -95,7 +143,6 @@ export function computeTotal(outcomes: readonly ProbeOutcome[]): ScoreResult {
   }
 
   const rounded = clampScore(total);
-  const anyFail = scores.some((s) => s.level === 'fail');
   let overall: Level;
   if (anyFail || capabilityFalsified || rounded < 40) overall = 'fail';
   else if (rounded < 75 || scores.some((s) => s.level === 'warn')) overall = 'warn';

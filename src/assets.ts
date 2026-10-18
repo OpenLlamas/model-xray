@@ -1,10 +1,13 @@
 import type { Rng } from './types.js';
 import { estimateTokens } from './tokens.js';
 
+// v0.2.2：quality 探针抗噪——主问题干净答错时复采样一次（temperature 0.7），按两次机会口径（首答 + 一次
+// 独立复采样取优）评分；恢复率异常偏高按可疑处理（防端点识别重复提问后策略性作答）。
+// 评分口径变化 → 旧基线不可比，需重新生成。
 // v0.2.1：identity 探针加强——自述样本 3→5（deep 8）、falsified 改全体一致判定、新增 claimed_version
 // 旁证；为此 IDENTITY_QUESTIONS 题池 5→7（deep 档需 7 道随机题 + 1 道固定版本自述题）。
 // 题集内容与判定口径变化 → 基线不可比。
-export const PROBESET_VERSION = 'v0.2.1';
+export const PROBESET_VERSION = 'v0.2.2';
 export const ASSETS_VERSION = 'assets-v0.1.0';
 
 /** Base paragraphs used to construct long context probes. Deterministic given seed. */

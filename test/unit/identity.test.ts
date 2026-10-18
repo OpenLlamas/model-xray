@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { probeIdentity } from '../../src/probes/identity.js';
+import { detectPersonaBrands, probeIdentity } from '../../src/probes/identity.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
@@ -10,6 +10,7 @@ function starvedResult(text: string): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'length',
+    model: null,
     text,
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 512, total_tokens: 522 },
@@ -28,6 +29,7 @@ function okResult(text: string): ChatResult {
     ok: true,
     status: 200,
     finishReason: 'stop',
+    model: null,
     text,
     reasoning: null,
     usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
@@ -83,6 +85,7 @@ function makeCtx(client: OpenAIClient, overrides: Partial<RunConfig> = {}): Prob
     seed: 1,
     timeoutMs: 1000,
     retries: 0,
+    streamFallback: false,
     outDir: 'reports',
     html: false,
     yes: true,
@@ -148,6 +151,75 @@ test('identity: schema probe starved → no deduction, no gateway-rewrite WARN, 
   assert.equal(outcome.metrics['schema_compliant'], 'N/A');
   assert.ok(!outcome.findings.some((f) => /网关可能重写响应/.test(f.message)), JSON.stringify(outcome.findings));
   assert.ok(outcome.findings.some((f) => /预算不足无法判定格式合规/.test(f.message)));
+});
+
+test('identity: 仅 1 条有效自述（其余空流）→ insufficient 不出分，即使声明目标族也不得 PASS 100', async () => {
+  const { client } = stubClient([
+    okResult('I am gpt-4o, made by OpenAI.'),
+    okResult(''),
+    okResult(''),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, null);
+  assert.match(outcome.headline, /有效自述样本不足（1 条）/);
+});
+
+test('identity: non-stream blank self-id falls back to stream and recovers (disclosed, no N/A)', async () => {
+  const [first, ...rest] = gptSelfResults();
+  const { client, requests } = stubClient([
+    { ...okResult(''), finishReason: null, error: 'empty stream' },
+    first!,
+    ...rest,
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const ctx = makeCtx(client);
+  ctx.cfg.streamFallback = true;
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['samples'], 5);
+  assert.equal(outcome.metrics['blank_retried'], 1);
+  assert.equal(outcome.metrics['stream_fallbacks'], 1);
+  assert.equal(requests.length, 7);
+  assert.equal(requests.filter((r) => r.stream === true).length, 1);
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /流式回退/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: schema probe blank (HTTP 200 empty) → N/A metric, info only, no gateway-rewrite WARN', async () => {
+  // 200 空文本是「未获得答案」，不是「未按结构返回」：不得扣分或告警（空响应 ≠ 格式不合规）。
+  const { client } = stubClient([...gptSelfResults(), okResult('')]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.metrics['schema_compliant'], 'N/A');
+  assert.ok(!outcome.findings.some((f) => /网关可能重写响应/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /格式合规探针返回空文本/.test(f.message)));
+});
+
+test('identity: identical non-empty self-ids amid blank samples → template WARN (blanks do not dilute)', async () => {
+  // 2 个空响应不应稀释「其余 3 个有效自述逐字一致」的信号（旧口径按 5 样本算，漏检）。
+  const same = 'I am gpt-4o, made by OpenAI.';
+  const { client } = stubClient([
+    okResult(same),
+    okResult(''),
+    okResult(same),
+    okResult(''),
+    okResult(same),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['samples'], 5);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /逐字一致/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+  assert.ok(typeof outcome.score === 'number' && outcome.score <= 70);
 });
 
 // ---------- v0.2.1：自述样本数 5（deep 8）+ 固定版本自述题 ----------
@@ -224,6 +296,122 @@ test('identity: version mismatch (claimed 4.5 vs target 5.3) → warn, score ≤
   assert.equal(outcome.score, 90);
   assert.equal(outcome.level, 'warn');
   assert.ok(String(outcome.metrics['claimed_version']).includes('4.5'));
+});
+
+test('identity: 上游回显更窄变体（请求 gpt-4o 回显 gpt-4o-mini）→ warn + 压分，冒充线索可见', async () => {
+  // 换壳方不改写回显字段时的唯一机器证据：自述可被「教」，回显字段不会。
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...gptSelfResults(), schemaOk()], 'gpt-4o-mini'));
+  const ctx = makeCtx(client, { model: 'gpt-4o' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  const warn = outcome.findings.find((f) => /上游回显/.test(f.message));
+  assert.ok(warn, JSON.stringify(outcome.findings));
+  assert.equal(warn?.level, 'warn');
+  assert.equal(outcome.score, 60);
+  assert.equal(outcome.level, 'warn');
+  assert.ok(/疑似换壳/.test(outcome.headline), outcome.headline);
+  assert.equal(outcome.metrics['model_echo_values'], 'gpt-4o-mini');
+});
+
+test('identity: 少数回显不一致（2/6）也只给 80，不得接近满分', async () => {
+  // 真机实证（2026-10-18）：请求 glm-5.3-flash，6 次中 2 次回显 deepseek-flash，旧口径给 90。
+  const results = [...glmNoVersionSelfResults(), schemaOk()].map((r, i) => ({
+    ...r,
+    model: i < 2 ? 'deepseek-flash' : 'glm-5.3-flash',
+  }));
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['model_echo'], '4/6');
+  assert.equal(outcome.score, 80);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /2\/6/);
+});
+
+test('identity: 回显被网关规范化（厂商前缀 + 日期钉版 / 滚动别名）不算异常，不诬告', async () => {
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  for (const alias of ['openai/gpt-4o-2024-08-06', 'gpt-4o-latest', 'gpt-4o']) {
+    const { client } = stubClient(echo([...gptSelfResults(), schemaOk()], alias));
+    const ctx = makeCtx(client, { model: 'gpt-4o' });
+    const outcome = await probeIdentity(ctx);
+    assert.equal(outcome.status, 'ok', alias);
+    assert.equal(outcome.score, 100, alias);
+    assert.equal(outcome.level, 'pass', alias);
+    assert.equal(outcome.metrics['model_echo'], '6/6', alias);
+    assert.ok(!outcome.findings.some((f) => /上游回显/.test(f.message)), `${alias}: ${JSON.stringify(outcome.findings)}`);
+  }
+});
+
+test('identity: 回显仅分隔符不同（glm-5.3-flash ↔ glm-5-3-flash）不算异常', async () => {
+  // 实证来源：[中转站] 同一模型混用点号/连字符回显，不归一会误判成换壳。
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...glmNoVersionSelfResults(), schemaOk()], 'glm-5-3-flash'));
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.ok(!outcome.findings.some((f) => /上游回显/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.equal(outcome.metrics['model_echo'], '6/6');
+});
+
+test('identity: 请求带日期钉版、回显被规范化成短名 → 不算异常', async () => {
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...gptSelfResults(), schemaOk()], 'gpt-4o'));
+  const ctx = makeCtx(client, { model: 'openai/gpt-4o-2024-08-06' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.metrics['model_echo'], '6/6');
+  assert.ok(!outcome.findings.some((f) => /上游回显/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: starved sample still contributes model echo mismatch', async () => {
+  // starved 样本文本不可用，但 HTTP 回显的 model 字段仍是换壳/换通道的机器证据，不能一并丢弃。
+  const starved = { ...starvedResult('{"a":'), model: 'deepseek-flash' };
+  const empty = (model: string): ChatResult => ({ ...okResult(''), model });
+  const schema = { ...okResult(COMPLETE_SCHEMA_JSON), model: 'glm-5.3-flash' };
+  const { client } = stubClient([
+    starved,
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    schema,
+  ]);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  // 自述全部空响应时不能以「证据不足」掩盖回显不一致：回显是独立机器证据，按 warn 报出；
+  // 但不给分（status insufficient / score null），避免「没核验到身份却拿 90 分」抬高中分。
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /自述全部空响应.*上游回显模型与请求不一致/);
+  assert.equal(outcome.metrics['model_echo'], '5/6');
+  assert.ok(String(outcome.metrics['model_echo_values']).includes('deepseek-flash'));
+  const echoWarn = outcome.findings.find((f) => f.level === 'warn' && /上游回显/.test(f.message));
+  assert.ok(echoWarn, JSON.stringify(outcome.findings));
+  assert.ok(echoWarn?.evidenceIds.includes('ev-001'), 'starved 样本的回显证据应被引用');
+  assert.equal(echoWarn?.evidenceIds.length, 6);
+});
+
+test('identity: all-empty responses without model echo mismatch stay insufficient (no false accusation)', async () => {
+  // 回显一致但正文全空：仍应诚实降级为证据不足，不得凭空给 warn/分数。
+  const empty = (model: string | null): ChatResult => ({ ...okResult(''), model });
+  const schema = { ...okResult(''), model: 'glm-5.3-flash' };
+  const { client } = stubClient([
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    empty('glm-5.3-flash'),
+    schema,
+  ]);
+  const outcome = await probeIdentity(makeCtx(client, { model: 'glm-5.3-flash' }));
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.equal(outcome.metrics['model_echo'], '6/6');
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /上游回显/.test(f.message)));
 });
 
 test('identity: self-descriptions without a concrete version → no version verdict, claimed_version none', async () => {
@@ -377,6 +565,42 @@ test('identity: target family not in alias table → honest insufficient with de
   assert.match(info!.message, /自述声明族：gpt/);
 });
 
+test('identity: target family unknown + model echo mismatch → warn (insufficient) discloses shell clue', async () => {
+  // 目标族不可识别时仍必须披露上游回显不一致：回显是独立机器证据，不能被「无法核验自述」掩盖。
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...gptSelfResults(), schemaOk()], 'deepseek-chat'));
+  const outcome = await probeIdentity(makeCtx(client, { model: 'my-custom-llm' }));
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /上游回显模型与请求不一致/);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /上游回显/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
+test('identity: undeclared family + model echo mismatch → warn (no family evidence does not hide echo)', async () => {
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const generic = [
+    okResult('我是一个AI助手。'),
+    okResult('我是一个AI助手，请问有什么可以帮你？'),
+    okResult('I am an AI assistant.'),
+    okResult('我是一个 AI 助手。'),
+    okResult('As an AI assistant, I can help.'),
+  ];
+  const { client } = stubClient(echo([...generic, schemaOk()], 'deepseek-chat'));
+  const outcome = await probeIdentity(makeCtx(client, { model: 'glm-5.3-flash' }));
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /自述未声明可识别模型族.*上游回显模型与请求不一致/);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /上游回显/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
 test('identity: noise tolerance — 1 mismatch in 5 → pass with no mismatch warning', async () => {
   const results = [
     okResult('我是 Claude，由 Anthropic 开发。'),
@@ -402,4 +626,105 @@ test('identity: families metric contract unchanged (union of declared families)'
   const ctx = makeCtx(client);
   const outcome = await probeIdentity(ctx);
   assert.equal(outcome.metrics['families'], 'gpt');
+});
+
+// ---------- detectPersonaBrands（F2，v0.2.2 起）----------
+
+test('detectPersonaBrands: positives across EN/ZH patterns and dotted/spaced brands', () => {
+  assert.deepEqual(detectPersonaBrands('I am NovaRelay assistant.'), ['NovaRelay']);
+  assert.ok(detectPersonaBrands("I'm an assistant called NovaRelay.").includes('NovaRelay'));
+  assert.ok(detectPersonaBrands('I am NovaRelay, an AI assistant.').includes('NovaRelay'));
+  assert.ok(detectPersonaBrands('我是 NovaRelay 助手').includes('NovaRelay'));
+  // 裁决必修项：点号/空格品牌不崩溃且命中（候选只做归一化字符串比较，绝不构造正则）
+  assert.deepEqual(detectPersonaBrands('I am Nova.Relay assistant.'), ['Nova.Relay']);
+  assert.deepEqual(detectPersonaBrands('I am Nova Relay assistant.'), ['Nova Relay']);
+  assert.deepEqual(detectPersonaBrands('this is AcmeBot assistant'), ['AcmeBot']);
+  assert.deepEqual(detectPersonaBrands('我叫 RelayX 助理'), ['RelayX']);
+  // 去重：同一文本多次命中同一品牌只回报一次（保留首次展示形态）
+  assert.deepEqual(detectPersonaBrands('I am NovaRelay assistant. I am NovaRelay assistant.'), ['NovaRelay']);
+});
+
+test('detectPersonaBrands: negatives — generic words, family names, quoted context', () => {
+  assert.deepEqual(detectPersonaBrands('I am an AI assistant.'), []);
+  assert.deepEqual(detectPersonaBrands('I am a helpful assistant.'), []);
+  assert.deepEqual(detectPersonaBrands('I am your assistant.'), []);
+  assert.deepEqual(detectPersonaBrands('我是你的助手。'), []);
+  assert.deepEqual(detectPersonaBrands('I am DeepSeek assistant.'), []);
+  // 句首锚定：引用/报道句不误报（多数样本自述是正常叙事，不是人格声明）
+  assert.deepEqual(detectPersonaBrands('The user asked if I am NovaRelay assistant.'), []);
+  assert.deepEqual(detectPersonaBrands(''), []);
+  // 大小写/空白归一后去重（同一品牌不因形态差异重复计数）
+  assert.deepEqual(detectPersonaBrands('I am NovaRelay assistant. I am NOVARELAY assistant.'), ['NovaRelay']);
+});
+
+// ---------- F2 探针级集成：人格命中在正常与降级分支都必须披露 ----------
+
+test('identity F2: persona brand + target-family self-ID → warn, score capped 80, hits recorded', async () => {
+  const { client } = stubClient([
+    okResult('I am gpt-4o. I am NovaRelay assistant.'),
+    okResult('I am gpt-4o, made by OpenAI.'),
+    okResult('I am gpt-4o. I am NovaRelay assistant.'),
+    okResult('gpt-4o is my model name.'),
+    okResult('我是 gpt-4o。'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 80, '人格注入是弱证据：压分到 80、降 warn，不单独定罪');
+  assert.equal(outcome.metrics['persona_hits'], 'NovaRelay×2');
+  assert.ok(
+    outcome.findings.some(
+      (f) => f.level === 'warn' && /自述出现非模型族人格名：NovaRelay（合计 2 处命中，目标族为 gpt-4o）/.test(f.message),
+    ),
+    JSON.stringify(outcome.findings),
+  );
+  assert.doesNotMatch(outcome.headline, /未见异常/, 'warn 时不得保留「未见异常」headline');
+});
+
+test('identity F2: persona disclosed in degraded branch (no family evidence, no score)', async () => {
+  const { client } = stubClient([
+    okResult('I am NovaRelay assistant.'),
+    okResult('I am a helpful assistant.'),
+    okResult('Hello, how can I help?'),
+    okResult('I am NovaRelay assistant.'),
+    okResult('I am an AI assistant.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.metrics['persona_hits'], 'NovaRelay×2');
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /自述出现非模型族人格名：NovaRelay/.test(f.message)),
+    '降级分支不得丢失人格信号：' + JSON.stringify(outcome.findings),
+  );
+});
+
+test('identity F2: persona hit coexists with falsified verdict without softening it (fail 0 stays)', async () => {
+  // 全体自述指向他族（falsified 定罪）+ 人格品牌：fail 0 不得被 persona 的 80 封顶规则拉回
+  const { client } = stubClient([
+    okResult('I am a DeepSeek assistant named NovaRelay.'),
+    okResult('I am DeepSeek.'),
+    okResult('我是 DeepSeek 的助手。'),
+    okResult('DeepSeek is my model.'),
+    okResult('I am DeepSeek assistant.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.level, 'fail');
+  assert.equal(outcome.score, 0, 'persona 的 80 封顶不得把 falsified 的 0 分拉回');
+  assert.match(outcome.headline, /身份矛盾/);
+  assert.equal(outcome.metrics['persona_hits'], 'NovaRelay×1');
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /自述出现非模型族人格名：NovaRelay/.test(f.message)));
+});
+
+test('identity F2: unknown target family → persona scan skipped (no baseline to compare against)', async () => {
+  const personaOnly = Array.from({ length: 5 }, () => okResult('I am NovaRelay assistant.'));
+  const { client } = stubClient([...personaOnly, okResult(COMPLETE_SCHEMA_JSON)]);
+  const outcome = await probeIdentity(makeCtx(client, { model: 'acme-9000' }));
+  assert.equal(outcome.status, 'insufficient');
+  assert.match(outcome.headline, /不在已知别名表/);
+  assert.equal(outcome.metrics['persona_hits'], 'none');
+  assert.ok(!outcome.findings.some((f) => /人格名/.test(f.message)), JSON.stringify(outcome.findings));
 });

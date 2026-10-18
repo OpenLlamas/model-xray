@@ -15,9 +15,11 @@ function outcome(id: ProbeOutcome['id'], score: number | null, status: ProbeOutc
   };
 }
 
-test('weights sum to 100 across scored probes', () => {
-  const sum = WEIGHTS.billing + WEIGHTS.quality + WEIGHTS.identity + WEIGHTS.context + WEIGHTS.capability + WEIGHTS.ttft;
-  assert.equal(sum, 100);
+test('weights sum to 90 across scored probes; TTFT is observation-only (weight 0)', () => {
+  const sum = WEIGHTS.billing + WEIGHTS.quality + WEIGHTS.identity + WEIGHTS.context + WEIGHTS.capability;
+  assert.equal(sum, 90);
+  assert.equal(WEIGHTS.ttft, 0);
+  assert.equal(WEIGHTS.decoy, 0);
 });
 
 test('all perfect scores produce 100 and pass', () => {
@@ -70,6 +72,7 @@ test('unscorable probes are excluded and logged, weights renormalize', () => {
   ]);
   assert.equal(result.total, 90);
   assert.ok(result.notes.some((n) => n.includes('未判定项')));
+  assert.ok(result.notes.some((n) => n.includes('评分覆盖：已判定 75/90 权重')), JSON.stringify(result.notes));
 });
 
 test('geometric mean penalizes a single low score', () => {
@@ -178,4 +181,63 @@ test('capability fail finding forces fail even when total is already capped by h
   // 硬红线 45 与 capability 证伪 60 并列取 min → 45
   assert.equal(result.total, 45);
   assert.equal(result.overall, 'fail');
+});
+
+// ---------- 覆盖率门槛：核心维度不可测 / 覆盖不足时不得出总分 ----------
+
+test('核心维度 quality 未判定时总分不出（billing+identity 高分不得外推为整体可信度）', () => {
+  const result = computeTotal(
+    [
+      outcome('identity', 80),
+      outcome('context', null, 'insufficient'),
+      outcome('billing', 100),
+      outcome('capability', null, 'insufficient'),
+      outcome('quality', null, 'insufficient'),
+    ],
+    { claimedContext: false, expectedCapabilities: [] },
+  );
+  assert.equal(result.total, null, '真机实证：quality 全空 + billing 100 曾报 96，必须改为未判定');
+  assert.equal(result.overall, 'warn');
+  assert.ok(result.notes.some((n) => n.includes('核心维度 quality')), JSON.stringify(result.notes));
+});
+
+test('核心维度 billing 未判定时总分同样不出', () => {
+  const result = computeTotal(
+    [
+      outcome('identity', 100),
+      outcome('billing', null, 'insufficient'),
+      outcome('quality', 100),
+    ],
+    { claimedContext: false, expectedCapabilities: [] },
+  );
+  assert.equal(result.total, null);
+  assert.ok(result.notes.some((n) => n.includes('核心维度 billing')), JSON.stringify(result.notes));
+});
+
+test('未声明的 context/capability 不计入覆盖率分母（默认命令仍可给出总分）', () => {
+  const result = computeTotal(
+    [
+      outcome('identity', null, 'insufficient'),
+      outcome('context', null, 'insufficient'),
+      outcome('billing', 100),
+      outcome('capability', null, 'insufficient'),
+      outcome('quality', 100),
+    ],
+    { claimedContext: false, expectedCapabilities: [] },
+  );
+  assert.equal(result.total, 100);
+  assert.ok(result.notes.some((n) => n.includes('已判定 50/65 权重')), JSON.stringify(result.notes));
+});
+
+test('覆盖率低于 60% 时总分不出（即使核心维度已判定）', () => {
+  const result = computeTotal([
+    outcome('identity', null, 'insufficient'),
+    outcome('context', null, 'insufficient'),
+    outcome('billing', 100),
+    outcome('capability', null, 'insufficient'),
+    outcome('quality', 100),
+  ]);
+  // 默认 scope 包含 context/capability：50/90 = 56%
+  assert.equal(result.total, null);
+  assert.ok(result.notes.some((n) => n.includes('评分覆盖不足')), JSON.stringify(result.notes));
 });

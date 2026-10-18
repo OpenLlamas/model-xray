@@ -91,9 +91,11 @@ test('scoreboard：计量维度（usage 判定缺失 → N/A；rejected 占比�
   assert.deepEqual(dim(na, 'billing'), { id: 'billing', score: null, level: 'na' });
 });
 
-test('scoreboard：身份维度（modelReq/modelResp 双双已知才入分母）', () => {
+test('scoreboard：身份维度（modelReq/modelResp 双双已知才入分母；比较大小写不敏感）', () => {
   const d = computeDimensions([sample(), sample({ modelResp: 'GLM-4' })], null);
   assert.equal(dim(d, 'identity').score, 50);
+  const ci = computeDimensions([sample({ modelReq: 'Glm-4', modelResp: 'GLM-4' })], null);
+  assert.equal(dim(ci, 'identity').score, 100, '仅大小写差异不应记 mismatch');
   const na = computeDimensions([sample({ modelReq: null, modelResp: null })], null);
   assert.deepEqual(dim(na, 'identity'), { id: 'identity', score: null, level: 'na' });
 });

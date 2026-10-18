@@ -40,6 +40,7 @@ export interface EvidenceInput {
 }
 
 const PREVIEW_CHARS = 800;
+const TAIL_PREVIEW_CHARS = 400;
 const RAW_LIMIT = 8192;
 
 export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): EvidenceRecord {
@@ -47,7 +48,6 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
   const lastMessage = request.messages[request.messages.length - 1];
   const lastText = renderContent(lastMessage?.content);
   const totalChars = request.messages.reduce((acc, message) => acc + renderContent(message.content).length, 0);
-  const raw = result.raw.length <= RAW_LIMIT ? result.raw : `${result.raw.slice(0, RAW_LIMIT)}…`;
   return recorder.record({
     probe: input.probe,
     label: input.label,
@@ -58,11 +58,13 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       maxTokens: request.maxTokens ?? null,
       messageCount: request.messages.length,
       lastUserPreview: truncate(lastText, PREVIEW_CHARS),
+      lastUserTailPreview: lastText.length > PREVIEW_CHARS ? truncateTail(lastText, TAIL_PREVIEW_CHARS) : '',
       lastUserChars: lastText.length,
       totalChars,
     },
     response: {
       status: result.status,
+      model: result.model,
       textPreview: truncate(result.text, PREVIEW_CHARS),
       textChars: result.text.length,
       usage: result.usage,
@@ -71,6 +73,8 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       toolCallCount: result.toolCalls.length,
       finishReason: result.finishReason,
       error: result.error,
+      raw: truncate(result.raw, RAW_LIMIT),
+      rawChars: Array.from(result.raw).length,
     },
     ttftMs: result.ttftMs,
     durationMs: result.durationMs,
@@ -98,4 +102,10 @@ function truncate(text: string, max: number): string {
   const chars = Array.from(text);
   if (chars.length <= max) return text;
   return `${chars.slice(0, max).join('')}…`;
+}
+
+function truncateTail(text: string, max: number): string {
+  const chars = Array.from(text);
+  if (chars.length <= max) return text;
+  return `…${chars.slice(-max).join('')}`;
 }

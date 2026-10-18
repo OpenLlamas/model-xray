@@ -116,8 +116,18 @@ function renderEvidence(record: EvidenceRecord): string {
     );
   }
   if (record.response.error) lines.push(`- error: ${quote(record.response.error)}`);
-  lines.push(`- 请求摘要: ${quote(record.request.lastUserPreview)}`);
-  lines.push(`- 响应摘要: ${quote(record.response.textPreview)}`);
+  // 上游回显模型：与请求模型不一致是换壳/降级冒充的机器证据，报告里必须肉眼可见
+  if (record.response.model !== null) {
+    const echo = record.response.model;
+    lines.push(`- 回显模型: ${quote(echo)}${echo === record.request.model ? '' : `（请求 ${record.request.model}）`}`);
+  }
+  const reqNote = record.request.lastUserChars > 500 ? '（Markdown 摘要最多 500 字符，JSON 保留 800 字符头部 + 400 字符尾部预览与完整字符数）' : '';
+  const respNote = record.response.textChars > 500 ? '（Markdown 摘要最多 500 字符，JSON 保留 800 字符预览与完整字符数）' : '';
+  lines.push(`- 请求摘要${reqNote}: ${quote(record.request.lastUserPreview)}`);
+  if (record.request.lastUserTailPreview) {
+    lines.push(`- 请求结尾（长请求尾部摘要，用于核对问题是否在末尾）: ${quote(record.request.lastUserTailPreview)}`);
+  }
+  lines.push(`- 响应摘要${respNote}: ${quote(record.response.textPreview)}`);
   lines.push('');
   return lines.join('\n');
 }

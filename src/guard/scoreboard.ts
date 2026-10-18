@@ -1,6 +1,7 @@
 import type { Usage, UsageRejection } from '../types.js';
 import { median } from '../stats.js';
 import { colorize } from '../color.js';
+import { sameModelId } from './model-id.js';
 
 /**
  * guard 多维实时评分卡：
@@ -83,7 +84,7 @@ const COST_SCORE: Readonly<Record<CostVerdict, number | null>> = { ok: 100, warn
  * 维度计算（纯函数，便于单测）：
  * - 可用性：非 aborted 样本中 2xx 占比；非 aborted 样本为 0 → N/A（aborted 不进分母，只进观测）；
  * - 计量：有判定样本（usage!=null || usageRejected!=null）中 usageRejected==null 占比；无判定样本 → N/A；
- * - 身份：modelReq/modelResp 均非 null 样本中相等占比；无样本 → N/A；
+ * - 身份：modelReq/modelResp 均非 null 样本中相等占比（比较经 canonicalModelId 归一（大小写/分隔符不敏感），与 buildAnomalies model_mismatch 口径一致）；无样本 → N/A；
  * - 时延：ttftMs!=null 样本的 p50 分段（≤2000ms→100、≤5000→85、≤8000→70、否则 50）；无样本 → N/A；
  * - 成本：最近一次 setCost（多结算取最新）：ok→100、warn→70、fail→40；skipped/skipped_recharge/未注入 → N/A。
  */
@@ -103,11 +104,14 @@ export function computeDimensions(
       ? { id: 'billing' as const, score: null, level: 'na' as const }
       : graded('billing', pct(judged.filter((s) => s.usageRejected === null).length, judged.length));
 
-  const identified = samples.filter((s) => s.modelReq !== null && s.modelResp !== null);
+  const identified = samples.filter(
+    (s): s is ScoreSample & { modelReq: string; modelResp: string } =>
+      s.modelReq !== null && s.modelResp !== null,
+  );
   const identity =
     identified.length === 0
       ? { id: 'identity' as const, score: null, level: 'na' as const }
-      : graded('identity', pct(identified.filter((s) => s.modelReq === s.modelResp).length, identified.length));
+      : graded('identity', pct(identified.filter((s) => sameModelId(s.modelReq, s.modelResp)).length, identified.length));
 
   const ttfts = samples.map((s) => s.ttftMs).filter((v): v is number => v !== null);
   let latency: DimensionScore;

@@ -27,6 +27,12 @@ export const DRIFT_QUALITY_WARN = 0.15;
 export const DRIFT_QUALITY_FAIL = 0.3;
 export const DRIFT_BILLING_ABS = 0.05;
 export const DRIFT_BILLING_REL = 0.2;
+/**
+ * 阈值比较的浮点容忍：0.9 - 0.6 = 0.30000000000000004，数学上恰好 30% 的降幅
+ * 若按裸 `> 0.3` 比较会被浮点噪声顶进 fail 硬阈值（封顶 30），制造一次「疑似降智」误报。
+ * 这里给所有阈值比较统一加 1e-9 容忍：恰好等于阈值按「未超过」处理，与文案一致。
+ */
+export const DRIFT_EPS = 1e-9;
 
 export interface BaselineDiffItem {
   probeId: ProbeId;
@@ -38,6 +44,8 @@ export interface BaselineDiffItem {
 export interface BaselineDiff {
   comparable: boolean;
   skipReason: string | null;
+  /** 非扣分披露（基线判据不可靠、准确率提升等）：只进 notes，绝不封顶或升级 level。 */
+  notes: string[];
   items: BaselineDiffItem[];
 }
 
@@ -161,8 +169,9 @@ function validateBaseline(b: Record<string, unknown>): void {
         throw fieldError(`baseline.quality.${key}`, '数字', quality[key]);
       }
     }
-    if (typeof quality['mainTotal'] !== 'number' || !Number.isFinite(quality['mainTotal']) || quality['mainTotal'] < 0) {
-      throw fieldError('baseline.quality.mainTotal', '≥0 的数字', quality['mainTotal']);
+    // buildQuality 拒收 total<=0（题集恒 15 题，mainTotal 恒正数）——0 属畸形基线，与口径一致拒收
+    if (typeof quality['mainTotal'] !== 'number' || !Number.isFinite(quality['mainTotal']) || quality['mainTotal'] <= 0) {
+      throw fieldError('baseline.quality.mainTotal', '正数', quality['mainTotal']);
     }
   }
 
@@ -223,13 +232,14 @@ function shortJson(value: unknown): string {
  */
 export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): BaselineDiff {
   if (oldBaseline.version !== 1) {
-    return { comparable: false, skipReason: `基线版本为 ${String(oldBaseline.version)}，仅支持 version=1`, items: [] };
+    return { comparable: false, skipReason: `基线版本为 ${String(oldBaseline.version)}，仅支持 version=1`, items: [], notes: [] };
   }
   if (oldBaseline.model !== current.model) {
     return {
       comparable: false,
       skipReason: `模型标识不一致（基线 ${oldBaseline.model} vs 本次 ${current.model}）`,
       items: [],
+      notes: [],
     };
   }
   if (oldBaseline.probesetVersion !== current.probesetVersion) {
@@ -237,6 +247,7 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
       comparable: false,
       skipReason: `题集版本不一致（基线 ${oldBaseline.probesetVersion} vs 本次 ${current.probesetVersion}）`,
       items: [],
+      notes: [],
     };
   }
   if (oldBaseline.assetsVersion !== current.assetsVersion) {
@@ -244,10 +255,12 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
       comparable: false,
       skipReason: `资产版本不一致（基线 ${oldBaseline.assetsVersion} vs 本次 ${current.assetsVersion}）`,
       items: [],
+      notes: [],
     };
   }
 
   const items: BaselineDiffItem[] = [];
+  const notes: string[] = [];
 
   const oldFamilies = new Set(oldBaseline.identity?.families ?? []);
   const newFamilies = new Set(current.identity?.families ?? []);
@@ -264,22 +277,28 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
   }
 
   if (oldBaseline.seed === current.seed && oldBaseline.quality && current.quality) {
-    const delta = Math.abs(current.quality.accuracy - oldBaseline.quality.accuracy);
     const from = percent(oldBaseline.quality.accuracy);
     const to = percent(current.quality.accuracy);
-    if (delta > DRIFT_QUALITY_FAIL) {
+    // 只对「变差」扣分；用 |Δ| 会把「变好」也判成疑似降智（实测 0/12 → 12/12 被封顶 30、总分 45）
+    const drop = oldBaseline.quality.accuracy - current.quality.accuracy;
+    const rise = -drop;
+    if (oldBaseline.quality.mainTotal > 0 && oldBaseline.quality.accuracy === 0) {
+      notes.push(`基线质量为 0/${oldBaseline.quality.mainTotal}（疑似失败跑批或上游故障），质量漂移判据不可靠，已跳过该项对比（本次 ${to}）；建议用一次正常跑批重新生成基线。`);
+    } else if (rise > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
+      notes.push(`质量准确率上升 ${percent(rise)}（${from} → ${to}），不视为降智、不扣分；疑似上游恢复或换成更强模型，可按需人工确认。`);
+    } else if (drop > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
       items.push({
         probeId: 'quality',
         level: 'fail',
         cap: 30,
-        message: `质量准确率漂移 ${percent(delta)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_FAIL)} 阈值，疑似降智或换模型`,
+        message: `质量准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_FAIL)} 阈值，疑似降智或换模型`,
       });
-    } else if (delta > DRIFT_QUALITY_WARN) {
+    } else if (drop > DRIFT_QUALITY_WARN + DRIFT_EPS) {
       items.push({
         probeId: 'quality',
         level: 'warn',
         cap: 70,
-        message: `质量准确率漂移 ${percent(delta)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_WARN)} 关注阈值`,
+        message: `质量准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_WARN)} 关注阈值`,
       });
     }
   }
@@ -308,7 +327,7 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
       if (typeof before !== 'number' || typeof after !== 'number' || Math.abs(before) < 1e-9) continue;
       const absDelta = Math.abs(after - before);
       const relDelta = absDelta / Math.abs(before);
-      if (absDelta > DRIFT_BILLING_ABS && relDelta > DRIFT_BILLING_REL) {
+      if (absDelta > DRIFT_BILLING_ABS + DRIFT_EPS && relDelta > DRIFT_BILLING_REL + DRIFT_EPS) {
         items.push({
           probeId: 'billing',
           level: 'warn',
@@ -319,7 +338,7 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
     }
   }
 
-  return { comparable: true, skipReason: null, items };
+  return { comparable: true, skipReason: null, items, notes };
 }
 
 function percent(value: number): string {

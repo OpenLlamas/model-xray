@@ -30,7 +30,8 @@ export async function probeTtft(ctx: ProbeCtx): Promise<ProbeOutcome> {
     else serialTtfts.push(ttft);
   }
 
-  const rounds = 3;
+  // 观测项不需要 17 发：5 发串行 + 1 轮 4 并发足以给出 p50 与并发对照，请求量降低约 47%。
+  const rounds = 1;
   const concurrency = 4;
   for (let round = 0; round < rounds; round += 1) {
     const batch = Array.from({ length: concurrency }, (_, i) =>

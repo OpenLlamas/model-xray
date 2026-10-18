@@ -12,6 +12,11 @@ export interface BuildCommandInput {
   expect: string[];
   priceInput: string;
   priceOutput: string;
+  priceCachedRead: string;
+  priceThreshold: string;
+  priceInput2: string;
+  priceOutput2: string;
+  priceCachedRead2: string;
   seed: string;
   timeout: string;
   out: string;
@@ -41,4 +46,38 @@ export interface WebApp {
   escapeHtml(s: string): string;
   buildCommand(input: BuildCommandInput): BuildCommandResult;
   renderScorecard(jsonText: string): RenderScorecardResult;
+  scrubSecrets(text: string, secrets: string[]): string;
+  buildModelPrices(entries: ModelPriceEntry[]): BuildModelPricesResult;
+  formatCostUsd(value: unknown): string;
+  classifyLogLine(text: string): string;
+}
+
+/** 价格编辑行（字段均为字符串，空串=未填）；alias 行来自模型清单。 */
+export interface ModelPriceEntry {
+  alias: string;
+  input: string;
+  output: string;
+  cachedRead: string;
+  threshold: string;
+  input2: string;
+  output2: string;
+  cachedRead2: string;
+}
+
+/** 单个模型的价格（与服务端 ModelPrice 同口径：USD/百万 tokens；threshold 为长上下文整单二档阈值）。 */
+export interface ModelPrice {
+  input: number;
+  output: number;
+  cachedRead?: number;
+  threshold?: number;
+  input2?: number;
+  output2?: number;
+  cachedRead2?: number;
+}
+
+export interface BuildModelPricesResult {
+  /** 可直接随渠道 POST 的 modelPrices（全空行已跳过）；error 非 null 时为已收集的部分（不提交）。 */
+  modelPrices: Record<string, ModelPrice>;
+  /** 校验错误信息（含别名与正确示例）；null 表示成功。 */
+  error: string | null;
 }

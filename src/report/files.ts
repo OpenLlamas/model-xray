@@ -69,9 +69,11 @@ export function writeReports(
   const markdownPath = join(dir, `report-${stamp}.md`);
   const htmlPath = join(dir, `report-${stamp}.html`);
   const jsonPath = join(dir, `report-${stamp}.json`);
+  // 集合级次序：先 json 后 md/html——md/html 引用「完整原始记录见同目录 JSON」，
+  // 先落 json 可把「md 在而 json 缺」的崩溃窗口缩到最小（每文件仍是独立原子写）
+  atomicWrite(jsonPath, renderJson(report));
   atomicWrite(markdownPath, renderMarkdown(report));
   atomicWrite(htmlPath, renderHtml(report));
-  atomicWrite(jsonPath, renderJson(report));
 
   let baselinePath: string | null = null;
   if (baseline !== null) {

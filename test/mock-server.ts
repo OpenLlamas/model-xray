@@ -1,6 +1,7 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
+import { IDENTITY_QUESTIONS } from '../src/assets.js';
 
 export type MockMode =
   | 'honest'
@@ -23,7 +24,11 @@ export type MockMode =
   | 'json-as-sse'
   | 'sse-as-json'
   | 'sse-empty'
-  | 'sse-comments';
+  | 'sse-comments'
+  | 'error-payload'
+  | 'persona-inject'
+  | 'usage-scale'
+  | 'retry-fix';
 
 export interface MockBehavior {
   mode: MockMode;
@@ -49,6 +54,14 @@ export interface MockBehavior {
   starveTruncated: string | null;
   /** thinking-starve：命中的问题豁免 starvation（照常作答），用于构造「部分样本被截断」场景 */
   starveExempt: RegExp | null;
+  /** usage-scale：prompt/completion 等比缩放倍率（1.3 = 全量虚增 30%，线性回归不可见） */
+  usageScale: number;
+  /** persona-inject：identity 自述题的计数器（第 2、5 个样本注入品牌人格） */
+  personaSeq: number;
+  /** retry-fix：允许首答错（+1 扰动）的题面数上限 */
+  retryFixPerturb: number;
+  /** retry-fix：已扰动过的题面文本（同题面重放即返回正确答案，模拟「复采样答对」） */
+  perturbed: Set<string>;
 }
 
 export interface MockOptions {
@@ -70,6 +83,10 @@ export interface MockOptions {
   starveTruncated?: string;
   /** thinking-starve：豁免 starvation 的问题正则（命中则照常作答），用于构造「部分样本被截断」场景 */
   starveExempt?: RegExp;
+  /** usage-scale：prompt/completion 等比缩放倍率，默认 1（忠实复刻 issue 场景：×1.3 线性回归不可见） */
+  usageScale?: number;
+  /** retry-fix：允许首答错（+1 扰动）的题面数上限，默认 3（首答错、复采样对，两次机会口径下应 100 分） */
+  retryFixPerturb?: number;
 }
 
 export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
@@ -116,6 +133,10 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     starveBelow: options.starveBelow ?? 1024,
     starveTruncated: options.starveTruncated ?? null,
     starveExempt: options.starveExempt ?? null,
+    usageScale: options.usageScale ?? 1,
+    personaSeq: 0,
+    retryFixPerturb: options.retryFixPerturb ?? 3,
+    perturbed: new Set<string>(),
   };
   const state: MockServer['state'] = { served: 0, balanceQueries: 0, authSeen: [], proxyAuthSeen: [], pathSeen: [] };
 
@@ -236,6 +257,22 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
     return;
   }
 
+  // error-payload：HTTP 200 却回 error 载荷（stream → SSE `data: {"error":...}`；非流式 → JSON），
+  // 模拟中转站欠费/限流/上游熔断的经典形态。此前客户端零信号 → ok:true 空正文，
+  // 探针据此指控「未发起工具调用」「上下文内容不可读」= 诬告；识别后须按请求失败降级。
+  if (behavior.mode === 'error-payload') {
+    const payload = JSON.stringify({
+      error: { message: 'upstream provider temporarily unavailable, please retry', type: 'upstream_error', code: 'no_available_channel' },
+    });
+    if (stream) {
+      res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
+      res.end(`data: ${payload}\n\ndata: [DONE]\n\n`);
+    } else {
+      sendJson(res, 200, { error: { message: 'upstream provider temporarily unavailable, please retry', type: 'upstream_error', code: 'no_available_channel' } });
+    }
+    return;
+  }
+
   const toolResultNonce = findToolResultNonce(messages);
   if (toolResultNonce !== null) {
     sendReply(res, behavior, `已收到工具结果，nonce ${toolResultNonce} 确认。`, estimate(allText), stream, modelName);
@@ -271,7 +308,7 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
       const keepChars = Math.floor(behavior.truncateTokens * 3.2);
       const clipped = allText.slice(-keepChars);
       const clippedUser = userText.length > keepChars ? userText.slice(-keepChars) : userText;
-      const reply = solve(clipped, behavior, clippedUser, imageUrl, modelName, state.served);
+      const reply = applyRetryFix(behavior, clippedUser, solve(clipped, behavior, clippedUser, imageUrl, modelName, state.served));
       sendReply(res, behavior, reply, estimatedTokens, stream, modelName);
       return;
     }
@@ -282,8 +319,34 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
     return;
   }
 
-  const reply = solve(allText, behavior, userText, imageUrl, modelName, state.served);
+  const reply = applyRetryFix(behavior, userText, solve(allText, behavior, userText, imageUrl, modelName, state.served));
   sendReply(res, behavior, reply, estimate(allText), stream, modelName);
+}
+
+/**
+ * retry-fix（F1 e2e）：对「数值答案」题面注入至多 retryFixPerturb 个首答错误（+1 扰动）；
+ * 同题面重放（= 复采样）返回原正确答案。效果：默认 3 个主题首答错、复采样对（两次机会口径 100 分；
+ * 旧单次口径为 9/12 warn）。控制题（复用 dumb 分支同款正则）不得扰动，防止控制题失败。
+ */
+function applyRetryFix(behavior: MockBehavior, userText: string, reply: string): string {
+  if (behavior.mode !== 'retry-fix') return reply;
+  const question =
+    userText
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => l.length > 0)
+      .at(-1) ?? '';
+  const isControl =
+    /一年有几个月/.test(question) ||
+    /^\s*\d{1,2}\s*[+＋]\s*\d{1,2}\s*等于/.test(question) ||
+    /^\s*\d{1,2}\s*[×x*]\s*\d{1,2}\s*等于/.test(question);
+  if (isControl) return reply;
+  if (!/^-?\d+(\.\d+)?$/.test(reply.trim())) return reply;
+  if (!behavior.perturbed.has(userText) && behavior.perturbed.size < behavior.retryFixPerturb) {
+    behavior.perturbed.add(userText);
+    return String(Number(reply.trim()) + 1);
+  }
+  return reply;
 }
 
 function solve(
@@ -413,6 +476,16 @@ function solve(
   if (/127\s*[×x*]\s*31/.test(question)) return '3937';
   if (/pong|ping/i.test(question)) return 'pong';
 
+  // persona-inject（F2 e2e）：端点识别自述题后向 system prompt 注入「品牌人格」——第 2、5 个
+  // 自述样本返回非模型族人格自述（'I am NovaRelay assistant...'），其余样本照常走下方 identity 回显分支
+  // （照常声明目标族 gpt）。效果：5 样本 2 个 persona → identity warn 封顶 80（精确复刻 issue #1 C2）。
+  if (behavior.mode === 'persona-inject' && isIdentityQuestion(userText, question)) {
+    behavior.personaSeq += 1;
+    if (behavior.personaSeq === 2 || behavior.personaSeq === 5) {
+      return 'I am NovaRelay assistant, built by NovaRelay Labs.';
+    }
+  }
+
   // v0.2.1：identity 固定版本自述题（完整模型名称/精确版本号）也按端点模型作答，否则 honest 端点会答非所问
   if (/你是什么AI模型|什么模型|真实身份|State your exact model|Which AI model|model name|完整模型名称|精确版本号/i.test(question)) {
     const variants = [`我是 ${modelName}，由 OpenAI 开发。`, `I am ${modelName}, created by OpenAI.`, `I'm the ${modelName} model.`];
@@ -420,6 +493,12 @@ function solve(
   }
 
   return '好的，收到。';
+}
+
+/** identity 题识别（persona-inject 用）：IDENTITY_QUESTIONS 全文命中或既有回显关键词命中。 */
+function isIdentityQuestion(userText: string, question: string): boolean {
+  if (IDENTITY_QUESTIONS.some((q) => userText.includes(q))) return true;
+  return /你是什么AI模型|什么模型|真实身份|State your exact model|Which AI model|model name|完整模型名称|精确版本号/i.test(question);
 }
 
 function findToolResultNonce(messages: Array<Record<string, unknown>>): string | null {
@@ -615,8 +694,18 @@ function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: st
     }
   } else {
     completion = Math.max(1, Math.ceil(reply.length / 3.2));
-    prompt = Math.max(10, estimatedTokens);
+    // 0.8 校准：本 mock 的 len/3.2 估算 vs 工具 estimateTokens（英文 ≈len/4）存在 1.25× 系统差，
+    // 不校准则回归斜率虚高 1.25×——usage-scale 1.3 会被 [0.05,1.6] 带宽误伤，而非「对回归不可见」。
+    // 校准后 honest 斜率≈1.0，usage-scale 的纯倍率才是回归的盲区（F3 参照对比的存在前提）。
+    prompt = Math.max(10, Math.round(estimatedTokens * 0.8));
     if (behavior.mode === 'inflated') prompt = Math.round(prompt * behavior.inflateFactor);
+    total = prompt + completion;
+  }
+  // usage-scale：全量等比虚增（prompt 与 completion 同倍率，total 重算）——线性回归/常量检测不可见，
+  // 只有与同名模型历史报告的 prompt_tokens 对比才能识别（--token-reference 的存在理由）。
+  if (behavior.mode === 'usage-scale') {
+    prompt = Math.round(prompt * behavior.usageScale);
+    completion = Math.round(completion * behavior.usageScale);
     total = prompt + completion;
   }
   // 可编程余额模式：按本笔 usage 累加成本（$/M 价格核算，与 guard 侧 --price-* 同式）

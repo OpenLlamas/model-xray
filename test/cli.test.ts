@@ -200,6 +200,9 @@ test('cli: invalid-key endpoint exits 2 (audit inconclusive)', async () => {
     ]);
     assert.equal(result.status, 2, result.stderr);
     assert.ok(!result.stdout.includes('[FAIL] capability'), result.stdout);
+    const files = readdirSync(out);
+    assert.ok(files.some((f) => f.startsWith('report-')), '报告仍应落盘');
+    assert.ok(!files.some((f) => f.startsWith('baseline-')), '零可评分项不得写空基线（会被后续对比误用）');
   } finally {
     mock.server.close();
   }
@@ -237,7 +240,7 @@ test('cli: empty --price-input is rejected', async () => {
 });
 
 test('cli: negative --price-input is rejected', async () => {
-  const result = await runCli([...REMOTE_ARGS, '--price-input', '-1', '--price-output', '2', '--dry-run']);
+  const result = await runCli([...REMOTE_ARGS, '--price-input=-1', '--price-output', '2', '--dry-run']);
   assert.equal(result.status, 2, result.stderr);
   assert.ok(result.stderr.includes('必须为正数'), result.stderr);
   assert.ok(result.stderr.includes('示例'), result.stderr);
@@ -247,6 +250,35 @@ test('cli: zero --price-input is rejected (non-negative semantics retired)', asy
   const result = await runCli([...REMOTE_ARGS, '--price-input', '0', '--price-output', '2', '--dry-run']);
   assert.equal(result.status, 2, result.stderr);
   assert.ok(result.stderr.includes('必须为正数'), result.stderr);
+});
+
+test('cli: partial tier price flags are rejected as a group', async () => {
+  const result = await runCli([
+    ...REMOTE_ARGS,
+    '--price-input', '2',
+    '--price-output', '8',
+    '--price-threshold', '1000000',
+    '--price-input2', '6',
+    '--dry-run',
+  ]);
+  assert.equal(result.status, 2, result.stderr);
+  assert.ok(result.stderr.includes('必须成组出现'), result.stderr);
+  assert.ok(result.stderr.includes('示例'), result.stderr);
+});
+
+test('cli: cached-read zero and full tier price flags are accepted', async () => {
+  const result = await runCli([
+    ...REMOTE_ARGS,
+    '--price-input', '2',
+    '--price-output', '8',
+    '--price-cached-read', '0',
+    '--price-threshold', '1000000',
+    '--price-input2', '6',
+    '--price-output2', '22.5',
+    '--price-cached-read2', '0.75',
+    '--dry-run',
+  ]);
+  assert.equal(result.status, 0, result.stderr);
 });
 
 test('cli: unknown --expect token lists legal values', async () => {

@@ -1,6 +1,6 @@
-﻿// test/unit/gateway.test.ts —— 网关切片的安全关键用例：
+// test/unit/gateway.test.ts —— 网关切片的安全关键用例：
 //   ① SSRF：私网/保留/回环/IPv6/混合解析结果一律拒绝；连接钉定杜绝二次解析；
-//   ② 数据面：独立虚拟 key（常量时间比较）、仅两条路由、model 别名改写、渠道删除/停用语义、
+//   ② 数据面：独立虚拟 key（常量时间比较）、五条路由（OpenAI 三条 + Anthropic 两条）、model 别名改写、渠道删除/停用语义、
 //      上游 3xx 不跟随且不外发 Location、413 上限、超时 504；
 //   ③ 渠道：纯内存 CRUD、别名唯一、apiKey 绝不回显（view.hasKey 恒 true、无 apiKey 字段）；
 //   ④ 管理面（经 serve.mjs）：全端点 token 校验、start/stop/409、渠道 CRUD/删除语义。
@@ -11,8 +11,9 @@ import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
 import { createAliasGateway, type AliasGateway, type GatewayLedger } from '../../src/gateway/server.js';
-import { ChannelError, ChannelStore, type ChannelView } from '../../src/gateway/channels.js';
-import { isPublicIpv4, validateUpstreamBaseUrl, resolvePinnedUpstream, pinnedLookup } from '../../src/gateway/ssrf.js';
+import { ChannelError, ChannelStore, noteChannelResult, type ChannelView } from '../../src/gateway/channels.js';
+import { computeCostUsd } from '../../src/gateway/pricing.js';
+import { isAllowedPrivateIpv4, isPublicIpv4, validateUpstreamBaseUrl, resolvePinnedUpstream, pinnedLookup } from '../../src/gateway/ssrf.js';
 import { Ledger } from '../../src/ledger/ledger.js';
 import { cpSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -63,15 +64,18 @@ interface MockState {
   lastAuth: string | null;
   lastModel: unknown;
   lastContentType: string | null;
+  lastXApiKey: string | null;
+  lastAnthropicVersion: string | null;
+  lastAnthropicBeta: string | null;
 }
-/** responder 返回 null = 收下请求但永不响应（用于上游挂起 → 504 测试）；truncate=true = 发出 2xx 响应头与部分 body 后断连（模拟传输截断）；sse = 以 text/event-stream 整段回发（模拟流式）。 */
+/** responder 返回 null = 收下请求但永不响应（用于上游挂起 → 504 测试）；truncate=true = 发出 2xx 响应头与部分 body 后断连（模拟传输截断）；sse = 以 text/event-stream 整段回发（模拟流式）；delayMs = 先挂起再回发（制造上游 TTFT；对 sse/JSON 均生效）。 */
 type MockResponder = (parsed: Record<string, unknown>) =>
-  | { status: number; payload?: unknown; truncate?: boolean; sse?: string; contentType?: string }
+  | { status: number; payload?: unknown; truncate?: boolean; sse?: string; contentType?: string; delayMs?: number }
   | null;
 class MockUpstream {
   private behavior: MockResponder = (parsed) => ({ status: 200, payload: { echo: true, model: parsed['model'] } });
   private server!: ReturnType<typeof createServer>;
-  readonly state: MockState = { lastPath: null, lastAuth: null, lastModel: null, lastContentType: null };
+  readonly state: MockState = { lastPath: null, lastAuth: null, lastModel: null, lastContentType: null, lastXApiKey: null, lastAnthropicVersion: null, lastAnthropicBeta: null };
   private constructor(public port: number) {}
   static async start(): Promise<MockUpstream> {
     const holder = new MockUpstream(0);
@@ -89,25 +93,49 @@ class MockUpstream {
         holder.state.lastPath = req.url ?? null;
         holder.state.lastAuth = typeof req.headers['authorization'] === 'string' ? req.headers['authorization'] : null;
         holder.state.lastContentType = typeof req.headers['content-type'] === 'string' ? req.headers['content-type'] : null;
+        holder.state.lastXApiKey = typeof req.headers['x-api-key'] === 'string' ? req.headers['x-api-key'] : null;
+        holder.state.lastAnthropicVersion = typeof req.headers['anthropic-version'] === 'string' ? req.headers['anthropic-version'] : null;
+        holder.state.lastAnthropicBeta = typeof req.headers['anthropic-beta'] === 'string' ? req.headers['anthropic-beta'] : null;
         holder.state.lastModel = parsed['model'] ?? null;
         const out = holder.behavior(parsed);
         if (out === null) return; // 收下请求后挂起不响应
         if (out.truncate === true) {
           // 声明大 content-length 后只发部分 body 即断连：模拟上游 2xx 传输截断
-          res.writeHead(out.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': '4096' });
-          res.write('{"truncated":');
-          setTimeout(() => res.destroy(), 30);
+          const doTruncate = () => {
+            res.writeHead(out.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': '4096' });
+            res.write('{"truncated":');
+            setTimeout(() => res.destroy(), 30);
+          };
+          if (out.delayMs === undefined) {
+            doTruncate();
+          } else {
+            setTimeout(doTruncate, out.delayMs);
+          }
           return;
         }
         if (out.sse !== undefined) {
           // 流式响应：text/event-stream 整段回发（tee 观测按帧解析；无 content-length 走 chunked）
-          res.writeHead(out.status, { 'content-type': out.contentType ?? 'text/event-stream; charset=utf-8' });
-          res.end(out.sse);
+          const sendSse = () => {
+            res.writeHead(out.status, { 'content-type': out.contentType ?? 'text/event-stream; charset=utf-8' });
+            res.end(out.sse);
+          };
+          if (out.delayMs === undefined) {
+            sendSse();
+          } else {
+            setTimeout(sendSse, out.delayMs);
+          }
           return;
         }
         const body = Buffer.from(JSON.stringify(out.payload ?? {}), 'utf8');
-        res.writeHead(out.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length) });
-        res.end(body);
+        const sendJson = () => {
+          res.writeHead(out.status, { 'content-type': 'application/json; charset=utf-8', 'content-length': String(body.length) });
+          res.end(body);
+        };
+        if (out.delayMs === undefined) {
+          sendJson();
+        } else {
+          setTimeout(sendJson, out.delayMs);
+        }
       });
     });
     holder.server = server;
@@ -127,6 +155,9 @@ class MockUpstream {
     this.state.lastAuth = null;
     this.state.lastModel = null;
     this.state.lastContentType = null;
+    this.state.lastXApiKey = null;
+    this.state.lastAnthropicVersion = null;
+    this.state.lastAnthropicBeta = null;
   }
   async close(): Promise<void> {
     if (this.server === undefined) return;
@@ -205,6 +236,32 @@ async function waitFor(condition: () => boolean, timeoutMs = 3000): Promise<void
 /** 组装 SSE 流：data: {frame}\n\n ... 以 data: [DONE] 收尾。 */
 function sseBody(frames: unknown[]): string {
   return frames.map((frame) => `data: ${JSON.stringify(frame)}`).join('\n\n') + '\n\ndata: [DONE]\n\n';
+}
+
+/** 组装 Anthropic Messages SSE 流：event/data 成对帧（与真实上游帧型一致，帧间空行分隔，无 [DONE] 哨兵）。 */
+function anthropicSseBody(frames: Array<Record<string, unknown>>): string {
+  return (
+    frames
+      .map((frame) => `event: ${typeof frame['type'] === 'string' ? (frame['type'] as string) : 'message'}\ndata: ${JSON.stringify(frame)}`)
+      .join('\n\n') + '\n\n'
+  );
+}
+
+/** Anthropic 路由鉴权头：默认 x-api-key 携带虚拟 key（Anthropic SDK 默认方式）。 */
+function anthropicAuthHeaders(gateway: AliasGateway, extra: Record<string, string> = {}): Record<string, string> {
+  return { 'x-api-key': gateway.virtualKey, 'content-type': 'application/json', ...extra };
+}
+
+/** 默认 Anthropic 渠道输入：protocol=anthropic；baseUrl 用域名 + mock 实端口（与 channelInput 同手法）。 */
+function anthropicInput(overrides: Record<string, unknown> = {}, mockPort = 65530): Record<string, unknown> {
+  return {
+    label: 'Anthropic 渠道',
+    baseUrl: `http://upstream.test:${mockPort}/v1`,
+    apiKey: MOCK_ECHO_AUTH,
+    models: ['claude-alias'],
+    protocol: 'anthropic',
+    ...overrides,
+  };
 }
 
 /** 账本测试夹具：临时目录文件库 + 第二只读连接（绕过聚合 API 直查原始行，支持金丝雀全库 dump）。 */
@@ -382,6 +439,89 @@ test('channels：非法别名/越界 modelMap/坏 label/坏 baseUrl/坏 apiKey �
   assert.throws(() => store.create(channelInput({ enabled: 'true' }) as never), /enabled/);
 });
 
+// ===== ②b 私网上游 opt-in（allowPrivateUpstream；默认安全姿态不动） =====
+
+/** opt-in 用例的渠道输入：单别名 + 空 modelMap，与 channelInput 默认别名解耦（别名唯一约束）。 */
+function optInInput(baseUrl: string, alias: string, allowPrivateUpstream?: unknown): Record<string, unknown> {
+  return { label: 'opt-in 渠道', baseUrl, apiKey: MOCK_ECHO_AUTH, models: [alias], modelMap: {}, allowPrivateUpstream };
+}
+
+test('ssrf：isAllowedPrivateIpv4 仅认回环+RFC1918；validateUpstreamBaseUrl 默认拒私网、opt-in 放行字面量', () => {
+  for (const ip of ['127.0.0.1', '10.255.1.2', '172.31.255.254', '192.168.255.254']) {
+    assert.equal(isAllowedPrivateIpv4(ip), true, `${ip} 应在 opt-in 白名单内`);
+  }
+  for (const ip of ['172.32.0.1', '11.0.0.1', '169.254.169.254', '100.64.0.1', '0.0.0.0', '8.8.8.8', 'not-ip']) {
+    assert.equal(isAllowedPrivateIpv4(ip), false, `${ip} 不应在 opt-in 白名单内`);
+  }
+  // 默认拒绝：文案含收到值、SSRF 与示例（既有安全姿态不放松）
+  const rejected = validateUpstreamBaseUrl('http://127.0.0.1:8622/v1');
+  assert.equal(rejected.ok, false);
+  assert.match(rejected.message, /SSRF/);
+  assert.match(rejected.message, /示例/);
+  assert.match(rejected.message, /127\.0\.0\.1/);
+  // opt-in 放行回环字面量；公网字面量两种模式都放行（放行方向不误伤）
+  assert.equal(validateUpstreamBaseUrl('http://127.0.0.1:8622/v1', { allowPrivate: true }).ok, true);
+  assert.equal(validateUpstreamBaseUrl(`https://${PUBLIC_IP}/v1`, { allowPrivate: true }).ok, true);
+  // opt-in 也拒白名单外的非公网字面量（云元数据；文案含收到值+示例）
+  const metadata = validateUpstreamBaseUrl('http://169.254.169.254/v1', { allowPrivate: true });
+  assert.equal(metadata.ok, false);
+  assert.match(metadata.message, /169\.254\.169\.254/);
+  assert.match(metadata.message, /示例/);
+});
+
+test('ssrf：域名解析到私网时 allowPrivate=true 仍拒（防用域名绕过）；字面量按 opt-in 判定', async () => {
+  const rebound = await resolvePinnedUpstream({
+    hostname: 'rebind.test',
+    lookup: async () => [{ address: '127.0.0.1', family: 4 }],
+    allowPrivate: true,
+  });
+  assert.equal(rebound.ok, false);
+  assert.match(rebound.message, /非公网|rebinding/);
+  assert.match(rebound.message, /字面量 IP/);
+  const loopLiteral = await resolvePinnedUpstream({ hostname: '127.0.0.1', lookup: async () => [], allowPrivate: true });
+  assert.equal(loopLiteral.ok, true);
+  assert.equal(loopLiteral.ip, '127.0.0.1');
+  const publicLiteral = await resolvePinnedUpstream({ hostname: PUBLIC_IP, lookup: async () => [], allowPrivate: true });
+  assert.equal(publicLiteral.ok, true);
+  assert.equal(publicLiteral.ip, PUBLIC_IP);
+  for (const host of ['169.254.169.254', '100.64.0.1', '0.0.0.0']) {
+    const bad = await resolvePinnedUpstream({ hostname: host, lookup: async () => [], allowPrivate: true });
+    assert.equal(bad.ok, false, `${host} 不应被 opt-in 放行`);
+  }
+  const v6 = await resolvePinnedUpstream({ hostname: '[::1]', lookup: async () => [], allowPrivate: true });
+  assert.equal(v6.ok, false);
+});
+
+test('channels：allowPrivateUpstream 严格布尔（字符串/数字 400 带收到值+示例）；update 缺省保留、显式 false 收紧；view 回显布尔不含 key', () => {
+  const store = new ChannelStore();
+  for (const raw of ['true', 1]) {
+    assert.throws(
+      () => store.create(optInInput('https://relay.example.com/v1', 'alias-bool', raw) as never),
+      (error: unknown) => {
+        assert.ok(error instanceof ChannelError);
+        assert.equal((error as ChannelError).status, 400);
+        assert.match((error as ChannelError).message, /allowPrivateUpstream 必须为布尔值/);
+        assert.match((error as ChannelError).message, /收到值/);
+        assert.match((error as ChannelError).message, /示例/);
+        return true;
+      },
+      JSON.stringify(raw),
+    );
+  }
+  const created = store.create(optInInput('http://127.0.0.1:8622/v1', 'alias-toggle', true) as never);
+  assert.equal(created.allowPrivateUpstream, true);
+  const kept = store.update(created.id, { label: '仅改名' });
+  assert.equal(kept.allowPrivateUpstream, true, '未给字段必须保留原值');
+  const tightened = store.update(created.id, { allowPrivateUpstream: false });
+  assert.equal(tightened.allowPrivateUpstream, false, '显式 false 必须收紧');
+  // 收紧后再改 baseUrl 回到私网字面量应 400（update 按当前 opt-in 状态校验）
+  assert.throws(() => store.update(created.id, { baseUrl: 'http://10.9.9.9/v1' }), /SSRF/);
+  const view = store.view(tightened);
+  assert.equal(view.allowPrivateUpstream, false);
+  assert.equal('apiKey' in view, false);
+  assert.ok(!JSON.stringify(view).includes(MOCK_ECHO_AUTH), 'view 不得含 apiKey 明文');
+});
+
 // ===== ③ 数据面 / server.ts =====
 
 test('数据面：缺/错 Bearer → 401 invalid_api_key；未知路由 → 404', async () => {
@@ -537,6 +677,34 @@ test('数据面：SSRF 解析结果含私网 → 502 upstream_blocked；渠道�
   assert.equal(gateway.store.view(channel).stats.ok, 1);
 });
 
+test('数据面：allowPrivate 渠道可指向 127.0.0.1 字面量并用渠道 key 转发；默认渠道同址域名解析回环 → 502', { timeout: 20000 }, async () => {
+  const stack = await startGatewayStack();
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  // 默认渠道（缺省 allowPrivate=false）：域名被解析到回环 → 每请求重校验拒绝，502 upstream_blocked
+  gateway.store.create(optInInput(`http://upstream.test:${mock.port}/v1`, 'alias-plain') as never);
+  stack.setDns([{ address: '127.0.0.1', family: 4 }]);
+  const blocked = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'alias-plain', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(blocked.status, 502);
+  assert.match(JSON.parse(blocked.body).error.code, /upstream_blocked/);
+  assert.equal(mock.state.lastPath, null, '被拒请求不得实际触达 mock 上游');
+  // opt-in 渠道：字面量回环 baseUrl（mock 实端口），data plane 正常转发且注入的是渠道 key（非客户端 key）
+  const local = gateway.store.create(optInInput(`http://127.0.0.1:${mock.port}/v1`, 'alias-local', true) as never);
+  assert.equal(local.allowPrivateUpstream, true);
+  const forwarded = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'alias-local', messages: [{ role: 'user', content: '你好' }] }),
+  });
+  assert.equal(forwarded.status, 200);
+  assert.equal(mock.state.lastPath, '/v1/chat/completions');
+  assert.equal(mock.state.lastAuth, `Bearer ${MOCK_ECHO_AUTH}`);
+});
+
 test('数据面：请求体超上限 → 413；请求体非 JSON → 400', async () => {
   const stack = await startGatewayStack();
   const { gateway, mock } = stack;
@@ -601,32 +769,37 @@ test('数据面：上游连接被拒 → 502 upstream_unavailable；渠道统计
   assert.equal(view.stats.errors, 1);
 });
 
-test('数据面：客户端中途断开 → 计一次请求但绝不计为成功（不借上次 lastStatus 假阳性）', async () => {
+test('数据面：客户端中途断开 → 计一次请求但绝不计为成功，也绝不让渠道背锅（error_source=client 不计错误/告警）', async () => {
   const stack = await startGatewayStack({ upstreamTimeoutMs: 30000 });
   const { gateway, mock } = stack;
   CLEANUPS.push(() => stack.cleanup());
   const channel = gateway.store.create(channelInput({}, stack.mock.port) as never);
   mock.setResponder(() => null); // 上游收下请求后挂起，客户端先断开
-  await new Promise<void>((resolveAbort) => {
-    const req = httpRequest(
-      { host: '127.0.0.1', port: gateway.port, path: '/v1/chat/completions', method: 'POST', headers: authHeaders(gateway) },
-      () => resolveAbort(),
-    );
-    req.on('error', () => resolveAbort());
-    req.end(JSON.stringify({ model: 'alias-a', messages: [] }));
-    setTimeout(() => {
-      req.destroy();
-      resolveAbort();
-    }, 150);
-  });
-  const deadline = Date.now() + 3000;
-  while (gateway.store.view(channel).stats.requests === 0 && Date.now() < deadline) {
-    await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+  // 连续 5 次客户端断开：窗口达到 error_rate 的 n>=5 阈值，但 0 条渠道错误 → 绝不触发告警。
+  for (let i = 1; i <= 5; i += 1) {
+    await new Promise<void>((resolveAbort) => {
+      const req = httpRequest(
+        { host: '127.0.0.1', port: gateway.port, path: '/v1/chat/completions', method: 'POST', headers: authHeaders(gateway) },
+        () => resolveAbort(),
+      );
+      req.on('error', () => resolveAbort());
+      req.end(JSON.stringify({ model: 'alias-a', messages: [] }));
+      setTimeout(() => {
+        req.destroy();
+        resolveAbort();
+      }, 150);
+    });
+    const deadline = Date.now() + 3000;
+    while (gateway.store.view(channel).stats.requests < i && Date.now() < deadline) {
+      await new Promise((resolveWait) => setTimeout(resolveWait, 30));
+    }
   }
   const stats = gateway.store.view(channel).stats;
-  assert.equal(stats.requests, 1);
-  assert.equal(stats.ok, 0, '客户端中断的请求不得计入 ok（未知结果按错误保守统计）');
-  assert.equal(stats.errors, 1, '客户端中断必须计入 errors（回归防护：漏调 errors++ 必须被捕获）');
+  assert.equal(stats.requests, 5);
+  assert.equal(stats.ok, 0, '客户端中断的请求不得计入 ok（未知结果绝不记成功）');
+  assert.equal(stats.errors, 0, '客户端主动断开与账本 error_source=client 同口径：渠道无责，不计错误/不更新 lastErrorAt');
+  assert.equal(stats.lastStatus, null, 'status=null 不借旧值冒充 lastStatus');
+  assert.equal(gateway.events().filter((event) => event.kind === 'error_rate').length, 0, '客户端断开不得推高渠道 error_rate 告警');
 });
 
 test('数据面：上游 2xx 响应体传输截断 → 绝不记为成功（记一次错误）；账本结算=truncated/upstream', async () => {
@@ -794,7 +967,7 @@ test('管理面：start（随机回环端口）→ running；重复 start → 40
   assert.equal(after.running, false);
 });
 
-test('管理面：未运行时渠道/虚拟 key 端点 400 引导启动（非 500 崩溃）', async () => {
+test('管理面：未运行时渠道端点仍可用（持久 store 预配置），虚拟 key 端点 400 引导启动（非 500 崩溃）', async () => {
   const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
@@ -805,10 +978,42 @@ test('管理面：未运行时渠道/虚拟 key 端点 400 引导启动（非 50
     headers: manageHeaders(token),
     body: JSON.stringify({ baseUrl: 'https://relay.example.com/v1', apiKey: 'sk-x', models: ['alias-a'] }),
   });
-  assert.equal(channels.status, 400);
-  assert.match(channels.body, /网关未运行|start/);
+  assert.equal(channels.status, 200, '渠道挂在控制台持久 store：网关未启动也应能预配置/列出');
+  assert.ok(!channels.body.includes('sk-x'), '渠道视图不得回显上游 key');
+  assert.equal(JSON.parse(channels.body).channel.models[0], 'alias-a');
   const virtualKey = await request(server.port, '/api/gateway/virtual-key', { headers: manageHeaders(token) });
-  assert.equal(virtualKey.status, 400);
+  assert.equal(virtualKey.status, 400, '虚拟 key 随网关启动生成：未运行时 400 引导而非 500 崩溃');
+});
+
+test('管理面：启动前预配置渠道 → 启动后数据面 /v1/models 即可见（store 注入回归），停止再启动仍保留', { timeout: 20000 }, async () => {
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  CLEANUPS.push(async () => {
+    await server.close().catch(() => undefined);
+  });
+  const token = server.token;
+  const header = manageHeaders(token);
+  const created = await request(server.port, '/api/gateway/channels', {
+    method: 'POST',
+    headers: header,
+    body: JSON.stringify({ label: '预配置', baseUrl: 'https://relay.example.com/v1', apiKey: 'sk-pre-1111', models: ['alias-pre'] }),
+  });
+  assert.equal(created.status, 200, `启动前创建渠道应 200：${created.body}`);
+  const started = JSON.parse(
+    (await request(server.port, '/api/gateway/start', { method: 'POST', headers: header, body: '{}' })).body,
+  ) as { port: number; virtualKey: string };
+  const first = await request(started.port, '/v1/models', { headers: { authorization: `Bearer ${started.virtualKey}` } });
+  assert.equal(first.status, 200);
+  const firstIds = (JSON.parse(first.body) as { data: Array<{ id: string }> }).data.map((item) => item.id);
+  assert.ok(firstIds.includes('alias-pre'), `启动前配置的别名必须对数据面可见（持久 store 注入回归）：${first.body}`);
+  // 停止 → 启动前配置的渠道保留 → 再启动（新虚拟 key）仍可见
+  await request(server.port, '/api/gateway/stop', { method: 'POST', headers: header, body: '{}' });
+  const restarted = JSON.parse(
+    (await request(server.port, '/api/gateway/start', { method: 'POST', headers: header, body: '{}' })).body,
+  ) as { port: number; virtualKey: string };
+  const second = await request(restarted.port, '/v1/models', { headers: { authorization: `Bearer ${restarted.virtualKey}` } });
+  assert.equal(second.status, 200);
+  const secondIds = (JSON.parse(second.body) as { data: Array<{ id: string }> }).data.map((item) => item.id);
+  assert.ok(secondIds.includes('alias-pre'), '渠道必须跨网关启停保留（持久 store）');
 });
 
 test('管理面：并发 start 只允许一个成功（另一个 409，不泄漏第二个监听实例）', { timeout: 20000 }, async () => {
@@ -933,6 +1138,13 @@ test('账本⑥：流式请求 → 恰一请求+一结算（ok/usage token/TTFT 
   assert.equal(row['token_missing_reason'], null);
   assert.equal(row['usage_valid'], 1);
   assert.ok(row['ttft_upstream_ms'] !== null, '首个内容帧到达应有 TTFT 样本');
+  const clientTtftMs = row['ttft_client_ms'];
+  assert.ok(typeof clientTtftMs === 'number' && Number.isFinite(clientTtftMs) && clientTtftMs > 0, `client_ttft 应为非 NULL 独立样本（收到 ${String(clientTtftMs)}）`);
+  // tz 口径：requests+settlements 的 ts_ms 必须是落库时刻 ±1s 内的 epoch 毫秒
+  for (const entry of [req, row]) {
+    const tsMs = Number(entry['ts_ms']);
+    assert.ok(Number.isInteger(tsMs) && tsMs > Date.now() - 60_000 && tsMs <= Date.now() + 1000, `ts_ms 应为 epoch 毫秒（收到 ${String(tsMs)}）`);
+  }
   // 金丝雀：渠道密钥绝不进入账本全库 dump 与网关日志流
   assert.equal(fixture.dump().includes(CANARY_KEY), false, '渠道 apiKey 绝不出现在账本');
   assert.equal(logs.some((line) => line.includes(CANARY_KEY)), false, '渠道 apiKey 绝不出现在网关日志');
@@ -1181,4 +1393,660 @@ test('旁路观测⑬：默认阈值不变量——样本守恒；账本逐行 0
   } else {
     assert.equal(gw.ttftP50Ms, null, '全被剔除时不披露 p50');
   }
+});
+
+// ===== TTFT 告警（ttft_high）与双口径 client_ttft =====
+
+/** 延迟回发的带 usage SSE：上游 TTFT ≈ delayMs（写头与整段 body 均延后）。 */
+function delayedTtftSse(delayMs: number): { status: number; sse: string; delayMs: number } {
+  return { ...ttftSseResponder(), delayMs };
+}
+
+test('TTFT 告警⑭：默认阈值边界——19 样本不报；第 20 样本恰 1 条 ttft_high（observed=p95≥300）；冷却抑制只见计数；client_ttft 独立口径落库', { timeout: 25000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(channelInput({}, stack.mock.port) as never);
+  mock.setResponder(() => delayedTtftSse(320));
+  await sendStreamChat(gateway, 19);
+  await waitFor(() => fixture.settlementRows().length === 19);
+  assert.equal(gateway.events().filter((alert) => alert.kind === 'ttft_high').length, 0, 'n<20 绝不告警（低样本抖动防误报）');
+  await sendStreamChat(gateway, 1);
+  await waitFor(() => fixture.settlementRows().length === 20);
+  const alerts = gateway.events();
+  assert.equal(alerts.length, 1, '第 20 个未污染样本恰触发一条 ttft_high');
+  assert.equal(alerts[0]!.kind, 'ttft_high');
+  assert.equal(alerts[0]!.n, 20);
+  assert.ok(alerts[0]!.observed >= 300, `observed 应为 p95≥300ms（收到 ${String(alerts[0]!.observed)}）`);
+  assert.equal(alerts[0]!.evidence_request_ids.length, 10, '证据 id 应为窗口内最近 10 条请求');
+  for (const id of alerts[0]!.evidence_request_ids) assert.match(id, /^[0-9a-f-]{36}$/);
+  assert.equal(gateway.status().alertSuppressed, 0, '告警首次触发不得算作被抑制');
+  assert.equal(gateway.status().alertSilenceWasActive, false, 'silence=0 时不得谎称静默期生效');
+  // 冷却抑制披露：窗口继续累积高样本 → 规则再触发只计数，不生成第二条事件
+  await sendStreamChat(gateway, 3);
+  await waitFor(() => fixture.settlementRows().length === 23);
+  assert.equal(gateway.events().length, 1, '冷却期内不重复生成 ttft_high 事件');
+  assert.ok(gateway.status().alertSuppressed >= 1, '冷却抑制必须计数披露（持续故障不得被一条旧告警掩盖）');
+  // 双口径：client_ttft 是「进网关→响应首字节（含状态行）」，upstream_ttft 是「发出上游请求→首个内容帧」；
+  // 状态行可能先于上游内容帧到达，故两者不保证大小顺序，只校验都反映同一段 ≥300ms 延迟。
+  for (const row of fixture.settlementRows()) {
+    const client = row['ttft_client_ms'];
+    const upstream = row['ttft_upstream_ms'];
+    assert.ok(typeof client === 'number' && Number.isFinite(client) && client >= 300, `client_ttft 必须落库且反映延迟（收到 ${String(client)}）`);
+    assert.ok(typeof upstream === 'number' && upstream >= 300, `upstream_ttft 应为延迟回发的 ≥300ms 样本（收到 ${String(upstream)}）`);
+  }
+});
+
+test('TTFT 告警⑮：样本充足（n=20）但 p95<300ms → 不告警（绝对下限防小幅波动）', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack({ alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(channelInput({}, stack.mock.port) as never);
+  mock.setResponder(() => ttftSseResponder());
+  await sendStreamChat(gateway, 20);
+  await waitFor(() => (gateway.usageSummary()[0]?.requests ?? 0) === 20);
+  assert.equal(gateway.events().filter((alert) => alert.kind === 'ttft_high').length, 0, 'p95 低于绝对下限不得诬告渠道');
+});
+
+test('TTFT 双口径⑯：上游 500 错误体转发 → ttft_upstream 为 NULL（无 SSE 帧）而 ttft_client_ms 独立落库（client 口径不以 upstream 为 gate）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(channelInput({}, stack.mock.port) as never);
+  mock.setResponder(() => ({ status: 500, payload: { error: { code: 'boom' } } }));
+  const res = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'alias-a', messages: [] }),
+  });
+  assert.equal(res.status, 500);
+  await waitFor(() => fixture.settlementRows().length === 1);
+  const row = fixture.settlementRows()[0]!;
+  assert.equal(row['upstream_status'], 500);
+  assert.equal(row['client_status'], 'ok', '上游错误体完整转发给客户端（client 侧送达语义不变）');
+  assert.equal(row['error_source'], 'upstream');
+  assert.equal(row['ttft_upstream_ms'], null, '非流式无内容帧 → upstream 口径为 NULL（绝不写 0 冒充）');
+  const client = row['ttft_client_ms'];
+  assert.ok(typeof client === 'number' && Number.isFinite(client) && client > 0, `错误体转发产生了首字节写出 → client_ttft 必须独立落库（收到 ${String(client)}）`);
+});
+
+test('计数口径⑰：/v1/models 只进网关内存计数（不入账本）；401 拒绝不计入 total', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(channelInput({}, stack.mock.port) as never);
+  assert.equal(gateway.status().requests.total, 0);
+  const anon = await request(gateway.port, '/v1/models', { headers: { authorization: 'Bearer sk-wrong' } });
+  assert.equal(anon.status, 401);
+  assert.equal(gateway.status().requests.total, 0, '鉴权拒绝发生在路由计数之前，不计入 total');
+  await request(gateway.port, '/v1/models', { headers: authHeaders(gateway) });
+  await request(gateway.port, '/v1/models', { headers: authHeaders(gateway) });
+  const status = gateway.status();
+  assert.equal(status.requests.total, 2);
+  assert.equal(status.requests.ok, 2);
+  assert.equal(status.requests.error, 0);
+  assert.equal(fixture.requestRows().length, 0, '/v1/models 不写账本（仅网关计数口径）');
+});
+
+test('告警⑱：启动静默期——期间不评估不生成事件（更不得计入 alertSuppressed 冒充冷却抑制）；粘性披露 alertSilenceWasActive', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack({ alertSilenceMs: 1500 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(channelInput({ models: ['alias-a'] }, stack.mock.port) as never);
+  mock.setResponder(() => ({
+    status: 200,
+    sse: sseBody([{ model: 'other-model', choices: [{ index: 0, delta: { content: 'a' }, finish_reason: null }] }]),
+  }));
+  const before = gateway.status();
+  assert.ok(before.alertSilenceRemainingMs > 0, '启动静默期必须披露剩余毫秒');
+  assert.equal(before.alertSilenceWasActive, true, '静默期生效中 → wasActive 如实为 true');
+  const sendChat = async () => {
+    const res = await request(gateway.port, '/v1/chat/completions', {
+      method: 'POST',
+      headers: authHeaders(gateway),
+      body: JSON.stringify({ model: 'alias-a', messages: [{ role: 'user', content: 'hi' }] }),
+    });
+    assert.equal(res.status, 200);
+  };
+  await sendChat();
+  await sendChat();
+  const settled = () => gateway.usageSummary()[0]?.requests ?? 0;
+  await waitFor(() => settled() === 2);
+  assert.equal(gateway.events().length, 0, '静默期内不评估告警（防重启告警风暴）');
+  const during = gateway.status();
+  assert.equal(during.alertSilenceWasActive, true, '静默期一旦生效必须粘性披露（期间告警从未被评估）');
+  assert.equal(during.alertSuppressed, 0, '静默期早退不许计入 alertSuppressed 冒充「抑制了 N 条告警」');
+  // 粘性：静默期过期后 remaining 归零，但 wasActive 必须保持 true（防「检查过没问题」的假安心）
+  await new Promise((resolveWait) => setTimeout(resolveWait, 1600));
+  const after = gateway.status();
+  assert.equal(after.alertSilenceRemainingMs, 0);
+  assert.equal(after.alertSilenceWasActive, true, '剩余毫秒归零后 wasActive 必须保持 true（粘性披露）');
+});
+
+test('noteChannelResult：error_source=client 不计渠道错误（客户端断开绝不冤枉渠道）', () => {
+  const store = new ChannelStore();
+  const channel = store.create(channelInput() as never);
+  noteChannelResult(channel, null, 'client');
+  assert.equal(channel.stats.errors, 0, '客户端断开不计错误');
+  assert.equal(channel.stats.lastErrorAt, null);
+  assert.equal(channel.stats.lastStatus, null, 'status=null 不落 lastStatus');
+  noteChannelResult(channel, null, 'upstream');
+  assert.equal(channel.stats.errors, 1, '上游故障照常计错误');
+  assert.ok((channel.stats.lastErrorAt ?? 0) > 0);
+});
+
+// ===== ⑥ Anthropic Messages 协议（数据面） =====
+
+test('渠道：protocol 校验（缺省 unified；非法值 400 带收到值与示例；更新可切换协议）', () => {
+  const store = new ChannelStore();
+  const opened = store.create(channelInput() as never);
+  assert.equal(store.view(opened).protocol, 'unified', '缺省协议为 unified（统一中转）');
+  const anthropic = store.create(channelInput({ protocol: 'anthropic', models: ['claude-alias'], modelMap: {} }) as never);
+  assert.equal(store.view(anthropic).protocol, 'anthropic');
+  const unified = store.create(channelInput({ protocol: 'unified', models: ['u-alias'], modelMap: {} }) as never);
+  assert.equal(store.view(unified).protocol, 'unified');
+  assert.throws(
+    () => store.create(channelInput({ protocol: 'gemini', models: ['x-alias'], modelMap: {} }) as never),
+    (error: unknown) =>
+      error instanceof ChannelError &&
+      /收到值/.test((error as Error).message) &&
+      /示例/.test((error as Error).message) &&
+      /unified/.test((error as Error).message) &&
+      /统一/.test((error as Error).message),
+  );
+  assert.equal(store.update(anthropic.id, { protocol: 'openai' } as never).protocol, 'openai', '更新可切换协议');
+  assert.equal(store.update(opened.id, { label: '改标签' } as never).protocol, 'unified', '未传 protocol 时保持现值');
+});
+
+test('Anthropic①：POST /v1/messages SSE 端到端（x-api-key 注入上游、anthropic-version/beta 透传、账本 stop_reason 与 token 四字段）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const logs: string[] = [];
+  const stack = await startGatewayStack({ ledger: fixture.ledger, onLog: (line) => logs.push(line) });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(
+    channelInput({ protocol: 'anthropic', models: ['claude-alias'], apiKey: CANARY_KEY, modelMap: { 'claude-alias': 'claude-upstream-1' } }, stack.mock.port) as never,
+  );
+  mock.setResponder(() => ({
+    status: 200,
+    sse: anthropicSseBody([
+      { type: 'message_start', message: { id: 'msg_1', model: 'claude-upstream-1', usage: { input_tokens: 25, output_tokens: 5, cache_read_input_tokens: 5 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: '你好' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking: '思考' } },
+      { type: 'content_block_stop', index: 0 },
+      { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: null }, usage: { output_tokens: 30 } },
+      { type: 'message_stop' },
+    ]),
+  }));
+  const res = await request(gateway.port, '/v1/messages', {
+    method: 'POST',
+    headers: anthropicAuthHeaders(gateway, { 'anthropic-version': '2024-06-01', 'anthropic-beta': 'prompt-caching-2024-07-31' }),
+    body: JSON.stringify({ model: 'claude-alias', max_tokens: 1024, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers['content-type']), /text\/event-stream/);
+  assert.match(res.body, /message_start/);
+  // 上游收到的关键事实：路径、model 改写、x-api-key 注入、版本头透传、Authorization 不落地
+  assert.equal(mock.state.lastPath, '/v1/messages');
+  assert.equal(mock.state.lastModel, 'claude-upstream-1');
+  assert.equal(mock.state.lastXApiKey, CANARY_KEY);
+  assert.equal(mock.state.lastAnthropicVersion, '2024-06-01');
+  assert.equal(mock.state.lastAnthropicBeta, 'prompt-caching-2024-07-31');
+  assert.equal(mock.state.lastAuth, null, 'Anthropic 上游不得收到 Authorization 头');
+  await waitFor(() => fixture.settlementRows().length === 1);
+  const row = fixture.settlementRows()[0]!;
+  assert.equal(row['client_status'], 'ok');
+  assert.equal(row['error_source'], null);
+  assert.equal(row['finish_reason'], 'length', 'max_tokens 映射为 length（与连接截断语义无关）');
+  assert.equal(row['token_prompt'], 25);
+  assert.equal(row['token_completion'], 30, 'message_delta 累计 output 覆盖 message_start 的初值');
+  assert.equal(row['token_cached'], 5);
+  assert.equal(row['token_reasoning'], 0);
+  assert.equal(row['token_source'], 'usage');
+  assert.equal(row['usage_valid'], 1);
+  assert.ok(row['ttft_upstream_ms'] !== null, '首个 text_delta 到达应有 TTFT 样本');
+  assert.equal(fixture.dump().includes(CANARY_KEY), false, '渠道 apiKey 绝不出现在账本');
+  assert.equal(logs.some((line) => line.includes(CANARY_KEY)), false, '渠道 apiKey 绝不出现在网关日志');
+});
+
+test('Anthropic②：鉴权（x-api-key 或 Bearer 均可；错误 key 401 且带两种携带引导；OpenAI 路由（chat/responses）仍只认 Bearer）', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack();
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(anthropicInput({}, stack.mock.port) as never);
+  mock.setResponder(() => ({ status: 200, payload: { ok: true } }));
+  const body = JSON.stringify({ model: 'claude-alias', max_tokens: 16, messages: [] });
+  const byKey = await request(gateway.port, '/v1/messages', { method: 'POST', headers: { 'x-api-key': gateway.virtualKey, 'content-type': 'application/json' }, body });
+  assert.equal(byKey.status, 200, 'x-api-key 命中虚拟 key 放行');
+  const byBearer = await request(gateway.port, '/v1/messages', {
+    method: 'POST',
+    headers: { authorization: `Bearer ${gateway.virtualKey}`, 'content-type': 'application/json' },
+    body,
+  });
+  assert.equal(byBearer.status, 200, 'Bearer 亦接受');
+  const wrong = await request(gateway.port, '/v1/messages', { method: 'POST', headers: { 'x-api-key': 'sk-wrong-key', 'content-type': 'application/json' }, body });
+  assert.equal(wrong.status, 401);
+  assert.match(wrong.body, /x-api-key/, '401 文案给两种携带方式引导');
+  assert.match(wrong.body, /Bearer/);
+  const openaiRoute = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'x-api-key': gateway.virtualKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-alias', messages: [] }),
+  });
+  assert.equal(openaiRoute.status, 401, 'OpenAI 路由不接受 x-api-key（仍只认 Authorization: Bearer）');
+  const responsesByKeyOnly = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: { 'x-api-key': gateway.virtualKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'claude-alias', input: 'hi' }),
+  });
+  assert.equal(responsesByKeyOnly.status, 401, '/v1/responses 同为 OpenAI 系路由，只认 Bearer');
+});
+
+test('Anthropic③：协议门禁 409 双向（别名跨协议调用必须显式改路由；绝不打上游）', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack();
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(channelInput({ protocol: 'openai', models: ['alias-a'] }, stack.mock.port) as never); // 显式 openai 协议（缺省已为 unified）
+  gateway.store.create(anthropicInput({}, stack.mock.port) as never); // Anthropic 协议
+  mock.setResponder(() => ({ status: 200, payload: { unreachable: true } }));
+  const chatToAnthropic = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'claude-alias', messages: [] }),
+  });
+  assert.equal(chatToAnthropic.status, 409);
+  assert.match(chatToAnthropic.body, /protocol_mismatch/);
+  assert.match(chatToAnthropic.body, /\/v1\/messages/, 'OpenAI 路由命中 Anthropic 渠道 → 引导改到 /v1/messages');
+  assert.match(chatToAnthropic.body, /统一/, '409 文案引导 unified 统一中转');
+  assert.equal(JSON.parse(chatToAnthropic.body).error.type, 'invalid_request_error', '409 归 invalid_request_error');
+  const messagesToOpenai = await request(gateway.port, '/v1/messages', {
+    method: 'POST',
+    headers: anthropicAuthHeaders(gateway),
+    body: JSON.stringify({ model: 'alias-a', max_tokens: 16, messages: [] }),
+  });
+  assert.equal(messagesToOpenai.status, 409);
+  assert.match(messagesToOpenai.body, /\/v1\/chat\/completions/, 'Anthropic 路由命中 OpenAI 渠道 → 引导改到 /v1/chat/completions');
+  const responsesToAnthropic = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'claude-alias', input: 'hi' }),
+  });
+  assert.equal(responsesToAnthropic.status, 409);
+  assert.match(responsesToAnthropic.body, /protocol_mismatch/);
+  assert.match(responsesToAnthropic.body, /\/v1\/messages/, 'Responses 路由命中 Anthropic 渠道 → 引导改到 /v1/messages');
+  assert.match(responsesToAnthropic.body, /统一/);
+  assert.equal(mock.state.lastPath, null, '协议不匹配绝不触达上游');
+});
+
+test('Anthropic④：count_tokens 轻路径（真实转发到 /messages/count_tokens；零账本、不进用量窗口、计网关 counters）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(channelInput({ protocol: 'anthropic', models: ['claude-alias'], modelMap: { 'claude-alias': 'claude-upstream-1' } }, stack.mock.port) as never);
+  mock.setResponder(() => ({ status: 200, payload: { input_tokens: 42 } }));
+  const before = gateway.status().requests.total;
+  const res = await request(gateway.port, '/v1/messages/count_tokens', {
+    method: 'POST',
+    headers: anthropicAuthHeaders(gateway),
+    body: JSON.stringify({ model: 'claude-alias', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 200, 'count_tokens 不要求 max_tokens');
+  assert.deepEqual(JSON.parse(res.body), { input_tokens: 42 });
+  assert.equal(mock.state.lastPath, '/v1/messages/count_tokens', '真实转发到 count_tokens 端点');
+  assert.equal(mock.state.lastModel, 'claude-upstream-1');
+  await new Promise((resolveWait) => setTimeout(resolveWait, 100));
+  assert.equal(fixture.requestRows().length, 0, 'count_tokens 零账本（防「有请求无 token」假缺失）');
+  assert.equal(fixture.settlementRows().length, 0);
+  assert.equal(gateway.usageSummary().length, 0, 'count_tokens 不进用量/告警窗口');
+  assert.equal(gateway.status().requests.total, before + 1, '网关 counters 照常计数');
+});
+
+test('Anthropic⑤：非流式 JSON 落账（stop_reason/usage/content 与流式同口径提取）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(anthropicInput({}, stack.mock.port) as never);
+  mock.setResponder(() => ({
+    status: 200,
+    payload: {
+      id: 'msg_2',
+      type: 'message',
+      role: 'assistant',
+      model: 'claude-upstream-x',
+      content: [{ type: 'text', text: 'hello' }],
+      stop_reason: 'end_turn',
+      usage: { input_tokens: 12, output_tokens: 3, cache_read_input_tokens: 2 },
+    },
+  }));
+  const res = await request(gateway.port, '/v1/messages', {
+    method: 'POST',
+    headers: anthropicAuthHeaders(gateway),
+    body: JSON.stringify({ model: 'claude-alias', max_tokens: 64, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(res.status, 200);
+  await waitFor(() => fixture.settlementRows().length === 1);
+  const row = fixture.settlementRows()[0]!;
+  assert.equal(row['client_status'], 'ok');
+  assert.equal(row['finish_reason'], 'stop', 'end_turn 映射为 stop');
+  assert.equal(row['token_prompt'], 12);
+  assert.equal(row['token_completion'], 3);
+  assert.equal(row['token_cached'], 2);
+  assert.equal(row['token_reasoning'], 0);
+  assert.equal(row['usage_valid'], 1);
+  assert.ok(row['ttft_upstream_ms'] !== null, '非流式整包到达也算首内容');
+});
+
+test('Anthropic⑥：/v1/messages 体校验（缺 max_tokens / 缺 model → 400 带示例；未知别名 404）', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack();
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(anthropicInput({}, stack.mock.port) as never);
+  mock.setResponder(() => ({ status: 200, payload: { ok: true } }));
+  const headers = anthropicAuthHeaders(gateway);
+  const noMax = await request(gateway.port, '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ model: 'claude-alias', messages: [] }) });
+  assert.equal(noMax.status, 400);
+  assert.match(noMax.body, /max_tokens/);
+  assert.match(noMax.body, /收到值/);
+  assert.match(noMax.body, /示例/);
+  const badMax = await request(gateway.port, '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ model: 'claude-alias', max_tokens: 0, messages: [] }) });
+  assert.equal(badMax.status, 400);
+  const noModel = await request(gateway.port, '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ max_tokens: 16, messages: [] }) });
+  assert.equal(noModel.status, 400);
+  assert.match(noModel.body, /示例/);
+  const unknown = await request(gateway.port, '/v1/messages', { method: 'POST', headers, body: JSON.stringify({ model: 'nope-alias', max_tokens: 16, messages: [] }) });
+  assert.equal(unknown.status, 404);
+  assert.match(unknown.body, /未知 model 别名/);
+  assert.equal(mock.state.lastPath, null, '校验失败绝不打上游');
+});
+
+test('渠道：modelPrices 校验与往返（键∈models/成对/白名单/阶梯三元组/负值 400；未传保持、显式 {} 清空、models 变更重校验）', () => {
+  const store = new ChannelStore();
+  const created = store.create(
+    channelInput({
+      modelPrices: {
+        'alias-a': { input: 2.5, output: 10, cachedRead: 0.5 },
+        'alias-b': { input: 1, output: 2, threshold: 1000000, input2: 3, output2: 4, cachedRead2: 0.25 },
+      },
+    }) as never,
+  );
+  assert.deepEqual(store.view(created).modelPrices, {
+    'alias-a': { input: 2.5, output: 10, cachedRead: 0.5 },
+    'alias-b': { input: 1, output: 2, threshold: 1000000, input2: 3, output2: 4, cachedRead2: 0.25 },
+  });
+  assert.deepEqual(
+    store.view(store.create(channelInput({ models: ['m-only'], modelMap: {} }) as never)).modelPrices,
+    {},
+    '未录价 = 空对象（而非 null）',
+  );
+  const reject = (modelPrices: unknown, pattern: RegExp) => {
+    assert.throws(
+      () => store.create(channelInput({ models: ['m1'], modelMap: {}, modelPrices }) as never),
+      (error: unknown) =>
+        error instanceof ChannelError && pattern.test((error as Error).message) && /收到值|收到键/.test((error as Error).message) && /示例/.test((error as Error).message),
+    );
+  };
+  reject({ ghost: { input: 1, output: 1 } }, /不在本渠道 models/);
+  reject({ m1: { input: 1 } }, /成对/);
+  reject({ m1: { input: 1, output: 1, unknownKey: 2 } }, /未知字段/);
+  reject({ m1: { input: -1, output: 1 } }, /不小于 0/);
+  reject({ m1: { input: 1, output: 1, threshold: 100 } }, /同时提供/);
+  reject({ m1: { input: 1, output: 1, cachedRead2: 0.1 } }, /仅在提供阶梯价/);
+  reject({ m1: { input: 1, output: 1, threshold: 0, input2: 1, output2: 1 } }, /正整数/);
+  reject({ m1: { input: 1, output: 1, threshold: 1.5, input2: 1, output2: 1 } }, /正整数/);
+  // 未传 modelPrices → 保持现值（不被误清空）
+  const relabeled = store.update(created.id, { label: '改标签' } as never);
+  assert.deepEqual(store.view(relabeled).modelPrices, {
+    'alias-a': { input: 2.5, output: 10, cachedRead: 0.5 },
+    'alias-b': { input: 1, output: 2, threshold: 1000000, input2: 3, output2: 4, cachedRead2: 0.25 },
+  });
+  // models 变更后旧 modelPrices 键必须仍在 models 内（显式 400，绝不静默清空/失效）
+  assert.throws(
+    () => store.update(created.id, { models: ['alias-a'] } as never),
+    (error: unknown) => error instanceof ChannelError && /不在本渠道 models/.test((error as Error).message),
+  );
+  // 显式 {} 清空后，models 收缩不再被旧价阻塞
+  const cleared = store.update(created.id, { modelPrices: {} } as never);
+  assert.deepEqual(store.view(cleared).modelPrices, {});
+  assert.deepEqual(store.update(created.id, { models: ['alias-a'] } as never).models, ['alias-a']);
+  // 更新路径同样严格校验
+  assert.throws(
+    () => store.update(created.id, { modelPrices: { ghost: { input: 1, output: 1 } } } as never),
+    (error: unknown) => error instanceof ChannelError && /不在本渠道 models/.test((error as Error).message),
+  );
+});
+
+test('pricing：computeCostUsd 缓存分量与整单阶梯（threshold 严格大于；cached>prompt 钳 0）', () => {
+  const near = (a: number, b: number, label: string) => assert.ok(Math.abs(a - b) < 1e-12, `${label}：${a} vs ${b}`);
+  near(computeCostUsd({ prompt_tokens: 14, completion_tokens: 3, cached_tokens: 4 }, { input: 2, output: 10, cachedRead: 0.5 }), (10 * 2 + 4 * 0.5 + 3 * 10) / 1e6, '缓存分量：未缓存 10×2 + 缓存 4×0.5 + 完成 3×10');
+  near(computeCostUsd({ prompt_tokens: 10, completion_tokens: 1 }, { input: 2, output: 10 }), (10 * 2 + 1 * 10) / 1e6, '未上报 cached 视 0');
+  near(computeCostUsd({ prompt_tokens: 5, completion_tokens: 1, cached_tokens: 9 }, { input: 2, output: 10, cachedRead: 0.5 }), (9 * 0.5 + 1 * 10) / 1e6, 'cached>prompt 钳 0，绝不产生负输入');
+  const tier = { input: 2, output: 10, threshold: 10, input2: 100, output2: 200 };
+  near(computeCostUsd({ prompt_tokens: 14, completion_tokens: 3 }, tier), (14 * 100 + 3 * 200) / 1e6, 'prompt>threshold → 整单二档');
+  near(computeCostUsd({ prompt_tokens: 10, completion_tokens: 3 }, tier), (10 * 2 + 3 * 10) / 1e6, 'prompt==threshold 不进二档（严格大于）');
+  near(computeCostUsd({ prompt_tokens: 14, completion_tokens: 3, cached_tokens: 4 }, { ...tier, cachedRead2: 5 }), (10 * 100 + 4 * 5 + 3 * 200) / 1e6, '二档缓存：未缓存 10×input2 + 缓存 4×cachedRead2 + 完成 3×output2');
+  near(computeCostUsd({ prompt_tokens: 14, completion_tokens: 3, cached_tokens: 4 }, tier), (10 * 100 + 4 * 100 + 3 * 200) / 1e6, '二档未配 cachedRead2 → 缓存按二档输入价');
+});
+
+// ===== ⑦ OpenAI Responses 协议与 unified 统一中转（数据面） =====
+
+test('Responses①：POST /v1/responses SSE 端到端（Bearer 注入、模型改写、账本 usage 四字段与 TTFT；只认 Bearer）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(
+    channelInput({ protocol: 'openai', models: ['resp-alias'], apiKey: CANARY_KEY, modelMap: { 'resp-alias': 'gpt-upstream-1' } }, stack.mock.port) as never,
+  );
+  mock.setResponder(() => ({
+    status: 200,
+    sse: sseBody([
+      { type: 'response.created', response: { id: 'resp_1', model: 'gpt-upstream-1', status: 'in_progress' } },
+      { type: 'response.output_text.delta', item_id: 'msg_1', output_index: 0, delta: '你好' },
+      { type: 'response.output_text.delta', item_id: 'msg_1', output_index: 0, delta: '！' },
+      {
+        type: 'response.completed',
+        response: {
+          id: 'resp_1',
+          model: 'gpt-upstream-1',
+          status: 'completed',
+          usage: { input_tokens: 14, output_tokens: 3, total_tokens: 17, input_tokens_details: { cached_tokens: 4 }, output_tokens_details: { reasoning_tokens: 1 } },
+        },
+      },
+    ]),
+  }));
+  const byKeyOnly = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: { 'x-api-key': gateway.virtualKey, 'content-type': 'application/json' },
+    body: JSON.stringify({ model: 'resp-alias', input: 'hi' }),
+  });
+  assert.equal(byKeyOnly.status, 401, '/v1/responses 只认 Authorization: Bearer');
+  const res = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'resp-alias', input: 'hi', stream: true }),
+  });
+  assert.equal(res.status, 200);
+  assert.match(String(res.headers['content-type']), /text\/event-stream/);
+  assert.match(res.body, /response\.created/);
+  assert.equal(mock.state.lastPath, '/v1/responses', '真实转发到 /v1/responses');
+  assert.equal(mock.state.lastModel, 'gpt-upstream-1', 'model 别名改写');
+  assert.equal(mock.state.lastAuth, `Bearer ${CANARY_KEY}`, 'OpenAI 系请求注入 Bearer 渠道 key');
+  assert.equal(mock.state.lastXApiKey, null, 'Responses 上游不得收到 x-api-key');
+  await waitFor(() => fixture.settlementRows().length === 1);
+  const row = fixture.settlementRows()[0]!;
+  assert.equal(row['client_status'], 'ok');
+  assert.equal(row['finish_reason'], 'stop', 'response.completed 映射为 stop');
+  assert.equal(row['token_prompt'], 14);
+  assert.equal(row['token_completion'], 3);
+  assert.equal(row['token_cached'], 4, 'input_tokens_details.cached_tokens 透传');
+  assert.equal(row['token_reasoning'], 1, 'output_tokens_details.reasoning_tokens 透传');
+  assert.equal(row['usage_valid'], 1);
+  assert.ok(row['ttft_upstream_ms'] !== null, '首个 output_text.delta 到达应有 TTFT 样本');
+});
+
+test('Responses②：非流式 JSON 落账（completed→stop；incomplete+max_output_tokens→length；体校验 400/404）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(channelInput({ models: ['resp-alias'], modelMap: { 'resp-alias': 'gpt-upstream-1' } }, stack.mock.port) as never);
+  mock.setResponder(() => ({
+    status: 200,
+    payload: {
+      id: 'resp_2',
+      model: 'gpt-upstream-1',
+      status: 'completed',
+      output: [{ type: 'message', content: [{ type: 'output_text', text: 'hello' }] }],
+      usage: { input_tokens: 5, output_tokens: 1, total_tokens: 6 },
+    },
+  }));
+  const done = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'resp-alias', input: 'hi' }),
+  });
+  assert.equal(done.status, 200);
+  await waitFor(() => fixture.settlementRows().length === 1);
+  const okRow = fixture.settlementRows()[0]!;
+  assert.equal(okRow['finish_reason'], 'stop');
+  assert.equal(okRow['token_prompt'], 5);
+  assert.equal(okRow['token_completion'], 1);
+  assert.ok(okRow['ttft_upstream_ms'] !== null, '非流式 output[] 含非空 output_text 也算内容信号');
+  mock.setResponder(() => ({
+    status: 200,
+    payload: { id: 'resp_3', model: 'gpt-upstream-1', status: 'incomplete', incomplete_details: { reason: 'max_output_tokens' }, output: [], usage: { input_tokens: 2, output_tokens: 16, total_tokens: 18 } },
+  }));
+  const truncated = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'resp-alias', input: 'hi' }),
+  });
+  assert.equal(truncated.status, 200);
+  await waitFor(() => fixture.settlementRows().length === 2);
+  const cutRow = fixture.settlementRows().find((entry) => entry['token_prompt'] === 2)!;
+  assert.equal(cutRow['finish_reason'], 'length', 'max_output_tokens 映射为 length');
+  assert.equal(cutRow['ttft_upstream_ms'], null, '空 output[] 无内容信号，TTFT 必须 NULL 而非 0');
+  const noModel = await request(gateway.port, '/v1/responses', { method: 'POST', headers: authHeaders(gateway), body: JSON.stringify({ input: 'hi' }) });
+  assert.equal(noModel.status, 400);
+  assert.match(noModel.body, /收到值/);
+  assert.match(noModel.body, /示例/);
+  const unknown = await request(gateway.port, '/v1/responses', { method: 'POST', headers: authHeaders(gateway), body: JSON.stringify({ model: 'nope-alias', input: 'hi' }) });
+  assert.equal(unknown.status, 404);
+  assert.match(unknown.body, /未知 model 别名/);
+  assert.equal(mock.state.lastPath, '/v1/responses', '校验失败请求未触达上游（lastPath 仍为上一次成功转发）');
+});
+
+test('unified：统一中转渠道按客户端请求格式透传（messages→x-api-key；chat/responses→Bearer）', { timeout: 15000 }, async () => {
+  const stack = await startGatewayStack();
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  gateway.store.create(
+    channelInput({ protocol: 'unified', models: ['uni-alias'], apiKey: CANARY_KEY, modelMap: { 'uni-alias': 'uni-upstream' } }, stack.mock.port) as never,
+  );
+  mock.setResponder(() => ({ status: 200, payload: { ok: true } }));
+  const chat = await request(gateway.port, '/v1/chat/completions', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'uni-alias', messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(chat.status, 200);
+  assert.equal(mock.state.lastPath, '/v1/chat/completions');
+  assert.equal(mock.state.lastAuth, `Bearer ${CANARY_KEY}`, 'chat → Bearer');
+  assert.equal(mock.state.lastXApiKey, null);
+  const messages = await request(gateway.port, '/v1/messages', {
+    method: 'POST',
+    headers: anthropicAuthHeaders(gateway, { 'anthropic-version': '2024-06-01' }),
+    body: JSON.stringify({ model: 'uni-alias', max_tokens: 16, messages: [{ role: 'user', content: 'hi' }] }),
+  });
+  assert.equal(messages.status, 200);
+  assert.equal(mock.state.lastPath, '/v1/messages');
+  assert.equal(mock.state.lastXApiKey, CANARY_KEY, 'messages → x-api-key');
+  assert.equal(mock.state.lastAuth, null, 'Anthropic 系请求不得携带 Authorization');
+  assert.equal(mock.state.lastAnthropicVersion, '2024-06-01');
+  const responses = await request(gateway.port, '/v1/responses', {
+    method: 'POST',
+    headers: authHeaders(gateway),
+    body: JSON.stringify({ model: 'uni-alias', input: 'hi' }),
+  });
+  assert.equal(responses.status, 200);
+  assert.equal(mock.state.lastPath, '/v1/responses');
+  assert.equal(mock.state.lastAuth, `Bearer ${CANARY_KEY}`, 'responses → Bearer');
+  assert.equal(mock.state.lastXApiKey, null);
+});
+
+test('费用：modelPrices 结算（缓存分量 + 整单阶梯；amount/costUsd 精确；未录价渠道恒 NULL）', { timeout: 15000 }, async () => {
+  const fixture = makeLedgerFixture();
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  const { gateway, mock } = stack;
+  CLEANUPS.push(() => stack.cleanup());
+  CLEANUPS.push(async () => fixture.cleanup());
+  gateway.store.create(
+    channelInput(
+      { models: ['pay-alias'], modelMap: { 'pay-alias': 'gpt-upstream-1' }, modelPrices: { 'pay-alias': { input: 2, output: 10, cachedRead: 0.5 } } },
+      stack.mock.port,
+    ) as never,
+  );
+  gateway.store.create(
+    channelInput(
+      { models: ['tier-alias'], modelMap: { 'tier-alias': 'gpt-upstream-1' }, modelPrices: { 'tier-alias': { input: 2, output: 10, threshold: 10, input2: 100, output2: 200, cachedRead2: 5 } } },
+      stack.mock.port,
+    ) as never,
+  );
+  gateway.store.create(channelInput({ models: ['free-alias'], modelMap: { 'free-alias': 'gpt-upstream-1' } }, stack.mock.port) as never);
+  const usageFrame = (promptTokens: number, completionTokens: number, cachedTokens?: number) =>
+    sseBody([
+      {
+        model: 'gpt-upstream-1',
+        choices: [{ index: 0, delta: { content: 'a' }, finish_reason: 'stop' }],
+        usage: {
+          prompt_tokens: promptTokens,
+          completion_tokens: completionTokens,
+          total_tokens: promptTokens + completionTokens,
+          ...(cachedTokens === undefined ? {} : { prompt_tokens_details: { cached_tokens: cachedTokens } }),
+        },
+      },
+    ]);
+  const send = (alias: string) =>
+    request(gateway.port, '/v1/chat/completions', {
+      method: 'POST',
+      headers: authHeaders(gateway),
+      body: JSON.stringify({ model: alias, messages: [{ role: 'user', content: 'hi' }] }),
+    });
+  mock.setResponder(() => ({ status: 200, sse: usageFrame(14, 3, 4) }));
+  assert.equal((await send('pay-alias')).status, 200);
+  mock.setResponder(() => ({ status: 200, sse: usageFrame(21, 4) }));
+  assert.equal((await send('pay-alias')).status, 200);
+  mock.setResponder(() => ({ status: 200, sse: usageFrame(14, 3, 4) }));
+  assert.equal((await send('tier-alias')).status, 200);
+  mock.setResponder(() => ({ status: 200, sse: usageFrame(10, 1) }));
+  assert.equal((await send('free-alias')).status, 200);
+  await waitFor(() => fixture.settlementRows().length === 4);
+  const rows = fixture.settlementRows();
+  const near = (a: unknown, b: number, label: string) => assert.ok(typeof a === 'number' && Math.abs(a - b) < 1e-12, `${label}：收到 ${String(a)}，期望 ${b}`);
+  const pay1 = rows.find((entry) => entry['alias'] === 'pay-alias' && entry['token_prompt'] === 14)!;
+  const pay2 = rows.find((entry) => entry['alias'] === 'pay-alias' && entry['token_prompt'] === 21)!;
+  near(pay1['amount'], (10 * 2 + 4 * 0.5 + 3 * 10) / 1e6, '缓存分量计费 r1（未缓存 10×2 + 缓存 4×0.5 + 完成 3×10）');
+  near(pay2['amount'], (21 * 2 + 4 * 10) / 1e6, '无缓存上报 r2（21×2 + 4×10）');
+  const tierRow = rows.find((entry) => entry['alias'] === 'tier-alias')!;
+  near(tierRow['amount'], (10 * 100 + 4 * 5 + 3 * 200) / 1e6, 'prompt 14 > threshold 10 → 整单二档，缓存按 cachedRead2');
+  const freeRow = rows.find((entry) => entry['alias'] === 'free-alias')!;
+  assert.equal(freeRow['amount'], null, '未录价渠道 amount 恒 NULL，绝不写 0');
+  const summary = gateway.usageSummary();
+  near(summary.find((row) => row.alias === 'pay-alias')?.costUsd, ((10 * 2 + 4 * 0.5 + 3 * 10) + (21 * 2 + 4 * 10)) / 1e6, '内存汇总按结算价累加');
+  near(summary.find((row) => row.alias === 'tier-alias')?.costUsd, (10 * 100 + 4 * 5 + 3 * 200) / 1e6, '阶梯按整单二档汇总，缓存按 cachedRead2');
+  assert.equal(summary.find((row) => row.alias === 'free-alias')?.costUsd, null, '未录价 → costUsd null（绝不显示 $0）');
 });

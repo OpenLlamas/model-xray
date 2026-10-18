@@ -7,10 +7,10 @@ import { CREDIBILITY_NOTE } from './markdown.js';
 const DIMENSION_DESC: Readonly<Record<string, string>> = {
   identity: '身份与指纹：多角度自述问答与行为指纹比对，识破换标签/套皮；评分依据：自述一致性与指纹命中',
   context: '长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率',
-  billing: 'token 计量与线性：端点自报 usage 对比本地 tokenizer 实算；评分依据：偏差幅度与线性度',
+  billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性；可选 --token-reference 或价格+余额做绝对对账；评分依据：线性度、斜率区间与实测倍率',
   capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
   quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
-  ttft: '流式首字延迟：采样 TTFT 分位数；评分依据：p50/p95 分段阈值',
+  ttft: '流式首字延迟：采样 TTFT 分位数；观测项不计分，仅披露 p50/p95（非流式响应计至完整响应体到达）',
   decoy: '诱饵对照项：不计分，仅用于识别「对固定题集特判」的端点',
 };
 
@@ -128,9 +128,16 @@ function renderEvidence(record: EvidenceRecord): string {
   return `<details class="ev"><summary>${esc(record.id)} · ${esc(record.probe)} · ${esc(record.label)}</summary>
 <p class="muted">HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''} · ${esc(usage)}</p>
 ${record.response.error ? `<p class="muted">error: ${esc(record.response.error)}</p>` : ''}
-<pre>请求: ${esc(record.request.lastUserPreview)}</pre>
-<pre>响应: ${esc(record.response.textPreview)}</pre>
+${record.response.model !== null ? `<p class="muted">回显模型: ${esc(record.response.model)}${record.response.model === record.request.model ? '' : `（请求 ${esc(record.request.model)}）`}</p>` : ''}
+<pre>请求${truncationNote(record.request.lastUserPreview, record.request.lastUserChars)}: ${esc(record.request.lastUserPreview)}</pre>
+${record.request.lastUserTailPreview ? `<pre>请求结尾（长请求尾部摘要，用于核对问题是否在末尾）: ${esc(record.request.lastUserTailPreview)}</pre>` : ''}
+<pre>响应${truncationNote(record.response.textPreview, record.response.textChars)}: ${esc(record.response.textPreview)}</pre>
 </details>`;
+}
+
+function truncationNote(preview: string, fullChars: number): string {
+  const shown = Array.from(preview).length;
+  return shown >= fullChars && !preview.endsWith('…') ? '' : `（预览 ${shown}/${fullChars} 字符，已截断）`;
 }
 
 function esc(text: string): string {

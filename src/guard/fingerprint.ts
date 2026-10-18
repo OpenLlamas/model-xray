@@ -39,7 +39,10 @@ export class FingerprintMonitor implements FingerprintObserver {
   start(): void {
     if (this.timer !== null) return;
     this.timer = setInterval(() => {
-      void this.tick();
+      // 定时器回调绝不允许未处理 rejection 击穿常驻进程：任何异常降级为一行摘要
+      this.tick().catch((error) => {
+        this.options.onSummary?.(`[guard] 指纹复核异常（不影响转发）：${error instanceof Error ? error.message : String(error)}`);
+      });
     }, this.options.intervalMs);
   }
 
