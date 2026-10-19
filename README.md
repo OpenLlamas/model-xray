@@ -193,6 +193,8 @@ Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): 
 
 ![Case: `glm-5.3-flash` standing in for `glm-5.3` with a 1.5× markup — score 45/100, fail](docs/audit-case-glm-5.3.png)
 
+Same case audited from the web console (form with claimed prices entered, in-place scorecard): ![Web console: glm-5.3-flash standing in for glm-5.3, claimed prices entered, score 45/100 fail](docs/audit-case-glm-5.3-webui.png)
+
 ### Web console (local, executable)
 
 `npm run ui` starts a local server on <http://127.0.0.1:8620> (loopback only; auto-opens the browser) and turns the page into a real detection entry point with two tabs (the API aggregation tab is temporarily hidden — pending a later iteration; see below):
@@ -417,6 +419,8 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实测倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。
 
 ![案例：`glm-5.3-flash` 冒充 `glm-5.3` 且倍率 1.5×——总分 45/100，不通过](docs/audit-case-glm-5.3.png)
+
+同一案例在 Web 控制台实测（表单已录入宣称价格、评分卡原位渲染）：![Web 控制台：glm-5.3-flash 冒充 glm-5.3，已录入宣称价格，总分 45/100 不通过](docs/audit-case-glm-5.3-webui.png)
 
 ### Web 控制台（本地、可执行）
 
