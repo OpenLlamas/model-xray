@@ -855,7 +855,7 @@ function findRepoRoot(): string {
 const REPO_ROOT = findRepoRoot();
 const SERVE_URL = pathToFileURL(join(REPO_ROOT, 'scripts', 'serve.mjs')).href;
 const serveModule = (await import(SERVE_URL)) as {
-  createConsoleServer(options: { port: number; repoRoot: string }): Promise<{
+  createConsoleServer(options: { port: number; repoRoot: string; gatewayEnabled?: boolean }): Promise<{
     port: number;
     token: string;
     close(): Promise<void>;
@@ -882,8 +882,24 @@ test('管理面：无 token 一律 403（GET 亦要求 token）', async () => {
   assert.equal(startNoToken.status, 403);
 });
 
-test('管理面：start（随机回环端口）→ running；重复 start → 409；渠道 CRUD/删除/停用语义成立', { timeout: 20000 }, async () => {
+test('管理面：API 聚合默认停用（后需迭代上线）——携合法 token 亦回 503，token 校验仍先于停用判定', async () => {
   const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  CLEANUPS.push(async () => {
+    await server.close().catch(() => undefined);
+  });
+  const disabled = await request(server.port, '/api/gateway/status', { headers: manageHeaders(server.token) });
+  assert.equal(disabled.status, 503);
+  assert.match(disabled.body, /后需迭代上线/);
+  const disabledStart = await request(server.port, '/api/gateway/start', {
+    method: 'POST',
+    headers: manageHeaders(server.token),
+    body: '{}',
+  });
+  assert.equal(disabledStart.status, 503, 'POST 端点同样停用，不得绕过开关启动网关');
+});
+
+test('管理面：start（随机回环端口）→ running；重复 start → 409；渠道 CRUD/删除/停用语义成立', { timeout: 20000 }, async () => {
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -968,7 +984,7 @@ test('管理面：start（随机回环端口）→ running；重复 start → 40
 });
 
 test('管理面：未运行时渠道端点仍可用（持久 store 预配置），虚拟 key 端点 400 引导启动（非 500 崩溃）', async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -986,7 +1002,7 @@ test('管理面：未运行时渠道端点仍可用（持久 store 预配置）�
 });
 
 test('管理面：启动前预配置渠道 → 启动后数据面 /v1/models 即可见（store 注入回归），停止再启动仍保留', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1017,7 +1033,7 @@ test('管理面：启动前预配置渠道 → 启动后数据面 /v1/models 即
 });
 
 test('管理面：并发 start 只允许一个成功（另一个 409，不泄漏第二个监听实例）', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1034,7 +1050,7 @@ test('管理面：并发 start 只允许一个成功（另一个 409，不泄漏
 });
 
 test('管理面：start 参数非法（400）后 starting 已复位，可立即正常启动（finally 复位回归）', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1053,7 +1069,7 @@ test('管理面：start 参数非法（400）后 starting 已复位，可立即�
 
 test('管理面：未构建 → start 503 引导；复制 dist 后免重启重试成功（加载失败不缓存为永久 null）', { timeout: 20000 }, async () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'mx-serve-root-'));
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: tempRoot });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: tempRoot, gatewayEnabled: true });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
     rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3 });

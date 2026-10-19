@@ -25,6 +25,8 @@
   .tabs button[aria-selected="true"] { border-color: #b5a2ff20; background: linear-gradient(100deg, #a88bff1d, #a88bff08); color: #eee9ff; box-shadow: inset 2px 0 #b6a2ff; }
   .nav-icon { width: 19px; color: #878391; font-size: 16px; text-align: center; }
   .tabs button[aria-selected="true"] .nav-icon { color: #c0adff; }
+  .tabs button[hidden] { display: none; }
+  .nav-hint { padding: 9px 11px 0; }
   .sidebar-spacer { flex: 1; }
   .local-card { padding: 13px; border: 1px solid #ffffff0d; border-radius: 11px; background: linear-gradient(145deg, #171922, #111319); }
   .local-card-title { display: flex; align-items: center; gap: 8px; margin-bottom: 7px; color: #d0d0d9; font-size: 12px; font-weight: 600; }
@@ -175,7 +177,7 @@ button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8;
   #offline-banner { margin-top: 18px; }
   @keyframes panel-enter { from { opacity: .55; transform: translateY(4px); } to { opacity: 1; transform: translateY(0); } }
   @media (max-width: 900px) { .sidebar { width: 205px; } .workspace { margin-left: 205px; } main { padding-right: 24px; padding-left: 24px; } .topbar { padding: 0 24px; } }
-  @media (max-width: 690px) { .sidebar { position: sticky; inset: 0 0 auto; width: 100%; height: auto; padding: 10px 13px 0; border-right: 0; border-bottom: 1px solid #ffffff0c; } .brand { padding: 0 5px 10px; } .brand-mark { width: 30px; height: 30px; } .nav-label, .local-card, .sidebar-foot, .sidebar-spacer { display: none; } .tabs { display: flex; gap: 5px; overflow-x: auto; margin: 0; padding-bottom: 8px; } .tabs button { min-height: 37px; flex: 0 0 auto; gap: 7px; padding: 0 9px; font-size: 10px; } .nav-icon { width: auto; font-size: 13px; } .workspace { margin-left: 0; } .topbar { position: static; min-height: 46px; padding: 0 16px; } main { padding: 26px 15px 48px; } .page-heading { margin-bottom: 17px; } .keybar { gap: 7px; flex-wrap: wrap; padding: 10px; } .keybar .state { flex: 1 1 100%; } .keybar input { flex-basis: 150px; } .panel { padding: 16px 13px; } .panel-head { margin-bottom: 13px; } .metric-strip { grid-template-columns: 1fr; gap: 7px; } .metric { min-height: 0; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; } .metric-value { margin: 0; font-size: 14px; } #report-list li { gap: 8px; } #report-list .meta { white-space: normal; text-align: right; } }
+  @media (max-width: 690px) { .sidebar { position: sticky; inset: 0 0 auto; width: 100%; height: auto; padding: 10px 13px 0; border-right: 0; border-bottom: 1px solid #ffffff0c; } .brand { padding: 0 5px 10px; } .brand-mark { width: 30px; height: 30px; } .nav-label, .local-card, .sidebar-foot, .sidebar-spacer, .nav-hint { display: none; } .tabs { display: flex; gap: 5px; overflow-x: auto; margin: 0; padding-bottom: 8px; } .tabs button { min-height: 37px; flex: 0 0 auto; gap: 7px; padding: 0 9px; font-size: 10px; } .nav-icon { width: auto; font-size: 13px; } .workspace { margin-left: 0; } .topbar { position: static; min-height: 46px; padding: 0 16px; } main { padding: 26px 15px 48px; } .page-heading { margin-bottom: 17px; } .keybar { gap: 7px; flex-wrap: wrap; padding: 10px; } .keybar .state { flex: 1 1 100%; } .keybar input { flex-basis: 150px; } .panel { padding: 16px 13px; } .panel-head { margin-bottom: 13px; } .metric-strip { grid-template-columns: 1fr; gap: 7px; } .metric { min-height: 0; display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; } .metric-value { margin: 0; font-size: 14px; } #report-list li { gap: 8px; } #report-list .meta { white-space: normal; text-align: right; } }
   @media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; transition-duration: .01ms !important; } }
 </style>
 </head>
@@ -186,9 +188,10 @@ button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8;
     <div class="nav-label">工作区</div>
     <nav class="tabs" aria-label="工作区导航">
       <button id="tab-test" type="button" aria-selected="true"><span class="nav-icon">◈</span>模型检测</button>
-      <button id="tab-gateway" type="button" aria-selected="false"><span class="nav-icon">⛓</span>API 聚合</button>
+      <button id="tab-gateway" type="button" aria-selected="false" hidden><span class="nav-icon">⛓</span>API 聚合</button>
       <button id="tab-reports" type="button" aria-selected="false"><span class="nav-icon">▤</span>检测报告</button>
     </nav>
+    <p class="hints nav-hint">API 聚合实时监控 · 后需迭代上线</p>
     <div class="sidebar-spacer"></div>
     <div class="local-card"><div class="local-card-title"><span class="dot on"></span>隐私优先</div><p>请求、密钥和检测证据均由本机处理。模型能力与计量结论基于实际探测，不依赖供应商自述。</p></div>
     <div class="sidebar-foot">MODEL-XRAY · LOCAL WORKSPACE</div>
@@ -197,7 +200,7 @@ button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8;
     <header class="topbar"><div class="crumb">工作区 <span>/</span> <strong>模型可信度</strong></div><div class="top-actions"><span class="local-pill">LOCAL ONLY</span><span class="hints">v0.2 · 本机运行</span></div></header>
     <main>
       <div class="page-heading"><div><p class="eyebrow">Model observability</p><h1>看清每一次 <span>模型交付</span></h1><p class="privacy">用可复现的探针核验模型身份、能力、上下文与用量。<strong>发现证据，而不只是相信标签。</strong></p></div></div>
-      <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测、聚合与报告列表不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
+      <div id="offline-banner" class="banner banner-offline" hidden>当前页面未连接本地服务（token 未注入）：检测与报告列表不可用。请在仓库目录运行 <code>npm run ui</code> 后使用打开的页面。</div>
       <div id="ledger-degraded-banner" class="banner banner-warn" hidden></div>
       <section id="panel-test" class="panel">
         <div class="panel-head"><div><p class="eyebrow">01 / 一次性审计</p><h2>验证一个模型端点</h2><p>执行独立探针并生成带原始证据的评分报告。深度测试会产生真实 API 请求及费用。</p></div><span class="panel-kicker">AUDIT RUN</span></div>

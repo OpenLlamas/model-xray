@@ -464,6 +464,9 @@ test('桌面工作区：导航项与检测/聚合/报告视图一一对应（gua
   assert.ok(!dashboardHtml.includes('tab-guard'), '不得再有「实时监控」独立标签（监控并入 API 聚合页）');
   assert.ok(!dashboardHtml.includes('panel-guard'), '不得再有 guard 面板（透明代理仅保留 CLI）');
   assert.ok(!dashboardHtml.includes('/api/guard/'), '页面不得再调用已移除的 guard 托管端点');
+  // API 聚合暂未上线（后需迭代上线）：标签隐藏、侧栏标注提示，面板结构保留待复用
+  assert.match(dashboardHtml, /<button id="tab-gateway"[^>]*hidden/, 'API 聚合标签须隐藏（后需迭代上线）');
+  assert.match(dashboardHtml, /API 聚合实时监控 · 后需迭代上线/, '侧栏须标注「后需迭代上线」提示');
   assert.match(dashboardHtml, /id="f-channel-key"[^>]*type="password"/);
   assert.match(dashboardHtml, /id="f-gateway-client-key"[^>]*type="password"/);
   assert.match(dashboardHtml, /@media \(max-width: 690px\)/);

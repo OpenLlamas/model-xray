@@ -1467,7 +1467,7 @@ if (typeof document !== 'undefined') {
   renderUsage([]);
   renderAlerts([]);
 
-  void refreshGateway();
+  if (tabs.gateway?.getAttribute('aria-selected') === 'true') void refreshGateway(); // 聚合页隐藏期间不做无用初始化请求
   window.setInterval(() => {
     if (tabs.gateway?.getAttribute('aria-selected') === 'true') void refreshGateway();
   }, 2500);
