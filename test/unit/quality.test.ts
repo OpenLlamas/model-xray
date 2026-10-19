@@ -30,6 +30,9 @@ test('checkAnswer: wrong value still rejected (no false positive from comma stri
   assert.ok(!checkAnswer('7,719', question(7718)));
   assert.ok(!checkAnswer('718', question(7718)));
   assert.ok(!checkAnswer('无数字', question(7718)));
+  // 小数整体解析：整数题答 42.5 不因包含 42 被判对；42.0 等于整数 42，仍算对
+  assert.ok(!checkAnswer('42.5', question(42)));
+  assert.ok(checkAnswer('42.0', question(42)));
 });
 
 test('checkAnswer: exclusive distractor still blocks (comma-aware both sides)', () => {
@@ -393,6 +396,24 @@ test('quality scoring: 8/12 correct → warn 67 with wrong-topic list', async ()
   assert.equal(outcome.level, 'warn');
   assert.equal(outcome.score, 67);
   assert.match(outcome.headline, /质量可疑：主题 8\/12，错误集中在/);
+});
+
+test('quality scoring: accuracy carries a 95% Wilson CI disclosure (metrics + info finding, thresholds unchanged)', async () => {
+  const wrongIds = new Set(mains().slice(0, 4).map((q) => q.id));
+  const { client } = scriptedQuality((q) => (q.control || !wrongIds.has(q.id) ? rightAnswer(q) : wrongAnswer(q)));
+  const outcome = await probeQuality(qualityCtx(client));
+  // 0.9/0.6 判定阈值口径不变：8/12 ≈ 0.667 仍是 warn 67
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 67);
+  const low = outcome.metrics['accuracy_ci95_low'] as number;
+  const high = outcome.metrics['accuracy_ci95_high'] as number;
+  assert.ok(Number.isFinite(low) && Number.isFinite(high), `CI metrics=[${low}, ${high}]`);
+  assert.ok(low >= 0 && high <= 1 && low < high, `CI=[${low}, ${high}] 必须为有序 [0,1] 区间`);
+  assert.ok(low < 8 / 12 && 8 / 12 < high, `CI=[${low}, ${high}] 必须覆盖点估计 8/12`);
+  // 12 题样本的区间必然较宽 → 披露 finding 须提示置信度有限
+  const ciFinding = outcome.findings.find((f) => f.level === 'info' && /置信区间/.test(f.message));
+  assert.ok(ciFinding, JSON.stringify(outcome.findings));
+  assert.match(ciFinding?.message ?? '', /样本量偏小|置信度有限/);
 });
 
 test('quality insufficient: all mains starved → 0-usable branch (not a 0-score accusation)', async () => {

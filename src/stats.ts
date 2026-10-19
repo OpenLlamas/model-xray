@@ -81,6 +81,17 @@ export function wilsonLowerBound(successes: number, total: number, z = 1.64): nu
   return Math.max(0, (center - spread) / denom);
 }
 
+/** Wilson 区间上界（与 wilsonLowerBound 同公式镜像，clamp 到 [0,1]）；仅供披露，不参与判定阈值。 */
+export function wilsonUpperBound(successes: number, total: number, z = 1.64): number {
+  if (!Number.isFinite(successes) || !Number.isFinite(total) || total <= 0) return 1;
+  const clampedSuccesses = Math.max(0, Math.min(total, successes));
+  const p = clampedSuccesses / total;
+  const denom = 1 + (z * z) / total;
+  const center = p + (z * z) / (2 * total);
+  const spread = z * Math.sqrt((p * (1 - p)) / total + (z * z) / (4 * total * total));
+  return Math.min(1, (center + spread) / denom);
+}
+
 export function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(100, Math.round(value)));

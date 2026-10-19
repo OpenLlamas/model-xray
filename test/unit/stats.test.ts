@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { linearRegression, mad, median, quantile, stdev, wilsonLowerBound } from '../../src/stats.js';
+import { linearRegression, mad, median, quantile, stdev, wilsonLowerBound, wilsonUpperBound } from '../../src/stats.js';
 
 test('quantile: interpolation and edges', () => {
   const xs = [1, 2, 3, 4, 5];
@@ -55,4 +55,24 @@ test('wilson guard: non-finite or non-positive totals return 0 (no >1 pseudo-low
   assert.equal(wilsonLowerBound(5, Number.POSITIVE_INFINITY), 0);
   assert.equal(wilsonLowerBound(5, -1), 0);
   assert.equal(wilsonLowerBound(5, 0), 0);
+});
+
+test('wilsonUpperBound mirrors lower bound and stays in [0,1]', () => {
+  const upper = wilsonUpperBound(10, 10);
+  assert.ok(upper > 0.5 && upper <= 1);
+  assert.ok(wilsonUpperBound(0, 0) === 1);
+  assert.ok(wilsonUpperBound(5, 10) >= 0 && wilsonUpperBound(5, 10) <= 1);
+  assert.ok(wilsonUpperBound(-3, 10) >= 0);
+  assert.ok(wilsonUpperBound(99, 10) <= 1);
+
+  // 镜像性：successes 与 total-successes 互换时上下界互补（同一区间两端）
+  const low = wilsonLowerBound(7, 20, 1.96);
+  const high = wilsonUpperBound(13, 20, 1.96);
+  assert.ok(Math.abs(low + high - 1) < 1e-9, `low=${low} high=${high}`);
+
+  // 守卫对称：total 非正/非有限时上界返回 1（与下界 0 组成完整 [0,1] 不确定区间）
+  assert.equal(wilsonUpperBound(Number.NaN, 10), 1);
+  assert.equal(wilsonUpperBound(5, Number.NaN), 1);
+  assert.equal(wilsonUpperBound(5, 0), 1);
+  assert.equal(wilsonUpperBound(5, -1), 1);
 });

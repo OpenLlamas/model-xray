@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { probeContext } from '../../src/probes/context.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
+import { estimateMessageTokens } from '../../src/tokens.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
 
 /**
@@ -14,6 +15,12 @@ import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from 
  * 若简单改成「必须整档零命中」又会漏检。本组用例钉住两条边界：
  * ① 稀疏零星未命中 → warn（附命中计数，供人工复测）；
  * ② 整档零命中 / 单调恶化 / 双控制同时失败 / 二分扫描确认 / 400 尺寸类显式拒绝 → fail。
+ *
+ * 2026-10-18 审计修复追加的三条口径（对应测试见文件尾部）：
+ * ③ recordId 与 passphrase 分离：问题里只有记录编号，命中必须复述文档正文里的校验口令
+ *   （复述编号 = 不读文档，不得计命中）；
+ * ④ 边界扫描的 HTTP 200 空文本不算「不可读」证据：扫描立即终止且不判截断；
+ * ⑤ usage 校准：通过结论须核对端点自报 prompt_tokens 达到标称 90%，不可信 usage 仅披露不降级。
  */
 
 function hitResult(text: string): ChatResult {
@@ -55,18 +62,31 @@ function failResult(status: number, error: string): ChatResult {
 }
 
 /**
+ * 从请求 prompt 解析文档正文里的校验口令（needle 三种格式 + 结尾回显的尾部格式）：
+ * 「命中」的正确语义是复述口令；问题里的记录编号只用于定位记录，复述编号不算命中
+ * （2026-10-18 审计缺陷 ①：编号与口令复用同一随机串时可被「复述问题」假通过）。
+ */
+function passphraseOf(prompt: string): string {
+  return (
+    prompt.match(/校验口令是\s*([A-Z0-9]{6})/)?.[1] ??
+    prompt.match(/passphrase for this section is\s*([A-Z0-9]{6})/i)?.[1] ??
+    prompt.match(/唯一有效校验码：\s*([A-Z0-9]{6})/)?.[1] ??
+    prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ??
+    'ZZZZZZ'
+  );
+}
+
+/**
  * 脚本化客户端：needle 请求按序号（0..2=25% 档，3..5=50%，6..8=75%，9..11=90%）
  * 走策略函数；echo 请求按提示词里的「结尾核对」标记识别。
- * 命中策略只需返回「是否命中」，命中文案统一为该请求自己的 nonce（从问题里解析）。
+ * 命中策略只需返回「是否命中」，命中文案统一复述该请求文档里的校验口令。
  */
 function scriptedContextClient(
-  needle: (index: number) => 'hit' | 'miss' | ChatResult,
+  needle: (index: number, prompt: string) => 'hit' | 'miss' | ChatResult,
   echo: 'auto' | 'hit' | 'miss' | ChatResult,
 ): { client: OpenAIClient; requests: ChatRequest[] } {
   const requests: ChatRequest[] = [];
   let needleIndex = 0;
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
   return {
     requests,
     client: {
@@ -76,10 +96,10 @@ function scriptedContextClient(
         const last = req.messages[req.messages.length - 1];
         const prompt = typeof last?.content === 'string' ? last.content : '';
         const isEcho = prompt.includes('结尾核对');
-        const outcome = isEcho ? echo : needle(needleIndex++);
+        const outcome = isEcho ? echo : needle(needleIndex++, prompt);
         if (typeof outcome !== 'string') return outcome;
         // 'auto' = 结尾回显默认命中（正常端点都能复述尾部）
-        return outcome === 'hit' || outcome === 'auto' ? hitResult(nonceOf(prompt)) : hitResult('未找到相关记录');
+        return outcome === 'hit' || outcome === 'auto' ? hitResult(passphraseOf(prompt)) : hitResult('未找到相关记录');
       },
     },
   };
@@ -188,6 +208,41 @@ test('context: 400 尺寸类显式拒绝 → fail 15（差分验证通过后才�
   assert.match(String(outcome.metrics['size_differential']), /accepted/);
 });
 
+test('context: 50% 档可读、75%/90% 整档 400 → 显式拒绝前沿从 75% 起成立，fail 15', async () => {
+  const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
+  // 25%/50% 命中；75%/90% 整档 400；12/13 = 短输入对照成功；14 = 在最小整档被拒深度（75%）复验仍 400。
+  const { client } = scriptedContextClient((index) => {
+    if (index >= 12 && index <= 13) return 'hit';
+    if (index === 14) return tooLong();
+    if (index >= 6) return tooLong();
+    return 'hit';
+  }, tooLong());
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.equal(outcome.score, 15);
+  assert.match(outcome.headline, /显式拒绝/);
+  assert.equal(outcome.metrics['depth_explicit_reject'], 1);
+  assert.match(String(outcome.metrics['size_differential']), /75%:rejected/);
+});
+
+test('context: 50% 档首样本偶发 400 后成功、75%/90% 整档 400 → 复验取 75% 前沿，不因 50% 偶发 400 漏判', async () => {
+  const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
+  // 50% 首样本 400、同档其余成功；75%/90% 整档 400。
+  // 14 = 长样本复验：只有发到 75%（约 24000 tokens）才被拒；若错发到 50%（约 16000 tokens）会成功。
+  // 这钉住复验长度必须取「首个整档被拒的高深度档」，而不是该档内任意一次 400 的最小深度。
+  const { client } = scriptedContextClient((index, prompt) => {
+    if (index >= 12 && index <= 13) return 'hit';
+    if (index === 14) return prompt.length > 22000 ? tooLong() : 'hit';
+    if (index === 3 || index >= 6) return tooLong();
+    return 'hit';
+  }, tooLong());
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.equal(outcome.score, 15);
+  assert.equal(outcome.metrics['depth_explicit_reject'], 1);
+  assert.match(String(outcome.metrics['size_differential']), /75%:rejected/);
+});
+
 test('context: 高深度档首样本 400、后续样本成功 → 不构成整档显式拒绝', async () => {
   // records.find(depth) 只取该档第一条记录：若首样本是 400、后续样本成功，
   // 旧逻辑会误把「首条 400」当成「整档全部 400」→ explicitReject 误定罪。
@@ -235,8 +290,7 @@ test('context: 400 文案未提及长度且短输入对照同样 400 → 差分�
 test('context --deep: 边界扫描「先成功未命中、后遇传输故障」→ 不判截断（foundAtTokens 须一并失效）', async () => {
   // 层 3 反向审查明确要求的用例：break 前已得的 foundAtTokens 若不清空，一次故障后仍会触发 fail 10。
   let calls = 0;
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
     async chat(req: ChatRequest): Promise<ChatResult> {
@@ -261,8 +315,7 @@ test('context --deep: 边界扫描遇传输故障 → 不判「边界扫描确�
   // needle 请求在 calls>13 后一律传输故障（90% 档因此没有有效样本），结尾回显同样失败；
   // 随后边界二分扫描的请求也一律传输故障。边界故障不得变成截断定论；但缺失深度 + 回显未取得
   // 也不足以给出 pass，须诚实降为不可判定。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let calls = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -307,8 +360,7 @@ test('context --deep: 边界定界至少需要同尺寸三点一致 miss（主�
   // 双审必修项 1（2026-10-17 终轮裁决）：原确认链只需「主样本 miss + 确认① miss」即记 foundAt，
   // 对同尺寸注意力衰减/结构相关偶发漏回显仍有诬告通道 → 增加第二发确认样本，三点一致才定界；
   // 任一确认命中 → 视为噪声（lo=mid，不记边界）。边界采样为双 needle（文档开头+结尾），全 miss 扣任一 needle。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let calls = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -331,8 +383,7 @@ test('context --deep: 边界定界至少需要同尺寸三点一致 miss（主�
 
 test('context --deep: 边界三点一致 miss → 确认定界（foundAtTokens 记录）', async () => {
   // 双审必修项 1 的通过侧：确认链必须仍能在稳定失败点成立（加确认样本不得漏检真截断）。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let calls = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -353,8 +404,7 @@ test('context --deep: 边界三点一致 miss → 确认定界（foundAtTokens �
 test('context --deep: 确认样本遇尺寸类 400 → 不得与主样本 miss 混构「确认截断」（拒绝类证据不入定罪链）', async () => {
   // 双审必修项 1 后半：拒绝类证据与「正文未命中」是两类事由——确认链任一发为尺寸类 400 时只收敛区间，
   // 不记 foundAt；是否定罪走 needle 阶段的差分验证口径（400 全样本 + 前沿 + 差分）。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let calls = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -378,8 +428,7 @@ test('context --deep: 确认样本遇尺寸类 400 → 不得与主样本 miss �
 test('context: 结尾回显传输故障 + 稀疏高深度 miss → warn 55（不得输出「全部命中」的 pass）', async () => {
   // 2026-10-17 调试实证的标题不一致缺陷：0.75 档 3/4 + echo 传输故障时，
   // 「echo 故障仅披露」分支抢先 return pass，标题声称 needle 全部命中与 depth_hits 计数矛盾。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let needleIndex = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -434,8 +483,7 @@ test('context: 部分深度空响应且仅一档命中 → insufficient（不得
 test('context --deep: 部分深度全空 + 结尾回显空响应 → insufficient（不得凭其余深度 pass 100）', async () => {
   // --deep 跳过「每档有效样本覆盖」提前返回（边界扫描可能补正证据）；但回显同样未取得时，
   // 缺失深度没有任何可读性证据，不能宣称标称窗口通过。
-  const nonceOf = (prompt: string): string =>
-    prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/)?.[1] ?? 'ZZZZZZ';
+  const nonceOf = passphraseOf; // 命中 = 复述文档里的校验口令（问题里只有记录编号）
   let call = 0;
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -459,6 +507,36 @@ test('context --deep: 部分深度全空 + 结尾回显空响应 → insufficien
   assert.equal(call, 26, '边界扫描 3 步 × 2 位置应全部读取，且结论应为证据不足');
 });
 
+test('context --deep: 部分深度无有效样本但其余深度与边界扫描通过 → pass 100 且披露缺失深度', async () => {
+  // 缺失深度（75%/90%）没有 needle 证据，不能把「其余深度命中 + 边界扫描可读」写成
+  // 「needle 全部命中」；pass 仍可成立，但标题与 finding 必须披露缺失深度。
+  let call = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const last = req.messages[req.messages.length - 1];
+      const prompt = typeof last?.content === 'string' ? last.content : '';
+      if (prompt.includes('结尾核对')) return hitResult(passphraseOf(prompt));
+      const index = call;
+      call += 1;
+      // --deep 每档 5 样本：0..4=25%、5..9=50% 命中；10..19=75%/90% 空响应；20 起边界扫描命中
+      if (index < 10) return hitResult(passphraseOf(prompt));
+      if (index < 20) return hitResult('');
+      return hitResult(passphraseOf(prompt));
+    },
+  };
+  const outcome = await probeContext(makeCtx(client, true));
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['missing_depths'], '75%,90%');
+  assert.match(outcome.headline, /缺失 75%、90%/);
+  assert.ok(!/needle 全部命中/.test(outcome.headline), outcome.headline);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'info' && /没有有效 needle 样本/.test(f.message) && /75%、90%/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
 test('context: 低成本 1 样本档的未命中只报疑似 warn，不直接判 fail', async () => {
   // 每档 1 样本时，低深度 0/1 + 高深度未命中曾被直接判「窗口不实」（10 分 fail）。
   // 单样本未命中是注意力噪声的高发区：低成本档只作筛查，定论必须 --context-samples 3/--deep。
@@ -471,4 +549,119 @@ test('context: 低成本 1 样本档的未命中只报疑似 warn，不直接判
   assert.match(outcome.headline, /初步筛查/);
   assert.match(outcome.headline, /--context-samples 3 或 --deep/);
   assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+// ---------- 2026-10-18 审计缺陷 ①：只复述问题里的记录编号 ≠ 命中（recordId ≠ passphrase 后的负例） ----------
+
+test('context ③: 端点只复述问题里的记录编号（不读文档）→ 全部未命中，fail 而非假通过', async () => {
+  // 端点「取巧」策略：从问题里抓 record [A-Z0-9]{6} 原样作答。旧实现 recordId=passphrase 复用
+  // 同一随机串时，这条路径就是假通过 100 分；现在编号与口令分离，复述编号 0 命中。
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const last = req.messages[req.messages.length - 1];
+      const prompt = typeof last?.content === 'string' ? last.content : '';
+      if (prompt.includes('结尾核对')) {
+        return hitResult(prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? '');
+      }
+      const recordId =
+        prompt.match(/编号([A-Z0-9]{6})/)?.[1] ?? prompt.match(/record ([A-Z0-9]{6})/i)?.[1] ?? '';
+      return hitResult(recordId);
+    },
+  };
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'fail', `复述编号不得计命中：${outcome.headline}`);
+  assert.equal(outcome.score, 20, '全部 needle 零命中按「未获得任何命中」计 20');
+  assert.match(outcome.headline, /未获得任何命中/);
+  assert.equal(outcome.metrics['tail_echo'], 'hit');
+});
+
+// ---------- 2026-10-18 审计缺陷 ②：boundary 空响应样本 → 终止扫描且不判截断 ----------
+
+test('context --deep ④: 边界扫描遇 HTTP 200 空文本 → blank 终止，仍 pass 100 不判截断', async () => {
+  let call = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const last = req.messages[req.messages.length - 1];
+      const prompt = typeof last?.content === 'string' ? last.content : '';
+      if (prompt.includes('结尾核对')) {
+        return hitResult(prompt.match(/结尾核对 ([A-Z0-9]{6})/)?.[1] ?? '');
+      }
+      const index = call;
+      call += 1;
+      // --deep 每档 5 样本：0..4=25%、5..9=50%、10..14=75%、15..19=90%；20 起为边界扫描
+      if (index < 20) return hitResult(passphraseOf(prompt));
+      return hitResult(''); // 边界扫描全部返回 200 空文本（真机 xianyu1 事故形态）
+    },
+  };
+  const outcome = await probeContext(makeCtx(client, true));
+  assert.equal(outcome.level, 'pass', `空响应不得判截断：${outcome.headline}`);
+  assert.equal(outcome.score, 100);
+  assert.match(String(outcome.metrics['boundary'] ?? ''), /blank=true/);
+  assert.match(String(outcome.metrics['boundary'] ?? ''), /found=n\/a/);
+  assert.equal(outcome.metrics['boundary_blank'], 1);
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /空响应样本/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+// ---------- 2026-10-18 审计缺陷 ③：usage 校准（claims vs 实际发送深度） ----------
+
+/** 与 scriptedContextClient 同构，但 usage.prompt_tokens 用 estimateMessageTokens 实算（同源基准）。 */
+function usageAwareClient(scale: number | null): { client: OpenAIClient } {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const last = req.messages[req.messages.length - 1];
+      const prompt = typeof last?.content === 'string' ? last.content : '';
+      const aligned = estimateMessageTokens(req.messages);
+      const base = hitResult(passphraseOf(prompt));
+      const promptTokens = scale === null ? 10 : Math.round(aligned * scale);
+      return { ...base, usage: { prompt_tokens: promptTokens, completion_tokens: 5, total_tokens: promptTokens + 5 } };
+    },
+  };
+  return { client };
+}
+
+test('context ⑤: usage 校准通过 — 实测输入达标称 90% → pass 100 并披露实测 token', async () => {
+  const { client } = usageAwareClient(1);
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  const maxActual = outcome.metrics['actual_prompt_tokens_max'];
+  // buildFiller 按 estimateTokens 欠冲 ~1.3%：实际发送最大 ≈ 28416（标称 32000 的 ~89%）
+  assert.ok(typeof maxActual === 'number' && maxActual >= 32000 * 0.85, `actual_prompt_tokens_max=${maxActual}`);
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /实测输入 token/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /未经端点自报用量校准/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('context ⑤: usage 校准不通过 — 实测最大输入仅 70% → insufficient（不得宣称 32k 通过）', async () => {
+  const { client } = usageAwareClient(0.7);
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient', outcome.headline);
+  assert.equal(outcome.score, null);
+  assert.match(outcome.headline, /实测输入深度不足/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /实测最大输入仅/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('context ⑤: usage 与实际量级不符（prompt_tokens=10）→ 不可信比值不算校准，仍 pass 但如实披露', async () => {
+  const { client } = usageAwareClient(null);
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['actual_prompt_tokens_max'], 'N/A');
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /未经端点自报用量校准/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /实测最大输入仅/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('context ⑤: --deep 边界扫描完整走完（确定性证据）→ usage 偏低不推翻边界结论，仍 pass 100', async () => {
+  // 边界扫描在 claim 量级实际发送并读取 needle：这是比 usage 自报更强的发送深度证据。
+  // 端点自报偏低（0.7×，可能只是分词口径差异）不得把确定性边界结论降为无法判定。
+  const { client } = usageAwareClient(0.7);
+  const outcome = await probeContext(makeCtx(client, true));
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['boundary_conclusive'], 1);
+  assert.match(String(outcome.metrics['boundary'] ?? ''), /found=n\/a/);
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /实测最大输入仅/.test(f.message)), JSON.stringify(outcome.findings));
 });

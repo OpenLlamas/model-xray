@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { createClient, QuotaExhaustedError } from './client.js';
 import { createEvidenceRecorder, recordCall } from './evidence.js';
+import { runFailureDigest } from './diagnostics.js';
 import { createRng } from './random.js';
 import { ASSETS_VERSION, DECOYS, PROBESET_VERSION } from './assets.js';
 import { computeTotal } from './scoring.js';
@@ -96,6 +97,7 @@ export async function runAudit(
     apiKey: cfg.apiKey,
     timeoutMs: cfg.timeoutMs,
     retries: cfg.retries,
+    httpRetries: cfg.httpRetries,
     abortOnQuota: true,
     onRequest:
       activity === undefined
@@ -160,6 +162,9 @@ export async function runAudit(
     );
   }
   notes.push(...gatewayDiagnosisNotes(outcomes, evidence.all(), cfg.model));
+  // 运行级失败归因：N/M 笔请求被端点/网关拒绝等，让「为什么这么多未判定」一眼可读
+  const runFailureNote = runFailureDigest(evidence.all());
+  if (runFailureNote !== null) notes.push(runFailureNote);
 
   // 指纹基线：先构建本轮基线，再与输入基线对比；全部在 computeTotal 之前完成
   const currentBaseline = buildBaseline(outcomes, {

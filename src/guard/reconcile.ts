@@ -176,6 +176,11 @@ export class Reconciler {
     } else if (spendDelta === null) {
       verdict = 'skipped';
       message = '两次余额读数不同源（endpoint/kind/unit 不一致），无法作差，本窗口跳过对账。';
+    } else if (this.lastReading?.unit !== 'USD' || reading.unit !== 'USD') {
+      // quota 等非美元口径与按宣称价格折算的美元成本直接作比会产出天文倍率（假 fail）；
+      // 工具不换算单位，必须跳过（与一次性审计 decideRatio 的非美元门同口径）。
+      verdict = 'skipped';
+      message = `余额读数单位为 ${this.lastReading?.unit ?? 'unknown'}/${reading.unit}（非美元口径），无法与美元应缴金额直接作比（工具不换算单位），本窗口跳过对账。`;
     } else if (spendDelta < 0) {
       verdict = 'skipped_recharge';
       message = `窗口内余额不降反升（Δ=${round(spendDelta)}），疑充值/退款混入，作废本窗口不出倍率。`;

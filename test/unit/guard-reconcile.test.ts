@@ -214,6 +214,31 @@ test('guard reconcile：分母 0（全部 usage 缺失）→ skipped，缺失单
   }
 });
 
+test('guard reconcile：非美元口径（quota）→ skipped，不出假倍率', async () => {
+  // quota 粒度与 USD 不同；同源 quota 差值 ÷ 美元应缴会产出天文倍率，必须跳过（不换算单位）。
+  const quota = (value: number): BalanceReading => ({
+    value,
+    kind: 'balance',
+    unit: 'quota',
+    currency: null,
+    endpoint: '/api/user/self',
+  });
+  const harness = makeHarness([quota(500000), quota(499000)]);
+  try {
+    const reconciler = harness.makeReconciler();
+    await reconciler.initialize();
+    reconciler.recordCompletion(USAGE);
+    await reconciler.tick(true);
+    const entry = (await readReconcileEntries(harness))[0];
+    assert.ok(entry);
+    assert.equal(entry.verdict, 'skipped');
+    assert.equal(entry.ratio, null);
+    assert.match(entry.message, /非美元口径/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
 test('guard reconcile：Δ<0（充值/退款混入）→ skipped_recharge，不出 ratio', async () => {
   const harness = makeHarness([spent(10), spent(9)]);
   try {

@@ -77,26 +77,32 @@ export function buildFiller(rng: Rng, targetTokens: number): string {
   return parts.join('\n\n');
 }
 
-/** Build a needle sentence carrying a unique nonce. */
-export function buildNeedle(rng: Rng, nonce: string): string {
+/**
+ * Build a needle sentence carrying a unique record id and a passphrase.
+ * 抗识别（2026-10-18 审计缺陷 ①）：记录编号与校验口令必须是两个不同的随机串——
+ * 旧实现两者复用同一串，模型只要把问题里的编号原样复述就能冒充「读到文档」，
+ * 端点无需真正处理长上下文即可假通过（命中判定见 containsNonce）。
+ * 问题只含 recordId，口令只出现在文档正文里：答对口令才证明文档被读入。
+ */
+export function buildNeedle(rng: Rng, recordId: string, passphrase: string): string {
   return rng.pick([
-    `【档案记录 ${nonce}】本节内容的校验口令是 ${nonce}。`,
-    `[ARCHIVE RECORD ${nonce}] The verification passphrase for this section is ${nonce}.`,
-    `【勘误条目 ${nonce}】唯一有效校验码：${nonce}。`,
+    `【档案记录 ${recordId}】本节内容的校验口令是 ${passphrase}。`,
+    `[ARCHIVE RECORD ${recordId}] The verification passphrase for this section is ${passphrase}.`,
+    `【勘误条目 ${recordId}】唯一有效校验码：${passphrase}。`,
   ]);
 }
 
-export function buildNeedleQuestion(nonce: string, lang: 'zh' | 'en'): string {
-  if (lang === 'zh') return `在提供的文档中，编号${nonce}的记录里给出的存档口令是什么？只回答口令本身。`;
-  return `In the provided document, what is the archive passphrase in record ${nonce}? Reply with the passphrase only.`;
+export function buildNeedleQuestion(recordId: string, lang: 'zh' | 'en'): string {
+  if (lang === 'zh') return `在提供的文档中，编号${recordId}的记录里给出的存档口令是什么？只回答口令本身。`;
+  return `In the provided document, what is the archive passphrase in record ${recordId}? Reply with the passphrase only.`;
 }
 
 export function buildEchoQuestion(): string {
   return '请逐字复述你收到的上一条用户消息的最后一句话（最后 15 个字以内），只输出那句话，不要解释。';
 }
 
-export function needleAnswer(nonce: string): string {
-  return nonce;
+export function needleAnswer(passphrase: string): string {
+  return passphrase;
 }
 
 /** Random-looking harmless decoy tasks to detect eager special-casing. */

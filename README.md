@@ -92,8 +92,8 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 
 - **Verdict** (also the exit code): 通过 pass (0) · 可疑 warn (0) · 不通过 fail (1) · usage error / 未得出结论 (2).
 - Dimensions without enough evidence are marked `N/A` and excluded from scoring — never counted as 0.
-- **Scoring**: a weighted geometric credibility total (0–100): billing 25 / quality 25 / identity 15 / context 15 / capability 10 / TTFT 10. Any dimension at `fail`, or a credibility total < 40 → overall fail. Billing / capability / context / quality below 40 hit a **hard red line** (credibility total capped at 45); a falsified capability (advertised capability measured wrong or explicitly refused) caps the credibility total at 60. Credibility total < 75 or any warn dimension → 可疑 (warn).
-- **Quality caliber (v0.2.2+)**: two chances per question — the first answer plus one resample at temperature 0.7, best-of counts; recoveries are disclosed in findings; accuracy below 0.9 → 可疑. The caliber changed in v0.2.2 (older versions were single-chance) — regenerate old baselines before comparing.
+- **Scoring**: a weighted geometric credibility total (0–100): billing 25 / quality 25 / identity 15 / context 15 / capability 10; TTFT is observation-only and never scored. Any dimension at `fail`, or a credibility total < 40 → overall fail. Billing / capability / context / quality below 40 hit a **hard red line** (credibility total capped at 45); a falsified capability (advertised capability measured wrong or explicitly refused) caps the credibility total at 60. Credibility total < 75 or any warn dimension → 可疑 (warn).
+- **Quality caliber (probeset v0.2.2+)**: two chances per question — the first answer plus one resample at temperature 0.7, best-of counts; recoveries are disclosed in findings; accuracy below 0.9 → 可疑. The caliber changed with probeset v0.2.2 (older probesets were single-chance) — regenerate old baselines before comparing.
 - Every finding carries its evidence: per-request findings link the exact `evidenceIds`; aggregate verdict findings link all contributing sample `evidenceIds`.
 
 ### What it checks
@@ -101,13 +101,13 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 | Check | What it does |
 |---|---|
 | Identity & fingerprint | 5 self-ID questions (8 in `--deep`, incl. 1 exact model-name-and-version question) + behavioral fingerprints catch relabeled/guardrail-swapped models (e.g.自称 Claude 却答 "我是 GLM"); a "brand name + assistant" persona in self-description (e.g. "I am NovaRelay assistant") → warn with score capped at 80 |
-| Context length (needle test) | Bursts needles at claim-depth to verify the advertised window is real, not truncated silently |
-| Token counting | Compares endpoint usage tokens against official tokenizer counts, exposing padded billing |
-| Measured rate (balance delta) | Snapshots the billing balance before/after the billing series; Δspend ÷ expected cost (claimed price × self-reported usage) reveals the real multiplier behind "cheap" sticker prices |
+| Context length (needle test) | Bursts needles at claim-depth to verify the advertised window is real, not truncated silently; endpoint-reported `prompt_tokens` is cross-checked against the actually-sent volume, and a pass whose usage cannot be calibrated is downgraded to undetermined |
+| Token counting | Runs a within-run linearity regression of endpoint-reported `prompt_tokens` against a conservative local estimate (not an official tokenizer) and checks `completion_tokens` for hard contradictions (non-empty body reported as 0, or a count above the request's `max_tokens`). Linear shape alone is **not** a pass: without an absolute cross-check (`--token-reference` or the measured-rate check) the dimension is reported as *undetermined* — no score, no total — because uniform rescaling or a constant offset is invisible to the regression. Partial/failed samples, potentially-billed retries (not gateway-rejected 429/503, which never entered inference and are usually not billed), and completion anomalies cap the score at 70 instead of passing |
+| Measured rate (balance delta) | Snapshots the billing balance before/after the billing series; Δspend ÷ expected cost (claimed price × self-reported usage) reveals the real multiplier behind "cheap" sticker prices. Rate > 1.5 → fail; (1.1, 1.5] or [0.5, 0.8) → warn (underpayment may mean under-reported usage or a unit mismatch); [0.8, 1.1] → consistent. A spend or Δ below 3× the balance's smallest step is N/A; a ratio >10 cannot be attributed to this window (shared-account traffic/unit mismatch) and is reported as unverifiable, not a fail. Any potentially-billed retry (408/409/5xx/timeout after the first attempt — gateway-rejected 429/503 retries are exempt) or failed request inside the window voids the ratio (the spend no longer corresponds to the samples) |
 | Token-count reference (`--token-reference`) | Compares per-tier prompt_tokens against a prior audit report of the SAME model (same probeset version): ratio > 1.25 → fail (score capped 30); 1.1–1.25 or < 0.8 → warn (capped 70); 0.8–1.1 → ok — the only check that catches uniform usage rescaling (invisible to the regression). Limitations: prompt_tokens only; trust of the reference report is on you; fetching official token counts automatically is still missing (TODO) |
 | Fingerprint baseline | Saves/compares a versioned baseline (model family, quality, capability, billing slopes) across runs to catch silent model swaps |
 | Capability gates | vision / tool-calling / thinking flags actually exercised, not just advertised |
-| Fixed question bank | A versioned, reproducible set scored against reference answers for quality drift |
+| Fixed question bank | A versioned, reproducible set scored against reference answers for quality drift; reports disclose a 95% Wilson confidence interval for accuracy (informational only, thresholds unchanged) |
 | Streaming first-token latency | p50/p95 TTFT sampled under load, useful for spotting "queue-stretched" relays |
 
 ### Key options
@@ -128,6 +128,7 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 | `--yes` | Skip the interactive token-cost confirmation on remote endpoints (required in scripts / non-TTY) |
 | `--dry-run` | Print the planned requests and token estimate, then exit without sending anything |
 | `--deep` | More samples per probe (slower, costs more) |
+| `--http-retries <n>` | Per-request retries on gateway-rejected 429/503 responses (integer in [0, 6], default 2) — separate from `--retries` (200-empty-body retries). Such requests never entered inference and are usually not billed, so they do **not** contaminate billing evidence; other retryable statuses (408/409/500/502/504/timeout/network) still count as potentially-billed contamination and invalidate the measured rate. A run-level retry budget (24) bounds retry amplification when the endpoint is globally overloaded |
 | `--out <dir>` | Report output directory (default `reports`) |
 
 ### Troubleshooting
@@ -139,17 +140,19 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 | guard: port already in use | `--port 8622` (default 8621) |
 | cost dimension shows `N/A` / `skipped` | the station has no one-api style balance endpoint, or no `--price-input/--price-output` was given — reconciliation degrades to token-only stats, which is normal |
 | a capability item fails but the station never claimed it | only put capabilities the station actually advertises into `--expect` (default `vision,tool`); drop the rest or use `--expect none` |
+| several dimensions *undetermined* with a headline mentioning "端点/网关拒绝" (endpoint/gateway rejected) | the endpoint was overloaded or rate-limited at that moment (e.g. HTTP 503 system cpu overloaded) — requests never entered inference; the report notes aggregate the failure share. Re-run at a quieter time; the tool does not disguise endpoint failures as model problems |
 | want a cheaper / faster run | omit `--price-*` and `--claimed-context`; try `--dry-run` first |
 | `cmd.exe` rejects a command copied from the web shell | web-shell commands use single quotes — run them in PowerShell or bash |
 | build fails / `node` not found | install Node.js ≥ 22 from https://nodejs.org |
 
 ### Boundaries & caveats
 
-- **Same unit required.** The claimed price and the endpoint's displayed balance must share one unit (USD or quota); the tool only computes the ratio and never converts units.
+- **USD readings & precision floor.** The one-shot measured-rate check requires balance readings in USD (quota or other units void it with a note — the tool never converts units); a spend or Δspend below 3× the reading's smallest step is treated as precision noise and voided as well. A ratio above 10× cannot be attributed to the audit window (shared-account traffic, recharge/refund, or a unit mismatch): it is reported as unverifiable with the raw ratio and a masked fail for review, not as a fail.
 - **No concurrent traffic.** During the measured-rate window, keep the audited key idle — parallel requests inflate Δspend and bias the ratio upward. (Under `guard`, all traffic through the proxy is accounted per request, so the caveat shrinks to: don't use the same key outside the proxy.)
 - **Recharge interference.** A top-up between the two balance reads voids the measurement (Δ<0 is discarded); a recharge concurrent with spend remains undetectable — cross-check the station's billing log manually when in doubt.
 - **Same-origin assumption.** The two balance reads assume the relay routes them to the same backend and returns fresh (non-cached) values; multi-backend gateways or cached balances can distort Δ.
-- **Heuristic thresholds.** Drift thresholds (quality 15%/30%, billing slope 0.05/20%, rate 0.5–1.1–1.5) are versioned heuristic initial values so reports stay comparable across versions.
+- **Billing verifies self-reported usage.** The billing dimension judges the endpoint's *self-reported* token counts: linearity across input lengths (EN + ZH regression), internal consistency (`total = prompt + completion`, no negative values), output-side checks (`completion_tokens` vs the response body / requested `max_tokens`), and constant-usage detection. When all of these pass with no absolute reconciliation available (no `--token-reference`, no claimed price + usable balance endpoint), billing reports **pass at 85**: no evidence of usage falsification was found, but a uniform rescaling (e.g. ×1.3), a constant offset, or inflated *charges* cannot be excluded by shape evidence alone — the headline and findings disclose this explicitly (`evidence_level: shape-only`). Absolute reconciliation that passes raises the score to 100; contradicting evidence (non-linear counts, constant usage, measured ratio >1.5, reference drift) still fails the dimension.
+- **Heuristic thresholds.** Drift thresholds (quality 15%/30%, billing slope 0.05/20%, rate 0.8–1.1–1.5) are versioned heuristic initial values so reports stay comparable across versions.
 - **Baseline seed reuse.** `--baseline` reuses the baseline's seed to keep the question set fixed — a relay could theoretically special-case seeded probes; the trade-off is disclosed by design.
 - **Baseline format.** Baseline files are `version: 1` only; mismatched versions/models/probeset versions skip comparison with a note. A baseline holds aggregate fingerprints only (model families, accuracy, capability flags, billing slopes, seed) — never API keys, prompts, or balance values.
 
@@ -173,7 +176,7 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 
 Optional: `--fingerprint-minutes 60` re-runs the identity-family probe periodically and alerts when the model-family fingerprint drifts (the probe sends real requests and costs real money — off by default).
 
-Boundaries: only `chat/completions`, `completions`, and `embeddings` get deep inspection; other paths are forwarded untouched with a basic log line. HTTP/1.1 only; upstream responses are requested with `Accept-Encoding: identity` on deep-inspected endpoints (the only byte-level rewrite besides credential replacement). The balance probe polls the one-api style usage endpoint (its `total_usage` is read as ÷100); stations without such an endpoint degrade reconciliation to token-only stats with a `skipped` note. Local auth uses a constant-time comparison; `Ctrl+C` (or closing stdin) stops guard and settles the final window before flush.
+Boundaries: only `chat/completions`, `completions`, and `embeddings` get deep inspection; other paths are forwarded untouched with a basic log line. HTTP/1.1 only; upstream responses are requested with `Accept-Encoding: identity` on deep-inspected endpoints (the only byte-level rewrite besides credential replacement). The balance probe polls the one-api style usage endpoint (its `total_usage` must be an integer number of cents and is read as ÷100); non-integer/unknown schemas are rejected, non-USD readings (e.g. `quota`) skip rather than being converted, and stations without a usable endpoint degrade reconciliation to token-only stats with a `skipped` note. Local auth uses a constant-time comparison; `Ctrl+C` (or closing stdin) stops guard and settles the final window before flush.
 
 ### Web console (local, executable)
 
@@ -211,7 +214,7 @@ The local API gateway (Web console tab 2) records every forwarded request into a
 
 ### Status
 
-v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-repo you also get the executable web console (`npm run ui`) with three tabs: one-shot test, API aggregation with live usage/anomaly monitoring, and historical reports. The local API gateway (multi-channel model-alias routing, no retry/fallback yet; OpenAI-compatible + Anthropic Messages + Unified-relay protocols incl. the OpenAI Responses format; optional per-model prices with cost stats; the local ledger, live usage stats and anomaly alerts from S1–S3) is included. Not yet published to npm: run from source (see Quick start); after publishing, `npx model-xray` works out of the box. This repository hosts the CLI, the versioned test assets, and the maintainers' own published reports (`reports/`).
+v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-repo you also get the executable web console (`npm run ui`) with three tabs: one-shot test, API aggregation with live usage/anomaly monitoring, and historical reports. The local API gateway (multi-channel model-alias routing, no retry/fallback yet; OpenAI-compatible + Anthropic Messages + Unified-relay protocols incl. the OpenAI Responses format; optional per-model prices with cost stats; the local ledger, live usage stats and anomaly alerts from S1–S3) is included. Not yet published to npm: run from source (see Quick start); after publishing, `npx model-xray` works out of the box. This repository hosts the CLI and the versioned test assets; audit reports are generated locally under `reports/` and stay out of git (runtime data, .gitignore).
 
 ## 中文
 
@@ -300,7 +303,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 - **判定**（同退出码）：通过（0）· 可疑（0）· 不通过（1）· 用法错误/未得出结论（2）。
 - 证据不足的维度标 `N/A` 并排除在计分之外——绝不按 0 分算。
 - **计分**：加权几何合成 0–100 可信度总分：计量 25 / 质量 25 / 身份 15 / 上下文 15 / 能力 10（TTFT 仅观测，不计分）。任一维度 fail 或可信度总分 < 40 → 不通过；计量/能力/上下文/质量 低于 40 触发**硬红线**（可信度总分封顶 45）；能力被证伪（标称能力实测答错/被明确拒绝）→ 可信度总分封顶 60；可信度总分 < 75 或有 warn 维度 → 可疑。
-- **质量口径（v0.2.2 起）**：每题两次机会——首答 + 一次 temperature 0.7 复采样，取优计分；复采样答对在 findings 留证；正确率 < 0.9 → 可疑。口径自 v0.2.2 起变更（旧版为单次机会），旧基线需重新生成后对比。
+- **质量口径（题集版本 v0.2.2 起）**：每题两次机会——首答 + 一次 temperature 0.7 复采样，取优计分；复采样答对在 findings 留证；正确率 < 0.9 → 可疑。口径自题集版本 v0.2.2 起变更（旧版题集为单次机会），旧基线需重新生成后对比。
 - 每条结论都附原始请求/响应证据，可回查。
 
 ### 检测项
@@ -308,13 +311,13 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 | 检测项 | 做法 |
 |---|---|
 | 身份与指纹 | 自我身份问答（5 次自述，`--deep` 8 次，含 1 道完整模型名称与精确版本自述题）+ 行为指纹，识破换标签/换护栏的"套皮"模型（如自称 Claude 却答"我是 GLM"）；检测到「品牌名 + assistant/助手」形态的人格自述（如 "I am NovaRelay assistant"）→ warn 并分数封顶 80 |
-| 上下文长度实测 | 在标称深度埋 needle，验证标称窗口是真实的，而非静默截断 |
-| Token 计数对比 | 端点返回的 usage token 与官方 tokenizer 实算对比，暴露虚增计费 |
-| 实测倍率（余额差值法） | 计费序列前后各查一次余额，Δ扣费 ÷（宣称价格 × 端点自报 usage）的应缴金额，揭示"低价"背后的真实倍率 |
+| 上下文长度实测 | 在标称深度埋 needle，验证标称窗口是真实的，而非静默截断；同时核对端点自报 `prompt_tokens` 与实际发送量，未通过校准的「通过」降为无法判定 |
+  | Token 计数对比 | 对端点自报 `prompt_tokens` 与本地保守估算（非官方 tokenizer）做同轮线性回归，暴露非线性/硬编码计数；并检查 `completion_tokens` 的硬矛盾（非空正文却报 0、或超过请求 `max_tokens`）。形状/一致性/输出侧全过即判定「usage 未发现造假证据」：无绝对对账（`--token-reference` 或实测倍率）时该项 85 分并通过，headline 与 findings 如实披露「扣费金额真实性未验证」（全量等比缩放/常量偏移在回归中不可见）；绝对对账成立则 100 分。缺 usage 的样本、请求失败、可能已计费的重试（网关层 429/503 拒绝例外——未进入推理、通常不计费）、completion 异常一律封顶 70 而非通过 |
+| 实测倍率（余额差值法） | 计费序列前后各查一次余额，Δ扣费 ÷（宣称价格 × 端点自报 usage）的应缴金额，揭示"低价"背后的真实倍率。倍率 > 1.5 → fail；(1.1, 1.5] 或 [0.5, 0.8) → warn（低报可能意味着 usage 少计或单位错配）；[0.8, 1.1] → 与宣称价格一致。应缴金额或 Δ 低于余额最小刻度 3 倍时判 N/A；>10 倍的差值无法归因到本次窗口（账户级并发/单位错配），只报不可验证并保留原始倍率，不判 fail；窗口内出现可能已计费的重试（408/409/5xx/超时后重试——网关层 429/503 重试豁免）或失败请求时倍率作废 |
 | Token 计数参照对比（`--token-reference`） | 与同名模型历史报告的逐档 prompt_tokens 对比（同题集版本才生效）：比值 > 1.25 → fail（分数封顶 30）；1.1–1.25 或 < 0.8 → warn（封顶 70）；0.8–1.1 → ok——唯一能识别"全量等比缩放"型计数虚增的手段（回归对此不可见）。限制如实声明：仅对比 prompt_tokens；参考报告须用户自行确认为可信来源；自动获取官方计费计数的能力暂缺（TODO） |
 | 指纹基线对比 | 保存/对比版本化指纹基线（模型族、质量、能力、计费斜率），识别两次检测之间模型被偷换 |
 | 能力校验 | vision / tool calling / thinking 标称能力逐项实测，而非只看宣称 |
-| 固定题集质量打分 | 版本化可复现题集，对照参考答案量化质量（降智检测） |
+| 固定题集质量打分 | 版本化可复现题集，对照参考答案量化质量（降智检测）；报告附准确率 95% Wilson 置信区间（仅披露，不改变判定阈值） |
 | 流式首字延迟 | 采样 p50/p95 TTFT，识别"排队拉长"型中转 |
 
 ### 关键参数
@@ -335,6 +338,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 | `--yes` | 跳过远程端点的交互式成本确认（脚本/非 TTY 环境必需） |
 | `--dry-run` | 只打印计划请求量与 token 预估，不发任何请求 |
 | `--deep` | 每项探针更多样本（更慢、更贵） |
+| `--http-retries <n>` | 端点/网关层 429/503 拒绝时的每请求重试次数（整数 [0, 6]，默认 2）——与 `--retries`（200 空正文重试）分开计预算。此类请求未进入推理、通常不计费，因此**不污染**计费证据；其余可重试状态（408/409/500/502/504/超时/网络错误）仍按「可能已计费」判污染并作废实测倍率。运行级重试总预算（24）限制端点整体过载时的重试放大 |
 | `--out <dir>` | 报告输出目录（缺省 `reports`） |
 
 ### 出错了怎么办
@@ -346,17 +350,19 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 | guard：端口被占用 | `--port 8622`（默认 8621） |
 | 成本维度 `N/A` / `skipped` | 站点没有 one-api 风格余额接口，或没给 `--price-input/--price-output`——对账降级为纯 token 统计，属正常 |
 | 能力项 fail 但站方从没宣称过 | 只把站方确实宣称的能力放进 `--expect`（默认 `vision,tool`），其余去掉或用 `--expect none` |
+| 多个维度「未判定」且标题提示「端点/网关拒绝」 | 端点当时过载/限流（如 HTTP 503 system cpu overloaded），请求没进入推理。报告 notes 会汇总失败占比；建议错峰重测——工具不会把端点故障伪装成模型问题 |
 | 想跑得更省更快 | 不传 `--price-*` 与 `--claimed-context`；先 `--dry-run` 预估 |
 | cmd.exe 执行 web 壳生成的命令报错 | 该命令用单引号，请改用 PowerShell 或 bash（表单也有 cmd.exe 引号模式） |
 | 构建失败 / 找不到 node | 安装 Node.js ≥ 22（https://nodejs.org） |
 
 ### 边界与注意
 
-- **单位必须一致。** 宣称价格与该站余额显示单位须一致（美元/quota 均可），工具只算比值，不做单位换算。
+- **美元口径 + 精度要求。** 一次性审计的实测倍率要求余额读数为美元口径（quota 等非美元读数直接作废该项并提示，工具不换算单位）；余额差值 Δ 或本次应缴金额低于读数最小刻度 3 倍时视为精度噪声，同样作废。>10 倍的差值无法归因到本次窗口（账户级并发、充值/退款或单位错配），报告为不可验证并保留原始倍率，不判 fail。
 - **勿有并发流量。** `test` 实测倍率窗口内，被测 key 不要跑其他请求——并发消费会抬高 Δ扣费、使倍率偏高估。（`guard` 模式下经代理的流量逐请求入账，只需注意别让同一 key 在代理之外并发使用。）
 - **充值干扰。** 两次余额查询之间发生充值会使测量作废（Δ<0 直接判无效）；充值与消费叠加的情况难以识别，存疑时请人工核对该站账单流水。
 - **同源假设。** 两次余额读数假定中转站路由到同一后端且返回非缓存值；多后端网关或余额缓存可能使 Δ失真。
-- **阈值为启发式初值。** 漂移阈值（质量 15%/30%、计费斜率 0.05/20%、倍率 0.5–1.1–1.5）随题集版本化管理，保证跨版本报告可比。
+- **计费维度核验的是端点自报 usage。** 判据：自报 `prompt_tokens` 与输入长度线性（英文+中文双轨回归）、内部一致（`total = prompt + completion`、无负值）、输出侧无矛盾（`completion_tokens` 与正文/请求 `max_tokens`）、usage 恒定检测。全部通过且无绝对对账（既无 `--token-reference`、也没有可用余额对账窗口）时，计费维度判**通过（85 分）**：未发现 usage 造假证据，但全量等比缩放（如 ×1.3）、常量偏移与虚高扣费无法被形状证据排除——headline 与 findings 如实披露（`evidence_level: shape-only`）。绝对对账成立升为 100 分；有矛盾证据（非线性、恒定 usage、实测倍率 >1.5、参考漂移）仍判 fail。
+- **阈值为启发式初值。** 漂移阈值（质量 15%/30%、计费斜率 0.05/20%、倍率 0.8–1.1–1.5）随题集版本化管理，保证跨版本报告可比。
 - **基线沿用 seed。** `--baseline` 会沿用基线 seed 固定题集——端点理论上可对固定 seed 特判，该权衡在此明示。
 - **基线格式。** 基线文件仅支持 `version: 1`；版本/模型/题集版本不符时跳过对比并给出提示。基线只含聚合指纹字段（模型族、正确率、能力布尔、计费斜率、seed）——不含 API key、提示词原文或余额数值。
 
@@ -380,7 +386,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 可选：`--fingerprint-minutes 60` 周期性复跑身份族指纹探针，模型族漂移即告警（探针发真实请求、产生真实计费——默认关闭）。
 
-边界：只有 `chat/completions`、`completions`、`embeddings` 做深检，其余路径原样转发并记基础行；仅支持 HTTP/1.1；深检端点会强制 `Accept-Encoding: identity`（除凭证替换外唯一的字节级改写）。余额探针按 one-api 风格 usage 接口读取（`total_usage` 按 ÷100 折算），站点没有该接口时对账降级为纯 token 统计并出 `skipped` 提示。本地鉴权用常量时间比较；`Ctrl+C`（或关闭 stdin）停止时先结算最后一个对账窗口再落盘。
+边界：只有 `chat/completions`、`completions`、`embeddings` 做深检，其余路径原样转发并记基础行；仅支持 HTTP/1.1；深检端点会强制 `Accept-Encoding: identity`（除凭证替换外唯一的字节级改写）。余额探针按 one-api 风格 usage 接口读取（`total_usage` 必须是整数美分，按 ÷100 折算）；非整数/未知 schema 一律拒绝，quota 等非美元读数直接跳过（不换算），站点没有可用接口时对账降级为纯 token 统计并出 `skipped` 提示。本地鉴权用常量时间比较；`Ctrl+C`（或关闭 stdin）停止时先结算最后一个对账窗口再落盘。
 
 ### Web 控制台（本地、可执行）
 
@@ -417,7 +423,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 ### 状态
 
-v0.2.0 —— `test` 与 `guard`（P2，仅命令行）均已可用；仓库内还提供可执行 Web 控制台（`npm run ui`，三个标签页：一次性检测 / API 聚合与实时监控 / 历史报告）与本地 API 聚合网关（多渠道模型别名路由，暂不重试/不回退；支持 OpenAI 兼容、Anthropic Messages 与统一中转站三种协议，含 OpenAI Responses 格式；已含本地账本、实时用量、可选模型价格与费用统计、异常告警）；尚未发布到 npm：请按「快速开始」从源码运行（发布后 `npx model-xray` 开箱即用）。本仓库承载 CLI、版本化测试资产，以及官方自己的公开报告（`reports/`）。
+v0.2.0 —— `test` 与 `guard`（P2，仅命令行）均已可用；仓库内还提供可执行 Web 控制台（`npm run ui`，三个标签页：一次性检测 / API 聚合与实时监控 / 历史报告）与本地 API 聚合网关（多渠道模型别名路由，暂不重试/不回退；支持 OpenAI 兼容、Anthropic Messages 与统一中转站三种协议，含 OpenAI Responses 格式；已含本地账本、实时用量、可选模型价格与费用统计、异常告警）；尚未发布到 npm：请按「快速开始」从源码运行（发布后 `npx model-xray` 开箱即用）。本仓库承载 CLI 与版本化测试资产；检测报告生成在本机 `reports/`（已 gitignore，属运行数据，不入库）。
 
 ## License
 

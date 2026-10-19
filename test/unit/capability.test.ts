@@ -1,9 +1,28 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { probeCapability } from '../../src/probes/capability.js';
+import { parseSingleColorWord, probeCapability } from '../../src/probes/capability.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig, ToolCall } from '../../src/types.js';
+
+function rejectedResult(status: number, error: string): ChatResult {
+  return {
+    ok: false,
+    status,
+    finishReason: null,
+    model: null,
+    text: '',
+    reasoning: null,
+    usage: null,
+    usageRejected: null,
+    attempts: 1,
+    toolCalls: [],
+    ttftMs: null,
+    durationMs: 1,
+    error,
+    raw: '',
+  };
+}
 
 function toolCallResult(nonce: string): ChatResult {
   const call: ToolCall = {
@@ -268,4 +287,175 @@ test('capability tool: first round HTTP 200 blank → na (blank response is not 
   assert.equal(outcome.level, 'unknown');
   assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
   assert.ok(outcome.findings.some((f) => f.level === 'warn' && /空文本/.test(f.message)));
+});
+// ---------- 2026-10-18 审计缺陷 ⑥：多色绕过（单色图问题不存在多个正确颜色） ----------
+
+test('capability: parseSingleColorWord — 恰好一个词表内颜色词才命中，多词/零词返回 null', () => {
+  assert.equal(parseSingleColorWord('The color is red.'), 'red');
+  assert.equal(parseSingleColorWord('RED'), 'red');
+  assert.equal(parseSingleColorWord('I see a grey circle.'), 'gray');
+  assert.equal(parseSingleColorWord('It could be blue or blue.'), 'blue');
+  assert.equal(parseSingleColorWord('red green blue'), null);
+  assert.equal(parseSingleColorWord('red and green'), null);
+  // 词表外颜色词（cyan 不在 8 色盘）不算第二个候选：唯一盘内词仍命中
+  assert.equal(parseSingleColorWord('maybe green? no idea, also cyan.'), 'green');
+  assert.equal(parseSingleColorWord('no palette words here'), null);
+  assert.equal(parseSingleColorWord(''), null);
+  // 否定短语不得被当成颜色描述：'not blue' / "isn't blue" 不是「看到蓝色」
+  assert.equal(parseSingleColorWord('This is not blue.'), null);
+  assert.equal(parseSingleColorWord("It isn't blue."), null);
+  assert.equal(parseSingleColorWord('The color is not blue; it is red.'), 'red');
+  // 否定作用域覆盖并列颜色：not blue or green 不是「看到绿色」；not blue but green 仍应保留 green
+  assert.equal(parseSingleColorWord('It is not blue or green.'), null);
+  assert.equal(parseSingleColorWord('not blue and green'), null);
+  assert.equal(parseSingleColorWord('not blue/green'), null);
+  assert.equal(parseSingleColorWord('not blue but green'), 'green');
+  // not only 是强调而非否定，但列出多个颜色/单色都不构成单一答案
+  assert.equal(parseSingleColorWord('not only red but blue'), null);
+  assert.equal(parseSingleColorWord('not only red'), null);
+  assert.equal(parseSingleColorWord('not just blue'), null);
+  assert.equal(parseSingleColorWord('not even blue'), null);
+});
+
+test('capability vision: 仅 1 个有效作答且答错、其余空响应 → na/insufficient，不得凭 0/1 判 fail', async () => {
+  let calls = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      calls += 1;
+      return calls === 1 ? textResult('not blue') : textResult('');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /有效样本仅 1\/3/.test(f.message)));
+});
+
+test('capability vision: 1 个有效错误 + 1 个 415 + 1 个空响应 → na，不因混合 4xx 单判 fail', async () => {
+  let calls = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      calls += 1;
+      if (calls === 1) return rejectedResult(415, 'HTTP 415: Unsupported Media Type');
+      if (calls === 2) return textResult('not blue');
+      return textResult('');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.level, 'unknown');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /有效样本仅 1\/3/.test(f.message)));
+});
+
+test('capability vision: 仅 1 个 415 + 2 个空响应 → na，不凭单次 4xx 判 fail', async () => {
+  let calls = 0;
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      calls += 1;
+      if (calls === 1) return rejectedResult(415, 'HTTP 415: Unsupported Media Type');
+      return textResult('');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'na');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.level, 'unknown');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /1 次请求失败（状态码 415）、2 次空响应/.test(f.message)));
+});
+
+test('capability vision: 全部有效作答均识别错误（罗列全部颜色名）→ fail（不得按 partial 50 洗白）', async () => {
+  // 审计缺陷 ⑥：旧 containsColorWord 会把 "red green blue" 计为命中 → 端点输出全部颜色名即可假通过。
+  // 新口径只认单一颜色词：罗列式回答 0/3 全错 → vision fail（8 色随机猜中率 1/8，0 正确是强证据）。
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return textResult('red green blue');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'fail');
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /vision 失败/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /vision 可疑/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+// ---------- 2026-10-18 审计缺陷 ⑦：415/422 与 400 同属「能力不存在」的显式拒绝 ----------
+
+test('capability vision: 全部 415 → 显式拒绝 fail（不再降为证据不足）', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return rejectedResult(415, 'HTTP 415: Unsupported Media Type');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'fail');
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /明确返回 4xx 拒绝/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('capability: vision 证据不足 + tool 通过 → insufficient，不得把未判定项静默过滤成 100 分通过', async () => {
+  let nonce = 'NONCE1';
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const hasImage = req.messages.some(
+        (m) => Array.isArray(m.content) && m.content.some((part) => part.type === 'image_url'),
+      );
+      if (hasImage) return textResult('');
+      const isSecondRound = req.messages.some((m) => m.role === 'tool');
+      if (isSecondRound) {
+        return textResult(`已收到工具结果，nonce ${nonce} 已确认。`);
+      }
+      const last = req.messages[req.messages.length - 1];
+      const prompt = typeof last?.content === 'string' ? last.content : '';
+      nonce = prompt.match(/"([A-Z0-9]{6})"/)?.[1] ?? 'NONCE1';
+      return toolCallResult(nonce);
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['vision', 'tool'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['vision'], 'na');
+  assert.equal(outcome.metrics['tool'], 'pass');
+  assert.equal(outcome.status, 'insufficient', outcome.headline);
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.equal(outcome.metrics['unverified'], 'vision');
+  assert.match(outcome.headline, /部分无法判定/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /vision/.test(f.message)));
+});
+
+test('capability tool: 首轮全 422 → 显式拒绝 fail（与 400 同口径）', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return rejectedResult(422, 'HTTP 422: Unprocessable Entity');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['tool'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['tool'], 'fail');
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /明确拒绝（HTTP 422/.test(f.message)), JSON.stringify(outcome.findings));
 });

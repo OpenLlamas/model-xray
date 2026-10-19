@@ -3,6 +3,7 @@ import type { ChatMessage, Finding, Level, ProbeCtx, ProbeOutcome, RunConfig } f
 import { computeCostUsd, type ModelPrice } from '../gateway/pricing.js';
 import { estimateMessageTokens } from '../tokens.js';
 import { linearRegression, mean } from '../stats.js';
+import { failureDigest } from '../diagnostics.js';
 import { recordCall } from '../evidence.js';
 import { probeBalance, spendBetween, type BalanceReading } from '../balance.js';
 import { decideTokenReference, type TokenReferenceDecision } from '../token-reference.js';
@@ -10,6 +11,17 @@ import { PROBESET_VERSION } from '../assets.js';
 
 const FILLER_EN =
   'The quick brown fox jumps over the lazy dog while engineers keep measuring latency and correctness in production systems. ';
+
+/** billing 请求的 max_tokens：completion_tokens 超过该值即为与请求上限矛盾的硬异常。 */
+const BILLING_MAX_TOKENS = 16;
+
+/**
+ * 仅形状证据（线性 + 一致性 + 输出侧核验通过，无绝对对账）时的通过分：
+ * 与绝对对账成立的 100 区分，如实反映「等比缩放/常量偏移未被排除」的剩余不确定性；
+ * 判定对象是端点自报 usage，形状全过即给出「未发现造假证据」的明确结论（2026-10-19 用户口径），
+ * 不得因缺绝对对账悬置为 insufficient。
+ */
+const SHAPE_ONLY_SCORE = 85;
 
 function resolveClaimedPrice(cfg: RunConfig): { price: ModelPrice | null; error: string | null } {
   const input = cfg.priceInput;
@@ -99,7 +111,6 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const validEvidenceIds: string[] = [];
   /** 失败请求的证据 id（部分失败 finding 的证据面） */
   const failureEvidenceIds: string[] = [];
-  const attemptCounts: number[] = [];
   let usageMissing = 0;
   let usageInconsistent = 0;
   let usageInvalid = 0;
@@ -109,6 +120,22 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let reasoningTokensTotal = 0;
   let detailsReported = 0;
   const failures: string[] = [];
+  /** 失败请求的原始错误串（供 insufficient 标题归因；failures 带 lang@target 前缀不便分类） */
+  const failureErrors: string[] = [];
+  /** completion_tokens 与响应正文/请求上限矛盾（prompt 回归无法发现输出侧伪造） */
+  let completionZeroWithText = 0;
+  let completionOverCap = 0;
+  const completionAnomalyEvidenceIds: string[] = [];
+  /** 窗口内发生重试的请求（attempts>1，含纯 429/503 网关拒绝后的干净重试）：仅作观测，不单独定罪 */
+  let retriedRequests = 0;
+  const retryEvidenceIds: string[] = [];
+  /**
+   * 可能造成重复计费的重试（contaminatingRetry）：200 空正文 / 408/409/500/502/504 / 超时 /
+   * 网络错误之后才重试 → 上游可能已对某次尝试计费。429/503（网关层拒绝、未进入推理）后的
+   * 重试不计入——它们没有产出，重复请求不重复扣费。
+   */
+  let contaminatingRetries = 0;
+  const contaminatingEvidenceIds: string[] = [];
 
   for (const lang of langs) {
     for (const targetTokens of levels) {
@@ -124,7 +151,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         model: ctx.cfg.model,
         messages,
         temperature: 0,
-        max_tokens: 16,
+        max_tokens: BILLING_MAX_TOKENS,
         // 200 空响应仍带 usage：重发只会重复计 prompt 并令实测倍率 N/A，故不在 client 层重试空正文；
         // HTTP 5xx/429 等状态错误仍按 --retries 正常重试。
         retryEmpty: false,
@@ -136,9 +163,20 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         result,
       });
       requests += 1;
-      attemptCounts.push(result.attempts);
+      // 重试观测（attempts>1，全窗口如实计数）与污染口径（contaminatingRetry，仅「可能已
+      // 计费」的重试：200 空正文 / 408/409/500/502/504 / 超时后重试；429/503 网关拒绝后的
+      // 重试无产出不污染）分开统计。
+      if (result.attempts > 1) {
+        retriedRequests += 1;
+        retryEvidenceIds.push(evidence.id);
+      }
+      if (result.contaminatingRetry === true) {
+        contaminatingRetries += 1;
+        contaminatingEvidenceIds.push(evidence.id);
+      }
       if (!result.ok) {
         failures.push(`${lang}@${targetTokens}: ${result.error ?? 'error'}`);
+        failureErrors.push(result.error ?? 'error');
         failureEvidenceIds.push(evidence.id);
         continue;
       }
@@ -167,9 +205,20 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         }
         continue;
       }
+      // 输出侧硬矛盾检查：prompt 回归只看输入，completion_tokens 完全可能被独立伪造。
+      // 非空正文却报 0，或上报值超过请求的 max_tokens，都是与可观测事实直接冲突的硬异常。
+      const completion = result.usage.completion_tokens;
+      if (completion === 0 && result.text.trim().length > 0) {
+        completionZeroWithText += 1;
+        completionAnomalyEvidenceIds.push(evidence.id);
+      }
+      if (completion > BILLING_MAX_TOKENS) {
+        completionOverCap += 1;
+        completionAnomalyEvidenceIds.push(evidence.id);
+      }
       // 浮点累加误差分析：本处求和至多 n=12 项（deep 档 12 笔计费请求），
       // IEEE754 双精度求和的相对误差上界 ≈ n·2⁻⁵³ ≈ 1.3e-15，
-      // 与倍率判定带宽（[0.5,1.5]，宽 1.0；相邻阈值最小间隔 0.4）相差 14+ 个数量级，可忽略；
+      // 与倍率判定阈值（0.5/0.8/1.1/1.5；相邻最小间隔 0.3）相差 14+ 个数量级，可忽略；
       // 故不需要定点整数化或 Kahan 求和。
       if (priceEnabled) {
         expectedCost += computeCostUsd(result.usage, price as ModelPrice);
@@ -207,6 +256,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     metrics['price_cached_read2'] = price?.cachedRead2 ?? null;
     metrics['balance_endpoint'] = reading ? reading.endpoint : null;
     metrics['balance_unit'] = reading ? reading.unit : null;
+    metrics['balance_resolution'] = reading && Number.isFinite(reading.resolution) ? (reading.resolution as number) : null;
     metrics['balance_before'] = balanceBefore ? balanceBefore.value : null;
     metrics['balance_after'] = balanceAfter ? balanceAfter.value : null;
     metrics['spend_delta'] = spendDelta;
@@ -230,6 +280,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   metrics['cached_tokens_total'] = cachedTokensTotal;
   metrics['reasoning_tokens_total'] = reasoningTokensTotal;
   metrics['details_reported_count'] = detailsReported;
+  metrics['completion_zero_with_text'] = completionZeroWithText;
+  metrics['completion_over_cap'] = completionOverCap;
+  metrics['retried_requests'] = retriedRequests;
+  metrics['contaminating_retries'] = contaminatingRetries;
 
   const defaultHeadline = 'Token 计数与长度线性关系正常';
   let score = 100;
@@ -243,6 +297,45 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     score = Math.min(score, 70);
     level = escalate(level, 'warn');
     headline = `部分计费探针请求失败（${failures.length} 笔），计费样本不完整`;
+  }
+
+  if (completionZeroWithText + completionOverCap > 0) {
+    const parts: string[] = [];
+    if (completionZeroWithText > 0) parts.push(`${completionZeroWithText} 笔返回非空正文但 completion_tokens=0`);
+    if (completionOverCap > 0) parts.push(`${completionOverCap} 笔 completion_tokens 超过请求上限 ${BILLING_MAX_TOKENS}`);
+    findings.push({
+      level: 'warn',
+      message: `输出侧计费异常：${parts.join('；')}。prompt 回归无法覆盖输出计数，completion_tokens 与可观测事实矛盾，计费数据不可信。`,
+      evidenceIds: [...completionAnomalyEvidenceIds],
+    });
+    score = Math.min(score, 70);
+    level = escalate(level, 'warn');
+    if (level !== 'fail') headline = 'completion_tokens 与响应正文/请求上限矛盾，输出侧计费异常';
+  }
+
+  if (contaminatingRetries > 0) {
+    // 仅统计「可能重复计费」的重试：429/503 网关拒绝后的重试没有产出，不构成重复计费风险。
+    findings.push({
+      level: 'warn',
+      message: `审计窗口内有 ${contaminatingRetries} 笔请求在「可能已计费的尝试」之后重试（200 空正文/408/409/500/502/504/超时后重试）；上游可能对多次尝试重复计费，计费样本不能判定为正常。`,
+      evidenceIds: [...contaminatingEvidenceIds],
+    });
+    score = Math.min(score, 70);
+    level = escalate(level, 'warn');
+    if (level !== 'fail' && headline === defaultHeadline) {
+      headline = `审计窗口内存在可能重复计费的重试（${contaminatingRetries} 笔），计费口径不干净`;
+    }
+  }
+
+  if (usageMissing > 0 && usageMissing < Math.ceil(requests / 2)) {
+    findings.push({
+      level: 'warn',
+      message: `${usageMissing}/${requests} 笔请求缺少 usage，样本不完整；仅凭剩余样本无法给出「计费正常」结论。`,
+      evidenceIds: [],
+    });
+    score = Math.min(score, 70);
+    level = escalate(level, 'warn');
+    if (level !== 'fail' && headline === defaultHeadline) headline = `部分请求缺少 usage（${usageMissing}/${requests}），计费样本不完整`;
   }
 
   if (constantUsage) {
@@ -349,8 +442,8 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 或存在失败请求（其提示 token 可能已被计费但 usage 未知，expectedCost 分母不完整），
   // Δspend 都不再对应「本次应缴金额」，此时绝不能采信 ratio —— 直接手写 N/A，不调用 decideRatio。
   const contaminationReasons: string[] = [];
-  if (attemptCounts.some((attempts) => attempts > 1)) {
-    contaminationReasons.push('审计窗口内存在重试请求（attempts>1，服务端可能对多次尝试重复计费）');
+  if (contaminatingRetries > 0) {
+    contaminationReasons.push(`审计窗口内有 ${contaminatingRetries} 笔请求在「可能已计费的尝试」后重试（服务端可能对多次尝试重复计费）`);
   }
   if (failures.length > 0) {
     contaminationReasons.push(`审计窗口内存在 ${failures.length} 笔失败请求（提示 token 可能已被计费但 usage 未知，应缴金额分母不完整）`);
@@ -394,12 +487,16 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   } else if (allResponses.length < 3 || (!regressionRan && !constantUsage)) {
     // status=insufficient（score=null）：倍率只出独立 finding，不碰 score/status/level
     if (ratioDecision) findings.push(ratioDecision.finding);
+    // 归因：失败是主因时说清是谁的问题（端点拒绝/鉴权/网络），不让用户猜
+    const failureDigestText = failureDigest(failureErrors, requests);
     return {
       id: 'billing',
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline: '计费探针有效样本不足（请求失败或单轨道样本 <3），无法运行回归',
+      headline: failureDigestText !== null
+        ? `计费探针有效样本不足，无法运行回归；主因：${failureDigestText}`
+        : '计费探针有效样本不足（单轨道样本 <3），无法运行回归',
       findings,
       metrics,
     };
@@ -416,49 +513,55 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       const ratioText = ratioHeadline(ratioDecision, regressionLevel);
       if (ratioText !== null) headline = ratioText;
     }
-    // 余额差值是账户级口径：极高倍率更常见于审计窗口内的其他并发消费，而不是单次欺骗；
-    // 保留 fail 判定，但必须显式提示复核口径，避免用户把并发污染当成实锤。
-    if (ratioDecision.verdict === 'fail' && ratioDecision.ratio !== null && ratioDecision.ratio > 10) {
-      findings.push({
-        level: 'info',
-        message: `实测倍率 ${round(ratioDecision.ratio)} 极高，且余额差值为账户级口径：若审计窗口内同一 key 有其他并发消费，倍率会被放大；请确认窗口独占后再据此定性。`,
-        evidenceIds: [],
-      });
-    }
   }
 
-  if (level === 'pass') {
-    // 绝对对账是否真的发生过：参考报告一致，或价格/余额实测倍率落在 [0.5,1.1] 且窗口干净。
-    // 两者都没有时，headline 必须显式写「自报 usage，未做绝对对账」——否则「正常」会被误读为
-    // 「token 数绝对准确」，而全量等比虚增（×1.3）在纯回归下天然不可见（2026-10-18 用户复盘）。
-    const referenceVerified = referenceDecision?.verdict === 'ok';
-    const ratioVerified =
-      priceEnabled &&
-      ratioDecision !== null &&
-      ratioDecision.verdict === 'ok' &&
-      ratioDecision.maskedVerdict === null &&
-      ratioDecision.ratio !== null &&
-      ratioDecision.ratio >= 0.5 &&
-      ratioDecision.ratio <= 1.1 &&
-      usageMissing === 0 &&
-      failures.length === 0 &&
-      !attemptCounts.some((attempts) => attempts > 1) &&
-      regressionLevel !== 'fail';
-    const absoluteNote = referenceVerified || ratioVerified
-      ? '。'
-      : '；未提供可用的 --token-reference 或价格/余额对账时，"全量等比缩放"型计数虚增（如 ×1.3）无法被本回归识别，建议用同名模型的历史报告或录价渠道复测对比。';
+  const cleanWindow =
+    failures.length === 0 &&
+    usageMissing === 0 &&
+    contaminatingRetries === 0;
+  const referenceVerified = referenceDecision?.verdict === 'ok' && cleanWindow;
+  const ratioVerified =
+    priceEnabled &&
+    ratioDecision !== null &&
+    ratioDecision.verdict === 'ok' &&
+    ratioDecision.maskedVerdict === null &&
+    ratioDecision.ratio !== null &&
+    ratioDecision.ratio >= 0.8 &&
+    ratioDecision.ratio <= 1.1 &&
+    cleanWindow &&
+    regressionLevel !== 'fail';
+  const absoluteVerified = referenceVerified || ratioVerified;
+  metrics['reference_verified'] = referenceVerified ? 1 : 0;
+  metrics['ratio_verified'] = ratioVerified ? 1 : 0;
+  metrics['absolute_reconciliation'] = absoluteVerified ? 1 : 0;
+  metrics['evidence_level'] = absoluteVerified ? 'absolute' : 'shape-only';
+
+  if (level === 'pass' && !absoluteVerified) {
+    // billing 的核验对象是端点自报 usage：形状（线性）、内部一致性（total=prompt+completion、
+    // 非负值）、输出侧（completion 与正文/上限）与恒定检测全部通过，即给出「usage 未发现造假
+    // 证据」的明确判定，不因缺绝对对账悬置（2026-10-19 用户口径：本维度只验证 usage）。
+    // 证据分级仍如实透出：score 85 < 绝对对账的 100，headline 与 info finding 说明
+    // 「扣费金额真实性未验证」——×1.3 全量等比缩放或常量偏移只有 --token-reference /
+    // 价格+余额对账能识别。
     findings.push({
       level: 'info',
-      message: `token 估计为保守估算（非精确 tokenizer），判据使用回归一致性而非绝对相等${absoluteNote}`,
+      message:
+        '本轮已核验端点自报 usage 与输入长度线性、内部一致且输出侧无矛盾，未发现造假证据；' +
+        '未做绝对对账，扣费金额真实性未验证——全量等比缩放（如 ×1.3）或常量偏移在回归中不可见。' +
+        '如需绝对对账：提供 --token-reference（同名模型历史报告），或同时提供宣称价格并确保余额端点可用。',
       evidenceIds: [],
     });
-    if (referenceVerified) {
-      headline = 'Token 计数与长度线性关系正常，且与参考报告一致';
-    } else if (ratioVerified) {
-      headline = 'Token 计数与长度线性关系正常，实测倍率与宣称价格一致';
-    } else {
-      headline = 'Token 计数与长度线性关系正常（自报 usage，未做绝对对账）';
-    }
+    score = Math.min(score, SHAPE_ONLY_SCORE);
+    headline = 'usage 计数核验通过，未发现造假证据（未做绝对对账，扣费金额真实性未验证）';
+  } else if (level === 'pass') {
+    findings.push({
+      level: 'info',
+      message: `token 估计为保守估算（非精确 tokenizer）；本轮已通过${referenceVerified ? '参考报告逐档计数' : '价格+余额实测倍率'}做绝对对账，回归仅用于形状核验。`,
+      evidenceIds: [],
+    });
+    headline = referenceVerified
+      ? 'Token 计数与长度线性关系正常，且与参考报告一致'
+      : 'Token 计数与长度线性关系正常，实测倍率与宣称价格一致';
   }
   return { id: 'billing', status: 'ok', score, level, headline, findings, metrics };
 }
@@ -516,10 +619,18 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
   const { before, after, spendDelta, expectedCost, ratioDropped, regressionLevel } = args;
   // 证据不足一律 N/A + info，不加罚
   if (before === null || after === null) {
-    return na('余额端点不可用：未命中任何已知余额查询接口，实测倍率无法验证（中转站可通过禁用余额接口规避此项，建议在其后台人工核对）。');
+    return na('余额端点不可用或返回未知 schema（如 /dashboard/billing/usage 的 total_usage 非整数美分）：无法建立可比余额读数，实测倍率无法验证（中转站可通过禁用/改写余额接口规避此项，建议在其后台人工核对）。');
   }
   if (spendDelta === null) {
     return na('两次余额查询不同源（endpoint/kind/unit 不一致，可能被路由到不同后端），无法作差计算实测倍率。');
+  }
+  if (before.unit !== 'USD' || after.unit !== 'USD') {
+    // 非美元口径（如 one-api 的 quota）：expectedCost 按宣称价格折算为美元，quota 差值与美元直接作比
+    // 会产出天文/荒谬倍率（quota 粒度通常 1 单位 ≪ 1 USD），必须整体作废而非出 warn。
+    return na(
+      `余额读数单位为 ${before.unit === after.unit ? before.unit : `${before.unit}/${after.unit}`}（非美元口径），` +
+        '无法与按宣称价格折算的美元应缴金额直接作比（工具不换算单位），实测倍率判定作废。',
+    );
   }
   if (spendDelta === 0) {
     return na('审计窗口内余额差值 Δ=0：余额粒度不足或消费延迟入账，实测倍率无法计算。');
@@ -527,8 +638,28 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
   if (spendDelta < 0) {
     return na(`审计窗口内余额不降反升（Δ=${round(spendDelta)}）：疑有充值干扰，实测倍率判定作废。`);
   }
+  const resolution = Math.max(
+    Number.isFinite(before.resolution) ? (before.resolution as number) : 0,
+    Number.isFinite(after.resolution) ? (after.resolution as number) : 0,
+  );
+  if (resolution > 0 && spendDelta < 3 * resolution) {
+    // 精度噪声门：Δ 只有零点几个最小刻度时，无法区分「真实小额扣费」与「读数舍入噪声」，
+    // 采信会产生离谱倍率（Δ=0.01/res=0.01 → ratio 任意大），必须 N/A。
+    return na(
+      `审计窗口内余额差值 Δ=${round(spendDelta)} 低于余额读数最小分辨率（${round(resolution)}）的 3 倍，` +
+        '无法区分真实扣费与读数精度噪声，实测倍率无法判定（可增大审计窗口或改用 token-reference 对账）。',
+    );
+  }
   if (expectedCost <= 0) {
     return na('无有效 usage 记录，无法估算应缴金额，实测倍率无法计算。');
+  }
+  if (resolution > 0 && expectedCost < 3 * resolution) {
+    // 应缴金额本身低于 3 个最小刻度时，余额 Δ 的舍入噪声就能把倍率推到任意档位
+    //（2026-10-18 真机：应缴 $0.019 < 3×$0.01，却因账户级抖动读出 142.975× 假 fail）。
+    return na(
+      `本次应缴金额 ${round(expectedCost)} 低于余额读数最小分辨率（${round(resolution)}）的 3 倍：` +
+        '即使足额扣费也只能落在 1-3 个最小刻度内，倍率会被舍入噪声支配，无法可靠判定（可增大采样量 --deep 或改用 token-reference 对账）。',
+    );
   }
   const ratio = spendDelta / expectedCost;
   if (!Number.isFinite(ratio)) {
@@ -542,7 +673,7 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
     const masked =
       underlying !== null && (underlying.verdict === 'fail' || underlying.verdict === 'warn')
         ? underlying.verdict
-        : null;
+        : (underlying?.maskedVerdict ?? null);
     return {
       verdict: 'ok',
       maskedVerdict: masked,
@@ -553,6 +684,24 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
         message:
           `${ratioDropped} 笔请求 usage 缺失，实测倍率分母偏小、结果上偏，仅作参考不出判定` +
           (masked !== null ? `（按无缺失重算底层档位为 ${masked}，因上偏不采信）。` : '。'),
+        evidenceIds: [],
+      },
+    };
+  }
+  if (ratio > 10) {
+    // 余额差值是账户级口径：10 倍以上更可能是窗口内其他并发消费、充值/退款混入或单位错配，
+    // 无法归因到本次审计。保留原始倍率与 maskedVerdict 供复核，但不判 fail（防冤枉端点）。
+    return {
+      verdict: 'N/A',
+      maskedVerdict: 'fail',
+      cap: null,
+      ratio,
+      finding: {
+        level: 'warn',
+        message:
+          `实测倍率 ${round(ratio)} 远超本次应缴金额（Δ=${round(spendDelta)}，应缴=${round(expectedCost)}）：` +
+          '余额差值为账户级口径，无法区分真实超高计费与窗口内其他并发消费/余额单位错配，本次不判 fail；' +
+          '请确认审计窗口独占、余额单位一致，或人工核对该站账单。',
         evidenceIds: [],
       },
     };
@@ -610,7 +759,7 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
       },
     };
   }
-  if (ratio >= 0.5) {
+  if (ratio >= 0.8) {
     return {
       verdict: 'ok',
       maskedVerdict: null,
@@ -618,7 +767,22 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
       ratio,
       finding: {
         level: 'info',
-        message: `实测倍率 ${round(ratio)} 落在 [0.5, 1.1]：与宣称价格基本一致。`,
+        message: `实测倍率 ${round(ratio)} 落在 [0.8, 1.1]：与宣称价格基本一致。`,
+        evidenceIds: [],
+      },
+    };
+  }
+  if (ratio >= 0.5) {
+    // 低报 20%-50% 不能算「一致」：可能是 usage 少计、价格/余额单位错配或账户级抵扣。
+    // 不判 fail（方向对用户有利且账户级噪声未知），但必须 warn 阻止 PASS。
+    return {
+      verdict: 'warn',
+      maskedVerdict: null,
+      cap: null,
+      ratio,
+      finding: {
+        level: 'warn',
+        message: `实测倍率 ${round(ratio)} 落在 [0.5, 0.8)：实际扣费低于按宣称价格与自报 usage 的应缴金额，疑 usage 少计、价格/余额单位错配或账户级抵扣，请人工核对。`,
         evidenceIds: [],
       },
     };
@@ -664,6 +828,9 @@ export function applyRatioDecision(
  */
 function ratioHeadline(decision: RatioDecision, regressionLevel: Level): string | null {
   if (decision.ratio === null) return null;
+  if (decision.verdict === 'N/A') {
+    return `实测倍率 ${round(decision.ratio)} 异常但无法归因（疑账户级并发或余额单位错配），本次不作 fail 判定`;
+  }
   if (decision.finding.level === 'fail') {
     const suffix = regressionLevel === 'fail' ? '；usage 计数亦异常' : '';
     return `实测扣费为应缴的 ${round(decision.ratio)} 倍（>1.5），计费虚高${suffix}`;

@@ -7,7 +7,7 @@ import { CREDIBILITY_NOTE } from './markdown.js';
 const DIMENSION_DESC: Readonly<Record<string, string>> = {
   identity: '身份与指纹：多角度自述问答与行为指纹比对，识破换标签/套皮；评分依据：自述一致性与指纹命中',
   context: '长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率',
-  billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性；可选 --token-reference 或价格+余额做绝对对账；评分依据：线性度、斜率区间与实测倍率',
+  billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性 + completion_tokens 硬矛盾检查；绝对对账（--token-reference 或价格+余额实测倍率）缺失时判「未判定」，不给分',
   capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
   quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
   ttft: '流式首字延迟：采样 TTFT 分位数；观测项不计分，仅披露 p50/p95（非流式响应计至完整响应体到达）',

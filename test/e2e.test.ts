@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -77,9 +77,10 @@ function headlineOf(report: AuditReport, id: ProbeId) {
 }
 
 test('e2e honest endpoint scores 100 with no failures', async () => {
-  const mock = await createMockServer({ mode: 'honest' });
+  // 绝对对账：余额按 1.0 倍累加 usage 成本，billing 给 PASS 100（仅形状证据上限为 85）。
+  const mock = await createMockServer({ mode: 'honest', balanceRate: 1 });
   try {
-    const report = await audit(mock, { claimedContext: 4000 });
+    const report = await audit(mock, { claimedContext: 4000, priceInput: 2, priceOutput: 8 });
     assert.equal(report.total, 100);
     assert.equal(report.overall, 'pass');
     assert.ok(!report.scores.some((s) => s.level === 'fail'));
@@ -101,6 +102,9 @@ test('e2e honest endpoint scores 100 with no failures', async () => {
     assert.equal(billing?.metrics['cached_tokens_total'], 0);
     assert.equal(billing?.metrics['reasoning_tokens_total'], billed.length);
     assert.equal(billing?.metrics['details_reported_count'], billed.length);
+    assert.equal(billing?.metrics['ratio_verified'], 1);
+    assert.equal(billing?.metrics['absolute_reconciliation'], 1);
+    assert.equal(billing?.metrics['evidence_level'], 'absolute');
   } finally {
     mock.server.close();
   }
@@ -158,9 +162,9 @@ test('e2e relabeled endpoint (GLM pretending to be gpt-4o) fails identity', asyn
 
 test('e2e silently truncating endpoint fails context probe (deep)', async () => {
   // --deep 走 boundaryTruncated 二分定罪（确定性证据）；非 --deep 仅统计信号 → warn 不指控
-  const mock = await createMockServer({ mode: 'truncate', truncateTokens: 7000 });
+  const mock = await createMockServer({ mode: 'truncate', truncateTokens: 7000, balanceRate: 1 });
   try {
-    const report = await audit(mock, { claimedContext: 32000, deep: true });
+    const report = await audit(mock, { claimedContext: 32000, deep: true, priceInput: 2, priceOutput: 8 });
     assert.equal(levelOf(report, 'context'), 'fail');
     const headline = headlineOf(report, 'context');
     assert.ok(/截断|回显|窗口不实/.test(headline), headline);
@@ -312,6 +316,8 @@ test('e2e flaky endpoint completes with retries and no probe errors', async () =
     const report = await audit(mock);
     assert.ok(report.total !== null);
     assert.ok(!report.outcomes.some((o) => o.status === 'error'));
+    // 重试请求可能被上游重复计费：billing 必须 warn（不得 PASS），但仍可参与总分。
+    assert.equal(levelOf(report, 'billing'), 'warn');
   } finally {
     mock.server.close();
   }
@@ -443,7 +449,10 @@ test('e2e flaky500 with retries invalidates measured ratio (contamination gate)'
     assert.equal(billing?.metrics['measured_ratio'], 'N/A');
     // balance 查询不受污染闸影响，照常输出
     assert.equal(billing?.metrics['balance_endpoint'], '/dashboard/billing/usage');
-    assert.ok(billing?.findings.some((f) => /审计窗口内存在重试请求/.test(f.message)));
+    // 新口径：污染 warn 描述「可能已计费的尝试后重试（重复计费风险）」并给出 contaminating_retries 指标
+    assert.ok(billing?.findings.some((f) => /重复计费/.test(f.message)), JSON.stringify(billing?.findings));
+    // flaky500 对每个唯一请求体首次注入 500 → 10 笔计费样本（5 档 × en/zh）全部经历污染重试
+    assert.equal(billing?.metrics['contaminating_retries'], 10);
   } finally {
     mock.server.close();
   }
@@ -664,19 +673,28 @@ test('e2e persona-inject endpoint: brand persona in self-description → identit
 
 // --- F3 token-reference：全量等比虚增（线性回归不可见）的端到端识别 ---
 
-test('e2e usage-scale 1.3 without --token-reference stays pass with honest limitation disclosure', async () => {
-  // 全量等比虚增对回归/常量检测不可见（形状不变）——无参考时只能诚实披露检测边界，不得谎报识别能力
+test('e2e usage-scale 1.3 without --token-reference gives shape-only usage verdict (pass 85, disclosure kept)', async () => {
+  // billing 核验对象是 usage：全量等比虚增对回归/常量检测不可见（形状不变），
+  // 无参考/无余额对账时给出用法层面的明确判定（pass 85 + 「未做绝对对账」披露），
+  // 不再整体悬置为 insufficient（2026-10-19 用户口径：本维度只验证 usage 是否准确无误）；
+  // ×1.3 本身仍只有 --token-reference / 价格+余额对账能定罪。
   const mock = await createMockServer({ mode: 'usage-scale', usageScale: 1.3 });
   try {
     const report = await audit(mock);
     const billing = report.outcomes.find((o) => o.id === 'billing');
     assert.ok(billing);
-    assert.equal(billing?.level, 'pass', billing?.headline);
-    assert.equal(billing?.score, 100);
+    assert.equal(billing?.status, 'ok', billing?.headline);
+    assert.equal(billing?.level, 'pass');
+    assert.equal(billing?.score, 85);
+    assert.match(billing?.headline ?? '', /未发现造假证据/);
+    assert.match(billing?.headline ?? '', /未做绝对对账/);
+    assert.equal(billing?.metrics['absolute_reconciliation'], 0);
+    assert.equal(billing?.metrics['evidence_level'], 'shape-only');
     assert.ok(
-      billing?.findings.some((f) => f.level === 'info' && /--token-reference/.test(f.message)),
+      billing?.findings.some((f) => f.level === 'info' && /全量等比缩放/.test(f.message)),
       JSON.stringify(billing?.findings),
     );
+    assert.notEqual(report.total, null);
   } finally {
     mock.server.close();
   }
@@ -800,15 +818,61 @@ test('cli: --token-reference with malformed JSON exits 2 with zero requests', as
 });
 
 test('cli: honest audit subprocess exits within 20s with the right exit code', async () => {
-  const mock = await createMockServer({ mode: 'honest' });
+  // 用价格+余额对账构造绝对证据（billing 100），验证正常成功路径为退出码 0。
+  const mock = await createMockServer({ mode: 'honest', balanceRate: 1 });
   const dir = mkdtempSync(join(tmpdir(), 'mx-cli-audit-'));
+  try {
+    const result = await runCli(
+      [
+        'test',
+        '--base-url',
+        mock.baseUrl,
+        '--key',
+        'k',
+        '--model',
+        'gpt-4o',
+        '--seed',
+        '7',
+        '--price-input',
+        '2',
+        '--price-output',
+        '8',
+        '--out',
+        dir,
+      ],
+      60000,
+    );
+    assert.equal(result.status, 0, result.stderr);
+    assert.ok(result.elapsedMs < 20000, `审计子进程耗时 ${result.elapsedMs}ms，超过 20s`);
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cli: honest audit without price/balance still concludes on usage (exit 0, shape-only billing 85)', async () => {
+  // billing 只验证 usage：无价格/余额时形状证据全过 → usage 判定 pass 85 + 如实披露，
+  // 总分照常给出、退出码 0（不再因缺绝对对账悬置整轮）。
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-no-recon-'));
   try {
     const result = await runCli(
       ['test', '--base-url', mock.baseUrl, '--key', 'k', '--model', 'gpt-4o', '--seed', '7', '--out', dir],
       60000,
     );
     assert.equal(result.status, 0, result.stderr);
-    assert.ok(result.elapsedMs < 20000, `审计子进程耗时 ${result.elapsedMs}ms，超过 20s`);
+    const reportFile = readdirSync(dir).find((f) => f.startsWith('report-') && f.endsWith('.json'));
+    assert.ok(reportFile, '应产出报告 JSON');
+    const report = JSON.parse(readFileSync(join(dir, reportFile as string), 'utf8')) as {
+      outcomes: Array<{ id: string; status: string; score: number | null; headline: string }>;
+      total: number | null;
+    };
+    const billing = report.outcomes.find((o) => o.id === 'billing');
+    assert.ok(billing);
+    assert.equal(billing.status, 'ok');
+    assert.equal(billing.score, 85);
+    assert.match(billing.headline, /未做绝对对账/);
+    assert.notEqual(report.total, null);
   } finally {
     mock.server.close();
     rmSync(dir, { recursive: true, force: true });
