@@ -336,7 +336,12 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
   }
 
   const usable = main.length - excluded - unavailableSamples - mainEmpty;
-  metrics['main'] = `${mainCorrect}/${usable}`;
+  // —— pass@1 主口径（2026-10-19 图纸双审裁决）：质量主指标 = 首答正确率；
+  // metrics['main'] 记首答（与 headline/评分同口径），metrics['main_recovered'] 记两次机会口径。
+  const firstCorrect = mainCorrect - recoveredCount;
+  metrics['main'] = `${firstCorrect}/${usable}`;
+  metrics['main_recovered'] = `${mainCorrect}/${usable}`;
+  metrics['metric_version'] = 'pass1';
   metrics['controls'] = `${controlCorrect}/${controls.length}`;
   metrics['excluded'] = excluded;
   if (unavailableSamples > 0) metrics['unavailable'] = unavailableSamples;
@@ -399,56 +404,68 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
     };
   }
 
-  const accuracy = mainCorrect / usable;
-  let score = Math.round(accuracy * 100);
+  // —— pass@1 判定（阈值不变：0.9/0.6；语义从「两次机会」改为「首答」）——
+  // fail 增设复采前提（图纸双审必修）：首答 <0.6 且复采样仍未恢复至 0.6 线才判 fail（定论级）；
+  // 复采恢复到 ≥0.6 视为随机失误，降为 warn 不定罪。pass 只认首答：复采样答对绝不把端点
+  // 抬进 pass——识别「重复提问」后策略性作答的端点无法借第二次机会洗白。
+  const pass1 = firstCorrect / usable;
+  const twoChance = mainCorrect / usable;
+  let score: number;
   let level: ProbeOutcome['level'];
-  if (accuracy >= 0.9) level = 'pass';
-  else if (accuracy >= 0.6) level = 'warn';
-  else level = 'fail';
+  let whitewashRescued = false;
+  const recoveredNote = recoveredCount > 0 ? `，复采样恢复 ${recoveredCount} 题` : '';
+  if (pass1 >= 0.9) {
+    level = 'pass';
+    score = Math.round(pass1 * 100);
+  } else if (pass1 >= 0.6) {
+    level = 'warn';
+    score = Math.round(pass1 * 100);
+  } else if (twoChance >= 0.6) {
+    // 首答跌破 0.6 线但复采样恢复：随机失误不定罪，warn + 两次机会口径封顶 80
+    //（识别重复提问的端点即便复采全对也只能拿 80，不得接近满分洗白）。
+    level = 'warn';
+    score = Math.min(Math.round(twoChance * 100), 80);
+    whitewashRescued = true;
+  } else {
+    level = 'fail';
+    score = Math.round(pass1 * 100);
+  }
 
   // 准确率 95% 双侧 Wilson 置信区间（z=1.96）：小样本下点估计不可靠，区间只披露、不参与判定
   //（0.9/0.6 阈值口径不变），供报告读者自行评估「10/10」与「40/40」的证据强度差异。
-  const ciLow = wilsonLowerBound(mainCorrect, usable, 1.96);
-  const ciHigh = wilsonUpperBound(mainCorrect, usable, 1.96);
+  // 区间基于首答样本（与主指标同口径）。
+  const ciLow = wilsonLowerBound(firstCorrect, usable, 1.96);
+  const ciHigh = wilsonUpperBound(firstCorrect, usable, 1.96);
   metrics['accuracy_ci95_low'] = Math.round(ciLow * 1000) / 1000;
   metrics['accuracy_ci95_high'] = Math.round(ciHigh * 1000) / 1000;
   findings.push({
     level: 'info',
-    message: `主样本 ${usable} 题的准确率 95% 置信区间为 [${(ciLow * 100).toFixed(1)}%, ${(ciHigh * 100).toFixed(1)}%]` +
+    message: `首答准确率 95% 置信区间为 [${(ciLow * 100).toFixed(1)}%, ${(ciHigh * 100).toFixed(1)}%]` +
       (ciHigh - ciLow > 0.15 ? '：样本量偏小、区间较宽，结论置信度有限，建议复测或扩样后再定性。' : '。'),
     evidenceIds: [],
   });
 
   const excludedNote = excluded > 0 ? `，另有 ${excluded} 题因推理占满预算剔除分母` : '';
-  let headline =
-    level === 'pass'
-      ? `质量题集通过：主题 ${mainCorrect}/${usable}（控制题全对${excludedNote}）`
-      : level === 'warn'
-        ? `质量可疑：主题 ${mainCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}`
-        : `疑似降智：主题仅 ${mainCorrect}/${usable} 正确（控制题全对），已答错 ${wrong.length} 题${excludedNote}`;
+  let headline: string;
+  if (level === 'pass') {
+    headline = `质量题集通过：首答 ${firstCorrect}/${usable}（控制题全对${excludedNote}${recoveredNote}）`;
+  } else if (level === 'warn') {
+    headline = whitewashRescued
+      ? `质量可疑：首答仅 ${firstCorrect}/${usable}，复采样恢复至 ${mainCorrect}/${usable}（随机失误不足以定罪${excludedNote}）`
+      : `质量可疑：首答 ${firstCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}${recoveredNote}`;
+  } else {
+    headline = `疑似降智：首答仅 ${firstCorrect}/${usable} 正确，复采样后 ${mainCorrect}/${usable} 仍未达 0.6 线（控制题全对），已答错 ${wrong.length} 题${excludedNote}`;
+  }
 
-  // 恢复率防洗白（F1 裁决口径）：端点识别「重复提问」后策略性作答时，复采样恢复率会异常高。
-  // ① 恢复率异常高：只披露、不出分（首答正确数少 + 复采样几乎全对 = 可疑模式）；
-  // ② 过半主题依赖复采样才答对：按可疑处理（分数封顶 80、pass 降 warn），headline 同步改写。
-  const firstCorrect = mainCorrect - recoveredCount;
-  if (retriedCount > 0) {
-    if (recoveredCount >= 3 && recoveredCount / retriedCount >= 0.9 && firstCorrect <= 6) {
-      findings.push({
-        level: 'info',
-        message: `复采样恢复率异常高（${recoveredCount}/${retriedCount}，首答正确 ${firstCorrect}/${main.length}）：不排除端点识别重复提问后策略性作答，建议人工复核。`,
-        evidenceIds: [],
-      });
-    }
-    if (recoveredCount / main.length >= 0.5) {
-      findings.push({
-        level: 'warn',
-        message: `过半主题依赖复采样才答对（${recoveredCount}/${main.length}）：疑似端点识别重复提问后二次作答。`,
-        evidenceIds: [],
-      });
-      score = Math.min(score, 80);
-      if (level === 'pass') level = 'warn';
-      headline = `质量可疑：过半主题需复采样才对（${mainCorrect}/${usable}）`;
-    }
+  // 恢复率防洗白（F1 裁决口径，2026-10-19 收窄为纯披露）：端点识别「重复提问」后策略性作答时，
+  // 复采样恢复率会异常高——只披露提醒人工复核，不再参与计分/判定（pass@1 主口径下复采样
+  // 答对已不影响 pass 线，旧「过半依赖复采样 cap80」分支失去存在意义，删除）。
+  if (retriedCount > 0 && recoveredCount >= 3 && recoveredCount / retriedCount >= 0.9 && firstCorrect <= 6) {
+    findings.push({
+      level: 'info',
+      message: `复采样恢复率异常高（${recoveredCount}/${retriedCount}，首答正确 ${firstCorrect}/${main.length}）：不排除端点识别重复提问后策略性作答，建议人工复核。`,
+      evidenceIds: [],
+    });
   }
 
   findings.push({

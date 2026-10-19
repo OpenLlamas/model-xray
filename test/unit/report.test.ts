@@ -62,6 +62,7 @@ function sampleReport(textPreview: string): AuditReport {
           usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 },
           usageRejected: null,
           attempts: 1,
+          temperatureDropped: false,
           toolCallCount: 0,
           finishReason: 'length',
           error: null,

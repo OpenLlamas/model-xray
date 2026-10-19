@@ -229,3 +229,29 @@
 - **失败归因（新建 src/diagnostics.ts）**：`categorizeFailure`（gateway/auth/not-found/network/endpoint-error/other）+ `summarizeFailures` + `failureDigest` + `runFailureDigest`；错误详情白名单化（状态码+截断 90 字+去控制字符防 ANSI 注入）；文案称「端点/网关」而非「上游」（natapp 隧道场景 503 实为网关返回）；identity「无有效样本」标题与 runner notes（运行级失败汇总+建议）接入；明确不做：端点预检/健康门、放宽 billing 每档 ≥3 样本门槛、把 5xx 记为模型问题。
 - **范围外**：不自动放宽任何 fail 判据；UNKNOWN 仍如实呈现，只是说清是谁的问题并给建议（错峰重测等）。
 - **验证**：全量 `npm test` **672/672**（新增：client 重试分层×4、billing 污染口径×2、identity 归因标题×1、diagnostics 单测×5；既有断言按新口径对齐：billing insufficient 标题、e2e flaky500 污染指标）；`tsc --noEmit` exit 0；`git diff --check` exit 0。README 中英文同步（--http-retries、污染豁免口径、503/UNKNOWN 排查行）。
+
+### 2026-10-19 五维度收口切片（billing 输出侧/identity 变体/quality pass@1/context 早停与预算/badrelay 标定台）
+
+- **图纸双审留痕**：`dual_review` 裁决「有条件通过」，3 必修项逐条裁决后全部采纳：① balance `quota_per_unit` 校准不可达时不计分、余额只采信 `total_available`；② quality fail 需「复采样未恢复至 0.6 线」前提、pass 只认首答 ≥0.9、基线 `metricVersion:'pass1'` 守卫；③ context 早停必须满足「90% 档 ≥2 发有效 needle 全中 + usage 校准可信 + 该档干净」，samples=1/usage 不可信/有未命中一律不早停。
+- **billing 输出侧合计比对（src/probes/billing.ts）**：Σ(可见 completion = completion − reasoning_tokens，仅 `finish=stop`) ÷ Σ(正文本地估算) > 1.35 → 疑似输出 token 灌水，warn 封顶 70；< 0.6 → 仅提示；回归非零常量偏移（finite r²≥0.9 且截距超 `INTERCEPT_WARN_TOKENS=120`）同样 warn。真机实证：中转对普通复读也报 `reasoning_tokens=1`，需扣除推理 token 后比对。usage-scale 1.3 e2e 改为真阳性：mock billing 回 `NO_PASSPHRASE`（13 字符）走「校验」口令分支 → ×1.3 后 visible/est = 1.5 越线，合法抓到输出侧灌水。
+- **identity 变体冲突（src/probes/identity.ts）**：`TARGET_IDENTITY_RE` 族前缀+X.Y 版本+变体后缀比对——同族不同变体（宣称 glm-5.3、自述 glm-5.3-flash）→ warn 封顶 80；跨族 → fail 0。变体分隔符只认 `[-._]`（含 `\s` 会吞 "by" 产生假冲突）；benign 裸别名（latest/preview/beta/exp/experimental）归一为空不参与冲突；否定守卫含「不叫」；触发=精确版本题 1 条冲突或 ≥2 样本同一冲突变体。单测 62/62。
+- **quality pass@1（src/probes/quality.ts + src/baseline.ts）**：`firstCorrect = mainCorrect − recoveredCount`，`metrics['main']`=pass@1、`metrics['main_recovered']`=两次机会、`metric_version='pass1'`；rescued（首答<0.6 但复采≥0.6）→ warn 封顶 80；旧「过半依赖复采样 cap80」分支删除。基线 metricVersion 守卫：旧口径基线与 pass1 本次混比 → 跳过质量对比 + notes 提示重建，其余维度照常比较。单测 29/29 + baseline 25/25。
+- **context 降序执行 + 早停 + 软预算（src/probes/context.ts + src/cli.ts）**：`DEPTHS` 改降序 [0.9,0.75,0.5,0.25]（省 75% 发送量），frontier 判定（fullyRejectedHighDepths/highTiers）改升序找首个整档被拒档；早停四条件（DEPTH_TOP 档、samples≥2、全中、usage 校准可信且档干净）→ 浅档 skipped 披露、不计缺失深度；`--context-budget-usd <n>` 软预算（`createSpendTracker`，须与价格成对，估算超限即停发 needle/回显/边界扫描，pass 只建立在停发前证据 → insufficient + 披露估算花费，warn/fail 结论保留）。单测 38/38 + CLI e2e 2/2（缺价格对/非数字 fail-fast 零请求；'-0.5' 被 parseArgs 判 ambiguous 属另一 exit 2 路径）。
+- **badrelay 标定台（test/unit/badrelay-fixture.ts + badrelay.test.ts）**：7 场景检出矩阵（honest 反锚点/usage-scale 1.3→billing warn/relabel→identity fail 0/persona-inject→warn 80/truncate-7000→context warn/retry-fix-12→quality warn 80/组合）。mock-server 新增与 mode 正交的组合旋钮 `truncateAtTokens`/`retellAs`/`scaleUsage`。组合场景如实记录真实遮蔽：截断抵消输出侧 ratio 信号（0.733 落正常带）→ billing shape-only pass 85，但「等比缩放不可见 + 未做绝对对账」披露必须存在（专测钉住）——诚实降级而非假装全知。
+- **README 中英文同步**：质量口径 pass@1（注意 PROBESET_VERSION 仍为 v0.2.2，未 bump）、identity 变体冲突、context 早停/预算、billing 输出侧合计比对+截距、实测倍率 new-api 端点（/api/usage/token + /api/status 校准、baseUrl /v1 剥离）、--context-budget-usd 参数行、基线 metricVersion 条款。
+- **暂缓（未擅自补）**：分词器指纹、L0 零成本信号、跨探针复用 usage、多针 needle、SPRT/流水线、new-api 逐请求日志对账、稳健回归离群剔除、completion 控制题校准。
+
+### 2026-10-19 查漏补缺（对照 chroe.md 全清单复核）：余额快照稳定化 + temperature 400 去参回退
+
+- **复核结论**：chroe.md 逐项对照——已落地：badrelay 标定台（§1 部分）、计量差分截距/completion 合计比对（§2 部分）、pass@1 质量口径（§4 主项）、needle 降序早停+预算（§5 主项）、TTFT 文档矛盾/别名快照归一（§6）；既定暂缓（勿擅自补）：离线 tokenizer 参考表、跨探针复用 usage、网关被动 Theil–Sen、L0 零成本信号、分词器指纹、SPRT、多针 needle、流水线、new-api 逐请求日志/倍率表对账、题集程序化生成——均依赖官方 key/大改题集/网关重构，留痕见上。
+- **余额 post 快照稳定化（src/balance.ts `probeBalanceStable` + billing 接线）**：chroe §2「post 快照要轮询到连续两次读数稳定再取」。计费序列结束后以 400ms 间隔重读余额（上限 3 次额外），连续两次一致才认稳定；轮询上限内仍在变化（异步结算极慢/账户级并发）→ settled=false → 并入「实测倍率作废」闸（Δ 不可归因，info 披露不 fail）。异步结算延迟下单次读数会让 Δ 偏小、把诚实站点误判成低报 warn——这是本轮查出的真实误报源。余额 GET 不消耗模型 token。metrics 新增 `balance_post_settled`（1/0/null）/`balance_post_polls`。
+- **temperature 400 去参回退（src/client.ts）**：chroe §4「部分模型拒绝 temperature 参数（400），不该记成能力失败」——旧实现全维度请求带 temperature，被拒时每条探针请求失败 → 全报告 insufficient。现在 client 层对「400 且错误体含 temperature 且本请求带该参数」自动去参重发一次（不占 httpRetries/retries 预算；400 参数校验不进入推理、不计费，不置污染）；`ChatResult.temperatureDropped` 披露并写入证据（EvidenceResponse 同步）。attempts 如实 +1。回退只做一次，仍 400 则如实失败。
+- **测试**：balance 单测 19/19（新增稳定化 4 条：收敛取稳定值/上限内仍动 settled=false/首读即稳 2 次即停/端点不可达 null）；client 单测新增去参回退 4 条（去参成功不污染/非 temperature 400 不回退/回退后仍 400 如实失败/本无 temperature 不触发）；report 夹具补 temperatureDropped 字段。README 中英文同步（实测倍率稳定化条款 + 400 temperature 排查行）。
+
+### 2026-10-19 偷调倍率专项（再次查漏补缺，图纸双审「有条件通过」5 必修全采纳）
+
+- **复核结论**：实测倍率链路存在三个真实缺口——① pre 快照单次读数：窗口前未结算旧账会混入 Δ 推高倍率（诬告方向，post 稳定化只堵了漏计方向）；② expectedCost < 3×余额分辨率（整数美分端点 + 便宜模型）必然 N/A：余额端点可用却测不出；③ one-api /api/user/self 为 raw quota 单位 + 用户级口径：按非 USD 整体作废（永远测不出），且其他 key 并发消费可落 (1.5,10]（>10 门兜不住）。另修复候选探测隐藏缺陷：/api/* 候选原先打在 /v1/api/*（真实部署永远 404），现剥 /v1 后从站点根探测。
+- **必修落地**（dual_review 5 项全采纳）：① pre 稳定化 + 「首比即稳才认净」（polls≤2）：短窗内读数仍在动 = 窗口前有未结算消费 → 并入污染闸 N/A info；② /api/user/self 用户级来源禁出 fail：>1.5 降 warn + maskedVerdict=fail 记入 metrics（定论级指控只认 key 级），regressionLevel=fail 分支同受约束；③ top-up 硬预算：3× 目标额（按宣称价，含重试最坏放大），超限即停；④ top-up 触发守门：窗口干净（无失败/污染）+ pre 首比即稳 + USD 口径 + ≥1 有效计价样本，补采中首个不可归因事件（失败/污染重试/usage 缺失）立即停；⑤ qpu 校准量级守卫（1~1e12）+ pre/post resolution 一致性（spendBetween 不一致返回 null——qpu 中途变更产伪 Δ）。
+- **top-up 参数**：TOPUP_PROMPT_TOKENS=48000、TOPUP_MAX_REQUESTS=8、目标 5×resolution（作废门 3× 留裕量）、预检（8 笔全有效仍到不了作废门 → 整段跳过不付费，billing_topup_skipped=1 披露）；补采样本只进 Δ/应缴/ratioSamples，不进回归轨道与输出侧比对；metrics billing_topup_requests/billing_topup_expected_usd。
+- **顺带修复**：billing.test 4 处 per-reads 余额夹具迁移（>=2 → <=2 两段式，适配 pre/post 双稳定化轮询）；e2e balanceSeries [9950,10000] → [9950,9950,10000,10000]。
+- **测试**：全量 725/725（+9：decideRatio user 级禁 fail 三分支、pre 未即时稳定作废、top-up 触发/跳过/首败即停 3 条端到端、/api/user/self 校准可达/不可达/量级异常 3 条、spendBetween resolution 一致性）；tsc --noEmit 0；README 中英文实测倍率行双更新。

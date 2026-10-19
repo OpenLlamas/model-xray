@@ -9,7 +9,8 @@ export interface BaselineFile {
   probesetVersion: string;
   assetsVersion: string;
   identity: { families: string[]; schemaCompliant: boolean | null; refusalRate: number } | null;
-  quality: { accuracy: number; mainCorrect: number; mainTotal: number } | null;
+  /** quality 指标口径版本：'pass1' = 首答正确率（2026-10-19 起）；缺省 = 旧两次机会口径，对比时跳过质量项 */
+  quality: { accuracy: number; mainCorrect: number; mainTotal: number; metricVersion?: string } | null;
   capability: Record<string, string> | null;
   billing: { slopeEn: number | null; slopeZh: number | null } | null;
 }
@@ -94,7 +95,10 @@ function buildQuality(outcome: ProbeOutcome | undefined): BaselineFile['quality'
   const correct = Number(match[1]);
   const total = Number(match[2]);
   if (!Number.isFinite(correct) || !Number.isFinite(total) || total <= 0) return null;
-  return { accuracy: correct / total, mainCorrect: correct, mainTotal: total };
+  // metrics['main'] 自 2026-10-19 起为 pass@1（首答正确率）口径；旧口径基线无 metricVersion，
+  // diffBaseline 会跳过质量对比（两种口径的 accuracy 不可比，混比会假漂移）。
+  const metricVersion = typeof outcome.metrics['metric_version'] === 'string' ? outcome.metrics['metric_version'] : undefined;
+  return { accuracy: correct / total, mainCorrect: correct, mainTotal: total, ...(metricVersion !== undefined ? { metricVersion } : {}) };
 }
 
 function buildCapability(outcome: ProbeOutcome | undefined): BaselineFile['capability'] {
@@ -168,6 +172,10 @@ function validateBaseline(b: Record<string, unknown>): void {
       if (typeof quality[key] !== 'number' || !Number.isFinite(quality[key])) {
         throw fieldError(`baseline.quality.${key}`, '数字', quality[key]);
       }
+    }
+    // metricVersion 可选（旧基线无此字段 = 旧口径）；存在时必须是非空字符串
+    if ('metricVersion' in quality && (typeof quality['metricVersion'] !== 'string' || (quality['metricVersion'] as string) === '')) {
+      throw fieldError('baseline.quality.metricVersion', '非空字符串', quality['metricVersion']);
     }
     // buildQuality 拒收 total<=0（题集恒 15 题，mainTotal 恒正数）——0 属畸形基线，与口径一致拒收
     if (typeof quality['mainTotal'] !== 'number' || !Number.isFinite(quality['mainTotal']) || quality['mainTotal'] <= 0) {
@@ -277,29 +285,37 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
   }
 
   if (oldBaseline.seed === current.seed && oldBaseline.quality && current.quality) {
-    const from = percent(oldBaseline.quality.accuracy);
-    const to = percent(current.quality.accuracy);
-    // 只对「变差」扣分；用 |Δ| 会把「变好」也判成疑似降智（实测 0/12 → 12/12 被封顶 30、总分 45）
-    const drop = oldBaseline.quality.accuracy - current.quality.accuracy;
-    const rise = -drop;
-    if (oldBaseline.quality.mainTotal > 0 && oldBaseline.quality.accuracy === 0) {
-      notes.push(`基线质量为 0/${oldBaseline.quality.mainTotal}（疑似失败跑批或上游故障），质量漂移判据不可靠，已跳过该项对比（本次 ${to}）；建议用一次正常跑批重新生成基线。`);
-    } else if (rise > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
-      notes.push(`质量准确率上升 ${percent(rise)}（${from} → ${to}），不视为降智、不扣分；疑似上游恢复或换成更强模型，可按需人工确认。`);
-    } else if (drop > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
-      items.push({
-        probeId: 'quality',
-        level: 'fail',
-        cap: 30,
-        message: `质量准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_FAIL)} 阈值，疑似降智或换模型`,
-      });
-    } else if (drop > DRIFT_QUALITY_WARN + DRIFT_EPS) {
-      items.push({
-        probeId: 'quality',
-        level: 'warn',
-        cap: 70,
-        message: `质量准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_WARN)} 关注阈值`,
-      });
+    if (oldBaseline.quality.metricVersion !== current.quality.metricVersion) {
+      // 口径不同（旧两次机会 vs 新 pass@1）：两种 accuracy 不可比，混比会把「复采样恢复」
+      // 误读成漂移。跳过质量对比并注明，要求重建基线。
+      notes.push(
+        `基线质量口径与本次不同（基线 ${oldBaseline.quality.metricVersion ?? '旧两次机会口径'} vs 本次 ${current.quality.metricVersion ?? '旧两次机会口径'}），质量漂移对比已跳过；建议用一次正常跑批重建基线。`,
+      );
+    } else {
+      const from = percent(oldBaseline.quality.accuracy);
+      const to = percent(current.quality.accuracy);
+      // 只对「变差」扣分；用 |Δ| 会把「变好」也判成疑似降智（实测 0/12 → 12/12 被封顶 30、总分 45）
+      const drop = oldBaseline.quality.accuracy - current.quality.accuracy;
+      const rise = -drop;
+      if (oldBaseline.quality.mainTotal > 0 && oldBaseline.quality.accuracy === 0) {
+        notes.push(`基线质量为 0/${oldBaseline.quality.mainTotal}（疑似失败跑批或上游故障），质量漂移判据不可靠，已跳过该项对比（本次 ${to}）；建议用一次正常跑批重新生成基线。`);
+      } else if (rise > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
+        notes.push(`质量首答准确率上升 ${percent(rise)}（${from} → ${to}），不视为降智、不扣分；疑似上游恢复或换成更强模型，可按需人工确认。`);
+      } else if (drop > DRIFT_QUALITY_FAIL + DRIFT_EPS) {
+        items.push({
+          probeId: 'quality',
+          level: 'fail',
+          cap: 30,
+          message: `质量首答准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_FAIL)} 阈值，疑似降智或换模型`,
+        });
+      } else if (drop > DRIFT_QUALITY_WARN + DRIFT_EPS) {
+        items.push({
+          probeId: 'quality',
+          level: 'warn',
+          cap: 70,
+          message: `质量首答准确率下降 ${percent(drop)}（${from} → ${to}），超过 ${percent(DRIFT_QUALITY_WARN)} 关注阈值`,
+        });
+      }
     }
   }
 

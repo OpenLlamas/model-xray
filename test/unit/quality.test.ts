@@ -213,7 +213,7 @@ test('quality F1: failed control response with partial answer text does not pass
   assert.equal(requests.filter((r) => r.temperature === 0.7).length, 0);
 });
 
-test('quality F1: clean wrong first answer + correct resample (temperature 0.7) → counted correct by two-chance rule', async () => {
+test('quality F1: clean wrong first answer + correct resample (temperature 0.7) → pass@1 main, recovered disclosed', async () => {
   const target = generateQuestions(createRng(SEED)).find(isMain) as Question;
   const { client, requests } = scriptedQuality((q, req) => {
     if (q.id === target.id && req.temperature === 0.7) return rightAnswer(q);
@@ -222,11 +222,14 @@ test('quality F1: clean wrong first answer + correct resample (temperature 0.7) 
   });
   const outcome = await probeQuality(qualityCtx(client));
   assert.equal(outcome.status, 'ok');
+  // pass@1 主口径：11/12 首答正确 = 0.9167 ≥ 0.9 → pass 92；复采样恢复不改判 pass（由首答自达线）
   assert.equal(outcome.level, 'pass');
-  assert.equal(outcome.score, 100);
-  assert.equal(outcome.metrics['main'], '12/12', '复采样答对必须计入主题正确数');
+  assert.equal(outcome.score, 92);
+  assert.equal(outcome.metrics['main'], '11/12', 'metrics.main = pass@1 首答口径');
+  assert.equal(outcome.metrics['main_recovered'], '12/12', 'metrics.main_recovered = 两次机会口径');
   assert.equal(outcome.metrics['retried'], 1);
   assert.equal(outcome.metrics['recovered'], 1);
+  assert.equal(outcome.metrics['metric_version'], 'pass1');
   const info = outcome.findings.find((f) => f.level === 'info' && /首答错误、复采样/.test(f.message));
   assert.ok(info, JSON.stringify(outcome.findings));
   assert.equal(info?.evidenceIds.length, 2, '证据必须含首答与复采样两条');
@@ -248,7 +251,8 @@ test('quality F1: once a wrong first answer retried at 512 → resample reuses t
   const resample = requests.find((r) => r.temperature === 0.7) as ChatRequest;
   assert.equal(resample.max_tokens, 512, '复采样必须沿用首答最终生效预算');
   assert.equal(outcome.metrics['recovered'], 1);
-  assert.equal(outcome.metrics['main'], '12/12');
+  assert.equal(outcome.metrics['main'], '11/12');
+  assert.equal(outcome.metrics['main_recovered'], '12/12');
 });
 
 test('quality F1: starved resample whose truncated body already contains the answer still counts correct', async () => {
@@ -259,7 +263,8 @@ test('quality F1: starved resample whose truncated body already contains the ans
     return wrongAnswer(q);
   });
   const outcome = await probeQuality(qualityCtx(client));
-  assert.equal(outcome.metrics['main'], '12/12');
+  assert.equal(outcome.metrics['main'], '11/12');
+  assert.equal(outcome.metrics['main_recovered'], '12/12');
   assert.equal(outcome.metrics['recovered'], 1);
   assert.ok(outcome.findings.some((f) => f.level === 'info' && /复采样/.test(f.message)));
 });
@@ -313,52 +318,50 @@ test('quality F1: failed resample with partial answer text still cannot count as
   );
 });
 
-test('quality F1 anti-whitewash: all 12 mains recovered → level warn, score capped 80, disclose recovery rate', async () => {
+test('quality F1 pass@1: all 12 mains first-wrong + resample recovered → warn 80（复采洗白封顶），recovery-rate info 保留', async () => {
   const { client } = scriptedQuality((q, req) => {
     if (req.temperature === 0.7) return rightAnswer(q);
     return q.control ? rightAnswer(q) : wrongAnswer(q);
   });
   const outcome = await probeQuality(qualityCtx(client));
   assert.equal(outcome.status, 'ok');
-  assert.equal(outcome.level, 'warn', '过半主题依赖复采样 → 不得判 pass');
+  // pass@1：首答 0/12 < 0.6；两次机会 12/12 ≥ 0.6 → 随机失误不定罪降 warn，但封顶 80
+  assert.equal(outcome.level, 'warn', '首答全错不得判 pass');
   assert.equal(outcome.score, 80);
-  assert.match(outcome.headline, /过半主题需复采样才对/);
-  assert.equal(outcome.metrics['main'], '12/12');
+  assert.match(outcome.headline, /首答仅 0\/12，复采样恢复至 12\/12/);
+  assert.equal(outcome.metrics['main'], '0/12');
+  assert.equal(outcome.metrics['main_recovered'], '12/12');
   assert.equal(outcome.metrics['retried'], 12);
   assert.equal(outcome.metrics['recovered'], 12);
-  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /过半主题依赖复采样才答对/.test(f.message)));
   assert.ok(outcome.findings.some((f) => f.level === 'info' && /恢复率异常高/.test(f.message)));
 });
 
-test('quality F1 anti-whitewash boundary: 5/12 recovered → pass; exactly 6/12 → warn capped 80', async () => {
+test('quality F1 pass@1 boundary: 5/12 recovered（首答 7/12=0.583<0.6）→ rescued warn 80；首答自达 0.9 线时 recovered 不阻碍 pass', async () => {
   const questions = generateQuestions(createRng(SEED));
-  const mains = questions.filter(isMain);
-  const sixIds = new Set(mains.slice(0, 6).map((q) => q.id));
+  const mainsList = questions.filter(isMain);
+  const fiveIds = new Set(mainsList.slice(0, 5).map((q) => q.id));
 
-  // 5 个主题首答错/复采样对：5/12 < 0.5 → 不触发防洗白，pass 100（firstCorrect=7 > 6 也无恢复率 info）
-  const fiveIds = new Set(mains.slice(0, 5).map((q) => q.id));
+  // 首答 7/12 = 0.583 < 0.6，复采样 5/5 全恢复（两次机会 12/12 ≥ 0.6）→ rescued warn 封顶 80
   const five = scriptedQuality((q, req) => {
     if (req.temperature === 0.7 || !fiveIds.has(q.id)) return rightAnswer(q);
     return wrongAnswer(q);
   });
   const below = await probeQuality(qualityCtx(five.client));
-  assert.equal(below.level, 'pass', below.headline);
-  assert.equal(below.score, 100);
-  assert.ok(
-    !below.findings.some((f) => /过半主题|恢复率异常高/.test(f.message)),
-    '5/12 未过半数、firstCorrect=7 → 不触发防洗白告警',
-  );
+  assert.equal(below.level, 'warn', below.headline);
+  assert.equal(below.score, 80);
+  assert.match(below.headline, /首答仅 7\/12，复采样恢复至 12\/12/);
+  assert.ok(!below.findings.some((f) => /恢复率异常高/.test(f.message)), 'firstCorrect=7 > 6 → 不触发恢复率 info');
 
-  // 恰好 6/12 = 0.5 → 触发 warn 封顶 80；firstCorrect=6 同时触发恢复率 info
-  const six = scriptedQuality((q, req) => {
-    if (req.temperature === 0.7 || !sixIds.has(q.id)) return rightAnswer(q);
+  // 首答 11/12 = 0.9167 ≥ 0.9 且 1 题复采样恢复 → pass（pass 只看首答，恢复仅披露）
+  const oneId = new Set(mainsList.slice(0, 1).map((q) => q.id));
+  const one = scriptedQuality((q, req) => {
+    if (req.temperature === 0.7 || !oneId.has(q.id)) return rightAnswer(q);
     return wrongAnswer(q);
   });
-  const boundary = await probeQuality(qualityCtx(six.client));
-  assert.equal(boundary.level, 'warn');
-  assert.equal(boundary.score, 80);
-  assert.match(boundary.headline, /过半主题需复采样才对/);
-  assert.ok(boundary.findings.some((f) => f.level === 'info' && /恢复率异常高/.test(f.message)));
+  const above = await probeQuality(qualityCtx(one.client));
+  assert.equal(above.level, 'pass', above.headline);
+  assert.equal(above.score, 92);
+  assert.match(above.headline, /复采样恢复 1 题/);
 });
 
 test('quality F1: control question wrong → insufficient, no resample triggered for controls', async () => {
@@ -395,7 +398,7 @@ test('quality scoring: 8/12 correct → warn 67 with wrong-topic list', async ()
   const outcome = await probeQuality(qualityCtx(client));
   assert.equal(outcome.level, 'warn');
   assert.equal(outcome.score, 67);
-  assert.match(outcome.headline, /质量可疑：主题 8\/12，错误集中在/);
+  assert.match(outcome.headline, /质量可疑：首答 8\/12，错误集中在/);
 });
 
 test('quality scoring: accuracy carries a 95% Wilson CI disclosure (metrics + info finding, thresholds unchanged)', async () => {

@@ -58,6 +58,12 @@ export interface MockBehavior {
   starveExempt: RegExp | null;
   /** usage-scale：prompt/completion 等比缩放倍率（1.3 = 全量虚增 30%，线性回归不可见） */
   usageScale: number;
+  /** 独立于 mode 的组合旋钮（badrelay 标定台）：无论 mode 为何都生效的截断阈值（tokens 粗估） */
+  truncateAtTokens: number | null;
+  /** 独立于 mode 的组合旋钮：identity 自述伪装成该型号（跨族 → fail；同族异版本 → warn） */
+  retellAs: string | null;
+  /** 独立于 mode 的组合旋钮：usage 等比缩放倍率（等价于 usage-scale 模式） */
+  scaleUsage: number | null;
   /** persona-inject：identity 自述题的计数器（第 2、5 个样本注入品牌人格） */
   personaSeq: number;
   /** retry-fix：允许首答错（+1 扰动）的题面数上限 */
@@ -87,6 +93,12 @@ export interface MockOptions {
   starveExempt?: RegExp;
   /** usage-scale：prompt/completion 等比缩放倍率，默认 1（忠实复刻 issue 场景：×1.3 线性回归不可见） */
   usageScale?: number;
+  /** 独立于 mode 的组合旋钮（badrelay 标定台）：截断阈值（tokens 粗估），与 mode 正交 */
+  truncateAtTokens?: number;
+  /** 独立于 mode 的组合旋钮（badrelay 标定台）：identity 自述伪装成该型号，与 mode 正交 */
+  retellAs?: string;
+  /** 独立于 mode 的组合旋钮（badrelay 标定台）：usage 等比缩放倍率，与 mode 正交 */
+  scaleUsage?: number;
   /** retry-fix：允许首答错（+1 扰动）的题面数上限，默认 3（首答错、复采样对，两次机会口径下应 100 分） */
   retryFixPerturb?: number;
 }
@@ -136,6 +148,9 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     starveTruncated: options.starveTruncated ?? null,
     starveExempt: options.starveExempt ?? null,
     usageScale: options.usageScale ?? 1,
+    truncateAtTokens: options.truncateAtTokens ?? null,
+    retellAs: options.retellAs ?? null,
+    scaleUsage: options.scaleUsage ?? null,
     personaSeq: 0,
     retryFixPerturb: options.retryFixPerturb ?? 3,
     perturbed: new Set<string>(),
@@ -304,18 +319,20 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
     return;
   }
 
-  if (behavior.mode === 'truncate' || behavior.mode === 'oversize-reject') {
-    // 截断/拒绝的判定阈值仍用 len/3.2 粗估（保持既有触发行为），
-    // usage 上报则改用与工具同源的 usageBase。
+  // 截断/拒绝：mode 驱动（truncate/oversize-reject）或组合旋钮 truncateAtTokens 驱动（badrelay 标定台）。
+  // 判定阈值仍用 len/3.2 粗估（保持既有触发行为），usage 上报则改用与工具同源的 usageBase。
+  const truncLimit =
+    behavior.truncateAtTokens ?? (behavior.mode === 'truncate' || behavior.mode === 'oversize-reject' ? behavior.truncateTokens : null);
+  if (truncLimit !== null) {
     const estimatedTokens = Math.ceil(allText.length / 3.2);
-    if (estimatedTokens > behavior.truncateTokens) {
+    if (estimatedTokens > truncLimit) {
       if (behavior.mode === 'oversize-reject') {
         sendJson(res, 400, {
           error: { message: 'maximum context length exceeded', type: 'invalid_request_error', code: 'context_length_exceeded' },
         });
         return;
       }
-      const keepChars = Math.floor(behavior.truncateTokens * 3.2);
+      const keepChars = Math.floor(truncLimit * 3.2);
       const clipped = allText.slice(-keepChars);
       const clippedUser = userText.length > keepChars ? userText.slice(-keepChars) : userText;
       const reply = applyRetryFix(behavior, clippedUser, solve(clipped, behavior, clippedUser, imageUrl, modelName, state.served));
@@ -374,9 +391,9 @@ function solve(
       .filter((l) => l.length > 0)
       .at(-1) ?? '';
 
-  if (behavior.mode === 'relabel') {
+  if (behavior.mode === 'relabel' || behavior.retellAs !== null) {
     if (/JSON/i.test(question)) return '{"model_family": "GLM", "language_count": 30}';
-    return `我是 ${behavior.identityName}，由智谱 AI 开发。`;
+    return `我是 ${behavior.retellAs ?? behavior.identityName}，由智谱 AI 开发。`;
   }
 
   if (imageUrl !== null) {
@@ -394,7 +411,11 @@ function solve(
       .split('\n')
       .map((l) => l.trim())
       .filter((l) => l.length > 0);
-    return lines.at(-2) ?? '';
+    const line = lines.at(-2) ?? '';
+    // 忠实模拟 max_tokens 截断：billing 复读请求 max_tokens=16，真实端点的可见正文不超过 ~16 token；
+    // 不截断会令「completion(16) vs 正文(整段 filler)」产生假「少报」信号（输出侧灌水比对的夹具噪声）。
+    // 短回显（identity/echo nonce 等）保持原样。
+    return line.length > 200 ? line.slice(0, 64) : line;
   }
 
   if (/口令|passphrase|校验|archive/i.test(question)) {
@@ -716,9 +737,10 @@ function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: st
   }
   // usage-scale：全量等比虚增（prompt 与 completion 同倍率，total 重算）——线性回归/常量检测不可见，
   // 只有与同名模型历史报告的 prompt_tokens 对比才能识别（--token-reference 的存在理由）。
-  if (behavior.mode === 'usage-scale') {
-    prompt = Math.round(prompt * behavior.usageScale);
-    completion = Math.round(completion * behavior.usageScale);
+  const usageScaleFactor = behavior.mode === 'usage-scale' ? behavior.usageScale : (behavior.scaleUsage ?? null);
+  if (usageScaleFactor !== null) {
+    prompt = Math.round(prompt * usageScaleFactor);
+    completion = Math.round(completion * usageScaleFactor);
     total = prompt + completion;
   }
   // 模拟上游遵守 max_tokens：completion 不得超过请求上限。

@@ -777,3 +777,105 @@ test('client: 运行级 retryBudget 耗尽后不再重试（防端点过载时�
     server.close();
   }
 });
+
+// ---------- temperature 参数 400 去参回退（2026-10-19 查漏补缺：chroe §4 推理模型/网关兼容） ----------
+
+test('client: 400 拒绝 temperature → 去参重发成功（attempts=2、temperatureDropped 披露、不污染计费口径）', async () => {
+  let calls = 0;
+  let sawTemperature: boolean | null = null;
+  const server = createServer((req, res) => {
+    calls += 1;
+    let body = '';
+    req.on('data', (chunk) => {
+      body += String(chunk);
+    });
+    req.on('end', () => {
+      const parsed = JSON.parse(body) as Record<string, unknown>;
+      sawTemperature = 'temperature' in parsed;
+      if ('temperature' in parsed) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: 'temperature is not supported by this model', type: 'invalid_request_error' } }));
+        return;
+      }
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+          usage: { prompt_tokens: 5, completion_tokens: 1, total_tokens: 6 },
+        }),
+      );
+    });
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], temperature: 0.7, max_tokens: 32 });
+    assert.equal(result.ok, true, result.error ?? '');
+    assert.equal(result.text, 'ok');
+    assert.equal(result.attempts, 2, '去参重发计 1 次额外尝试');
+    assert.equal(result.temperatureDropped, true, '证据须披露去参回退');
+    assert.equal(result.contaminatingRetry, false, '400 参数校验失败不进入推理，不构成计费污染');
+    assert.equal(sawTemperature, false, '第二次请求不得再携带 temperature');
+    assert.equal(calls, 2);
+  } finally {
+    server.close();
+  }
+});
+
+test('client: 400 错误体不含 temperature → 不去参重发（避免掩盖真正的 400 拒绝）', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'context length exceeded', type: 'invalid_request_error' } }));
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], temperature: 0, max_tokens: 32 });
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 1, '与 temperature 无关的 400 不重发');
+    assert.notEqual(result.temperatureDropped, true);
+    assert.equal(calls, 1);
+  } finally {
+    server.close();
+  }
+});
+
+test('client: 去参重发后仍 400 → 如实失败（只回退一次，不无限去参重试）', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'temperature is not supported by this model' } }));
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], temperature: 0, max_tokens: 32 });
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 2, '去参重发了一次，仍失败则如实返回');
+    assert.equal(calls, 2, '只回退一次，不继续重试');
+  } finally {
+    server.close();
+  }
+});
+
+test('client: 无 temperature 的请求遇 400 不触发去参路径', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'temperature is not supported' } }));
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], max_tokens: 32 });
+    assert.equal(result.ok, false);
+    assert.equal(result.attempts, 1);
+    assert.equal(calls, 1, '本来就没带 temperature，无从去参');
+  } finally {
+    server.close();
+  }
+});

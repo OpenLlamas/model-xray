@@ -1015,3 +1015,197 @@ test('identity: 所有自述请求 503 → insufficient 且标题带端点/网�
   assert.match(outcome.headline, /端点\/网关拒绝（\d+\/\d+ 笔）：HTTP 503: system cpu overloaded/);
   assert.ok(!/自述请求全部失败/.test(outcome.headline), `headline=${outcome.headline}`);
 });
+
+// ---------- 自述具体型号后缀比对（审计钉 ⑤：同族异版本换壳的自述证据） ----------
+
+/** 目标 glm-5.3、自述全部为 glm-5.3-flash 的 5 条样本（措辞各异，避免逐字一致 WARN）。 */
+function glmFlashSelfResults(): ChatResult[] {
+  return [
+    okResult('我是 glm-5.3-flash，由智谱开发。'),
+    okResult('我的完整名称是 glm-5.3-flash。'),
+    okResult('I am GLM-5.3-Flash by Zhipu.'),
+    okResult('智谱 AI 的 glm-5.3-flash 是我。'),
+    okResult('Model: glm-5.3-flash.'),
+  ];
+}
+
+test('identity: 请求 glm-5.3、自述一致 glm-5.3-flash → 同族异版本 warn 80', async () => {
+  // 审计钉 ⑤ 核心场景：族（glm）与 X.Y 版本（5.3）全部一致，既有族指纹/版本判定全盲，
+  // 只有自述带出的变体段暴露「实际服务的是更轻变体」。
+  const { client } = stubClient([...glmFlashSelfResults(), schemaOk()]);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 80);
+  assert.match(outcome.headline, /同族异版本/);
+  const warn = outcome.findings.find((f) => /自述具体型号/.test(f.message));
+  assert.ok(warn && warn.level === 'warn', JSON.stringify(outcome.findings));
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 5);
+  assert.match(String(outcome.metrics['claimed_variants']), /glm-5\.3-flash/i);
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), '自述单独不定罪');
+});
+
+test('identity: 精确版本题单点自述冲突变体即触发（随机题只声明族）→ warn 80', async () => {
+  const results = [
+    okResult('我是 GLM，由智谱开发。'),
+    okResult('智谱 AI 的 GLM 是我。'),
+    okResult('I am a GLM model from Zhipu.'),
+    okResult('我叫 GLM。'),
+    okResult('完整名称是 glm-5.3-flash。'), // 精确版本题（固定最后一题）
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 80);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 1);
+  assert.match(outcome.headline, /同族异版本/);
+});
+
+test('identity: 随机题多源自述同一冲突变体（无精确题冲突）→ warn 80', async () => {
+  const results = [
+    okResult('我是 glm-5.3-flash，智谱出品。'),
+    okResult('智谱 AI 的 glm-5.3-flash 是我。'),
+    okResult('I am GLM-5.3 by Zhipu.'), // 族+版本一致，无变体段
+    okResult('我叫 GLM。'),
+    okResult('GLM-5.3'), // 精确版本题答族+版本，无变体
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 80);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 2);
+  assert.ok(!('claimed_narrower_claims' in outcome.metrics), '目标无变体时族+版本声明不算窄声明');
+});
+
+test('identity: 冲突变体零散各 1 次、无多源一致性 → 仅 info 披露不扣分', async () => {
+  const results = [
+    okResult('我是 glm-5.3，由智谱开发。'),
+    okResult('智谱 AI 的 glm-5.3 是我。'),
+    okResult('I am glm-5.3 by Zhipu.'),
+    okResult('glm-5.3-flash 是我哥哥。'), // 单次提及他变体，不定罪
+    okResult('GLM-5.3'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 1);
+  const info = outcome.findings.find((f) => /无多源一致性/.test(f.message));
+  assert.ok(info && info.level === 'info', JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => /同族异版本/.test(f.message)));
+});
+
+test('identity: 自述带 benign 滚动别名尾缀（glm-5.3-preview/latest）不算冲突', async () => {
+  // 与回显判定 BENIGN_ALIAS_SUFFIXES 同口径：preview/latest 是官方滚动别名而非降级变体。
+  const results = [
+    okResult('我是 glm-5.3-preview，由智谱开发。'),
+    okResult('智谱 AI 的 glm-5.3-latest 是我。'),
+    okResult('I am GLM-5.3-Preview by Zhipu.'),
+    okResult('我叫 GLM-5.3。'),
+    okResult('GLM-5.3-Preview'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 0);
+});
+
+test('identity: 否定语境的变体提及不构成自报（「我不是 glm-5.3-flash」→ 零冲突）', async () => {
+  const results = [
+    okResult('我不是 glm-5.3-flash，我是 glm-5.3。'),
+    okResult('我不叫 glm-5.3-flash，我叫 glm-5.3。'),
+    okResult('I am glm-5.3, not glm-5.3-flash.'),
+    okResult('我是 glm-5.3，由智谱开发。'),
+    okResult('GLM-5.3'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 0, JSON.stringify(outcome.findings));
+});
+
+test('identity: 不确定语境的变体提及不构成自报（「可能是 glm-5.3-flash」→ 零冲突）', async () => {
+  const results = [
+    okResult('可能是 glm-5.3-flash 吧，我不太确定。'),
+    okResult('或许是 glm-5.3-flash，也可能是别的。'),
+    okResult('也许我是 glm-5.3-flash，也许是 glm-5.3。'),
+    okResult('我是 glm-5.3，由智谱开发。'),
+    okResult('GLM-5.3'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 0, JSON.stringify(outcome.findings));
+});
+
+test('identity: 目标带变体（glm-5.3-flash）、自述一致另一变体（glm-5.3-air）→ warn 80', async () => {
+  const results = [
+    okResult('我是 glm-5.3-air，由智谱开发。'),
+    okResult('智谱 AI 的 glm-5.3-air 是我。'),
+    okResult('I am GLM-5.3-Air by Zhipu.'),
+    okResult('我叫 GLM。'),
+    okResult('glm-5.3-air'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 80);
+  assert.match(outcome.headline, /同族异版本/);
+  assert.equal(outcome.metrics['claimed_variant_conflicts'], 4);
+});
+
+test('identity: 目标带变体、自述只认领族+版本（更窄声明）→ 仅 info + metric，不扣分', async () => {
+  const results = [
+    okResult('我是 glm-5.3，由智谱开发。'),
+    okResult('智谱 AI 的 glm-5.3 是我。'),
+    okResult('I am GLM-5.3 by Zhipu.'),
+    okResult('我叫 GLM-5.3。'),
+    okResult('GLM-5.3'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['claimed_narrower_claims'], 5);
+  const info = outcome.findings.find((f) => /只认领到「族\+版本」/.test(f.message));
+  assert.ok(info && info.level === 'info', JSON.stringify(outcome.findings));
+});
+
+test('identity: 目标无 X.Y 版本锚点（gpt-4o）时变体比对整体跳过，不产出该维度 metric', async () => {
+  // gpt-4o 无小数点版本段：无锚点不做字符串猜测（自述变体线索由回显字段兜底）。
+  const results = [
+    okResult('I am gpt-4o-mini, made by OpenAI.'),
+    okResult('我是 gpt-4o-mini，由 OpenAI 开发。'),
+    okResult("I'm the gpt-4o-mini model."),
+    okResult('我来自 OpenAI 的 gpt-4o-mini。'),
+    okResult('gpt-4o-mini'), // 精确版本题
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client);
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.ok(!('claimed_variant_conflicts' in outcome.metrics));
+  assert.ok(!outcome.findings.some((f) => /同族异版本/.test(f.message)), JSON.stringify(outcome.findings));
+});

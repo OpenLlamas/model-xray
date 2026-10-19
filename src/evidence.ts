@@ -70,6 +70,7 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       usage: result.usage,
       usageRejected: result.usageRejected,
       attempts: result.attempts,
+      temperatureDropped: result.temperatureDropped === true,
       toolCallCount: result.toolCalls.length,
       finishReason: result.finishReason,
       error: result.error,

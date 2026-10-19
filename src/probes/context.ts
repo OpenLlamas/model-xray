@@ -1,9 +1,16 @@
-import type { ChatMessage, ChatResult, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
+import type { ChatMessage, ChatResult, Finding, ProbeCtx, ProbeOutcome, Rng, RunConfig } from '../types.js';
 import { buildEchoQuestion, buildFiller, buildNeedle, buildNeedleQuestion } from '../assets.js';
 import { isStarved, isBlankAnswer, chatWithStarveRetry, PROBE_BUDGETS } from './starve.js';
 import { estimateMessageTokens } from '../tokens.js';
 
-const DEPTHS = [0.25, 0.5, 0.75, 0.9];
+/**
+ * 深度档执行顺序：降序（90% → 25%）。最难的 90% 档先发——它是「标称窗口可读」的强证据，
+ * 全中且 usage 校准可信时即可早停跳过低档（低档输入更短，不构成额外窗口证据），节省约 75% 发送量。
+ * 统计/披露口径不受顺序影响（computeSignals 按 depth 键取数）。
+ */
+const DEPTHS = [0.9, 0.75, 0.5, 0.25];
+/** 最高深度档（早停判定锚点）：DEPTHS 首元素的无索引访问常量。 */
+const DEPTH_TOP = DEPTHS[0] as number;
 
 /**
  * 400 响应体中指向「非输入过大」的归因关键词：欠费/额度/限流/鉴权/模型不存在/内容策略。
@@ -81,6 +88,8 @@ interface DepthConfirmation {
   starved: number;
   errored: number;
   empty: number;
+  /** 预算停发：本轮确认未发满 confirmSamples 即被 --context-budget-usd 掐断 */
+  budgetStopped: boolean;
   /** 该档采信的 usage.prompt_tokens 最大值（全部不可信时为 null） */
   maxActualPromptTokens: number | null;
   evidenceIds: string[];
@@ -90,6 +99,40 @@ interface DepthConfirmation {
 /** 确认性复采每档追加样本数：标准 2、--deep 3；仅每档 ≥3 样本的标准档才自动复采（低成本档不复采）。 */
 const DEFAULT_CONFIRM_SAMPLES = 2;
 const DEEP_CONFIRM_SAMPLES = 3;
+
+/**
+ * context 软预算控制器（--context-budget-usd）：按「本地估算输入 tokens × 输入价 + 满额输出预算 × 输出价」
+ * 逐请求预扣估算费用，超出上限即拒绝放行（soft cap：真实计费含重试/流式回退可能略超，仅估算）。
+ * 须与 --price-input/--price-output 成对提供（CLI 校验）；库调用未配价时控制器直通。
+ */
+export interface SpendTracker {
+  /** 估算通过返回 true 并预扣；预计超上限或已停发返回 false（此后永远 false）。 */
+  allow(promptTokensEstimate: number): boolean;
+  exhausted(): boolean;
+  spentEstimate(): number;
+}
+
+export function createSpendTracker(cfg: RunConfig): SpendTracker {
+  const cap = cfg.contextBudgetUsd;
+  const priceIn = cfg.priceInput;
+  const priceOut = cfg.priceOutput;
+  let spent = 0;
+  let stopped = false;
+  return {
+    allow(promptTokensEstimate: number): boolean {
+      if (cap === undefined || priceIn == null || priceOut == null) return true;
+      const est = (promptTokensEstimate * priceIn + PROBE_BUDGETS.context * priceOut) / 1_000_000;
+      if (stopped || !Number.isFinite(est) || spent + est > cap) {
+        stopped = true;
+        return false;
+      }
+      spent += est;
+      return true;
+    },
+    exhausted: () => stopped,
+    spentEstimate: () => spent,
+  };
+}
 
 interface ContextSignals {
   /** 未加复核门槛的退化信号（只用于触发确认性复采，不可直接定罪） */
@@ -224,6 +267,7 @@ async function confirmDepth(
   claimed: number,
   depth: number,
   confirmSamples: number,
+  spend: SpendTracker,
 ): Promise<DepthConfirmation> {
   const targetTokens = Math.floor(claimed * depth);
   const evidenceIds: string[] = [];
@@ -233,6 +277,7 @@ async function confirmDepth(
   let starved = 0;
   let errored = 0;
   let empty = 0;
+  let budgetStopped = false;
   let maxActualPromptTokens: number | null = null;
   for (let i = 0; i < confirmSamples; i += 1) {
     const { recordId, passphrase } = freshNeedleIds(ctx.rng);
@@ -244,6 +289,10 @@ async function confirmDepth(
       { role: 'system', content: '你将收到一份长文档和一个问题。请只依据文档内容回答，不要编造。' },
       { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
     ];
+    if (!spend.allow(estimateMessageTokens(messages))) {
+      budgetStopped = true;
+      break;
+    }
     const call = await chatWithStarveRetry(ctx, {
       probe: 'context',
       label: `confirm depth=${depth} nonce=${passphrase}`,
@@ -270,7 +319,7 @@ async function confirmDepth(
     if (actualPromptTokens !== null) maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, actualPromptTokens);
     if (containsNonce(call.result.text, passphrase)) hits += 1;
   }
-  return { depth, hits, attempted, starved, errored, empty, maxActualPromptTokens, evidenceIds, emptyEvidenceIds };
+  return { depth, hits, attempted, starved, errored, empty, budgetStopped, maxActualPromptTokens, evidenceIds, emptyEvidenceIds };
 }
 
 export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
@@ -289,6 +338,9 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = { claimed_tokens: claimed };
+  // 软预算控制器（--context-budget-usd，CLI 已保证与价格成对提供；未配价时直通）
+  const spend = createSpendTracker(ctx.cfg);
+  let budgetStopped = false;
   // 低成本档（默认）：每档 1 个样本，只做筛查；需要统计定论时用 --context-samples 3 或 --deep。
   // 历史默认 3 样本 + 自动复采 3 样本 = 每档 6 发，1M 标称单轮发送数千万 tokens，成本过高。
   const samplesPerDepth = ctx.cfg.contextSamples ?? (ctx.cfg.deep ? 5 : 1);
@@ -320,11 +372,21 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const records: DepthRecord[] = [];
   /** 未命中样本的证据 id（聚合 fail finding 必须能回溯原始请求，兑现「每条 finding 链接证据」承诺） */
   const missEvidenceIds: string[] = [];
+  /** 早停跳过的低深度档：90% 档 ≥2 发全中且 usage 校准可信时，低档不再发送（低档输入更短，不构成额外窗口证据） */
+  let skippedDepths: number[] = [];
+  let earlyStopped = false;
 
-  for (const depth of DEPTHS) {
+  needleLoop: for (const depth of DEPTHS) {
     const targetTokens = Math.floor(claimed * depth);
     let successAtDepth = 0;
     let attempted = 0;
+    // 早停前提核对的该档干净度计数：任一异常（400/空/失败/推理占满/重试恢复）都取消早停资格
+    let tierStarved = 0;
+    let tierErrored = 0;
+    let tierSizeRejects = 0;
+    let tierEmpty = 0;
+    let tierBlankRetried = 0;
+    let tierStreamFallback = 0;
     for (let i = 0; i < samplesPerDepth; i += 1) {
       const { recordId, passphrase } = freshNeedleIds(ctx.rng);
       const filler = buildFiller(ctx.rng, targetTokens);
@@ -338,6 +400,10 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         { role: 'system', content: '你将收到一份长文档和一个问题。请只依据文档内容回答，不要编造。' },
         { role: 'user', content: `${document}\n\n${question}` },
       ];
+      if (!spend.allow(estimateMessageTokens(messages))) {
+        budgetStopped = true;
+        break needleLoop;
+      }
       const call = await chatWithStarveRetry(ctx, {
         probe: 'context',
         label: `needle depth=${depth} nonce=${passphrase}`,
@@ -347,9 +413,13 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       });
       const result = call.result;
       const evidenceIds = call.evidenceIds;
-      if (call.blankRetried) blankRetriedCount += 1;
+      if (call.blankRetried) {
+        blankRetriedCount += 1;
+        tierBlankRetried += 1;
+      }
       if (call.streamFallback) {
         streamFallbackCount += 1;
+        tierStreamFallback += 1;
         streamFallbackEvidenceIds.push(...evidenceIds);
       }
       if (call.retried) {
@@ -362,6 +432,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       if (isStarved(result)) {
         // thinking 模型推理占满预算：无正文可判命中，该样本不计入截断判定（不得据此指控静默截断）。
         starvedCount += 1;
+        tierStarved += 1;
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
           level: 'info',
@@ -376,6 +447,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         // 理由：靠错误文案枚举归因不可靠（网关/参数/WAF 也回 400 且文案千奇百怪），
         // 而「长输入全 400 + 短输入正常」才是与窗口相关的直接证据。
         records.push({ depth, hits: 0, attempted: 0, sizeRejects: 1, requested: 1 });
+        tierSizeRejects += 1;
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
           level: 'info',
@@ -391,6 +463,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         // 「network：fetch failed」被计入分母 → depth_hits 记 2/3、判定「标称窗口不实（15 分 fail）」，
         // 而排除该样本后 25% 深度为 2/2 全命中、其余深度 3/3 全命中、结尾回显通过 = 无任何截断证据。
         erroredSamples += 1;
+        tierErrored += 1;
         records.push({ depth, hits: 0, attempted: 0, sizeRejects: 0, requested: 1 });
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
@@ -404,6 +477,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         // HTTP 200 空文本：没有答案可判，既不能算命中也不能算未命中。
         // 历史缺陷（2026-10-18 真机）：空响应被计为 needle 未命中，12 发全空 → 误判「窗口不实」。
         emptySamples += 1;
+        tierEmpty += 1;
         emptyEvidenceIds.push(...evidenceIds);
         coverageGapEvidenceIds.push(...evidenceIds);
         records.push({ depth, hits: successAtDepth, attempted, sizeRejects: 0, requested: 1 });
@@ -437,6 +511,44 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     validNeedleSamples += attempted;
     depthResults[String(depth)] = attempted > 0 ? `${successAtDepth}/${attempted}` : 'N/A';
     depthMiss[String(depth)] = attempted > 0 && successAtDepth < attempted;
+
+    // —— 早停（90% 档先行，2026-10-19 裁决）：最难的 90% 档 ≥2 发有效 needle 全中、usage 校准可信、
+    // 该档干净（无 400/空/失败/推理占满/重试恢复）→ 低档不再发送。低档输入更短，不构成额外的
+    // 「窗口可读」证据；早停节省约 75% 发送量。--deep 与低成本单样本档（不足 2 发）不早停。
+    if (
+      depth === DEPTH_TOP &&
+      !ctx.cfg.deep &&
+      samplesPerDepth >= 2 &&
+      attempted >= 2 &&
+      successAtDepth === attempted &&
+      tierStarved === 0 &&
+      tierErrored === 0 &&
+      tierSizeRejects === 0 &&
+      tierEmpty === 0 &&
+      tierBlankRetried === 0 &&
+      tierStreamFallback === 0 &&
+      depthActual[String(depth)] !== undefined
+    ) {
+      earlyStopped = true;
+      skippedDepths = DEPTHS.filter((d) => d !== depth);
+      for (const skipped of skippedDepths) depthResults[String(skipped)] = 'skipped';
+      break;
+    }
+  }
+
+  if (earlyStopped) {
+    metrics['early_stopped'] = 1;
+    metrics['early_stopped_depths'] = skippedDepths.map((d) => `${(d * 100).toFixed(0)}%`).join(',');
+    findings.push({
+      level: 'info',
+      message: `早停：${(DEPTH_TOP * 100).toFixed(0)}% 档 ${samplesPerDepth} 发 needle 全中且 usage 校准可信，低深度档（${skippedDepths.map((d) => `${(d * 100).toFixed(0)}%`).join('、')}）未发送——低档输入更短，不构成额外的窗口可读证据。`,
+      evidenceIds: [],
+    });
+  }
+  if (budgetStopped) {
+    metrics['budget_stopped'] = 1;
+    metrics['budget_usd'] = ctx.cfg.contextBudgetUsd ?? null;
+    metrics['budget_est_spent'] = Math.round(spend.spentEstimate() * 1e6) / 1e6;
   }
 
   if (emptySamples > 0) {
@@ -481,14 +593,14 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     // 多长度 + 配对长样本复验（层 3 反向审查：单发短样本成功可能是偶发/故障恢复后的巧合）：
     // ① 两发不同长度的短输入都要成功 → 端点确实接受短输入；
     // ② 在「首个整档被拒的高深度档」补发一发长样本，仍须被拒 → 400 可复现，不是瞬时抖动。
-    const fullyRejectedHighDepths = DEPTHS.filter((d) => d >= 0.5 && fullyRejectedDepth(d));
+    const fullyRejectedHighDepths = DEPTHS.filter((d) => d >= 0.5 && fullyRejectedDepth(d)).sort((a, b) => a - b);
     const anyRejectedDepths = [...new Set(records.filter((r) => r.sizeRejects > 0).map((r) => r.depth))].sort((a, b) => a - b);
     const smallestRejected = fullyRejectedHighDepths[0] ?? anyRejectedDepths[0];
     const controls: SizeControl[] = [];
-    for (const tokens of [512, 1024]) controls.push(await differentialSizeProbe(ctx, claimed, tokens));
+    for (const tokens of [512, 1024]) controls.push(await differentialSizeProbe(ctx, claimed, tokens, false, spend));
     // 长样本复验必须在「首个整档被拒的高深度档」的真实长度上发（传深度比例会退化成极短输入，必然被接受）
     const longRetest = smallestRejected !== undefined
-      ? await differentialSizeProbe(ctx, claimed, Math.floor(claimed * smallestRejected), true)
+      ? await differentialSizeProbe(ctx, claimed, Math.floor(claimed * smallestRejected), true, spend)
       : null;
     const shortOk = controls.every((c) => c.ok);
     const longReproduced = longRetest !== null && longRetest.sizeRejected;
@@ -525,11 +637,15 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 前沿以下（更深）允许 400/空响应/故障等非有效样本，但一旦出现任何有效应答
   // （attempted>0，含命中与未命中），拒绝就不再随深度单调，说明可能是请求特异性拒绝。
   if (sizeRejectionConfirmed) {
-    const highTiers = DEPTHS.filter((d) => d >= 0.5).map((d) => ({
-      depth: d,
-      allRejected: fullyRejectedDepth(d),
-      attempted: depthStats[String(d)]?.attempted ?? 0,
-    }));
+    // 前沿按「深度升序」找首个整档被拒的高深度档（与 DEPTHS 执行顺序无关）：50% 档可读、
+    // 75%/90% 整档 400 时，前沿是 75%，其后（更深）档须全部被拒或无有效样本。
+    const highTiers = DEPTHS.filter((d) => d >= 0.5)
+      .sort((a, b) => a - b)
+      .map((d) => ({
+        depth: d,
+        allRejected: fullyRejectedDepth(d),
+        attempted: depthStats[String(d)]?.attempted ?? 0,
+      }));
     const firstRejected = highTiers.findIndex((t) => t.allRejected);
     explicitReject =
       firstRejected >= 0 &&
@@ -568,7 +684,8 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     const depthsToConfirm = [...new Set([...highSuspects].sort((a, b) => b - a).slice(0, 2).concat(0.25))];
     const confirmations: DepthConfirmation[] = [];
     for (const depth of depthsToConfirm) {
-      const confirmation = await confirmDepth(ctx, claimed, depth, confirmSamples);
+      const confirmation = await confirmDepth(ctx, claimed, depth, confirmSamples, spend);
+      if (confirmation.budgetStopped) budgetStopped = true;
       confirmations.push(confirmation);
       if (confirmation.attempted === 0) coverageGapEvidenceIds.push(...confirmation.evidenceIds);
       confirmedDepths.add(depth);
@@ -621,7 +738,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 确认性复采也可能遇到空响应：指标取合并后的总数（供报告与降级守卫使用）。
   if (emptySamples > 0) metrics['empty_samples'] = emptySamples;
 
-  const missingDepths = DEPTHS.filter((d) => (depthStats[String(d)]?.attempted ?? 0) === 0);
+  const missingDepths = DEPTHS.filter((d) => (depthStats[String(d)]?.attempted ?? 0) === 0 && !skippedDepths.includes(d));
   if (missingDepths.length > 0) {
     metrics['missing_depths'] = missingDepths.map((d) => `${(d * 100).toFixed(0)}%`).join(',');
   }
@@ -684,7 +801,36 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     { role: 'system', content: '你将收到一份长文档和一个指令。请严格按指令执行。' },
     { role: 'user', content: `${echoDoc}\n\n${buildEchoQuestion()}` },
   ];
-  const echoCall = await chatWithStarveRetry(ctx, {
+  let echoBudgetStopped = false;
+  if (!spend.allow(estimateMessageTokens(echoMessages))) {
+    // 预算上限已达：回显不发。回显是「窗口属实」结论的端到端控制项，缺失时 pass 不得成立（下方预算门统一降级）。
+    budgetStopped = true;
+    echoBudgetStopped = true;
+  }
+  const echoCall = echoBudgetStopped
+    ? {
+        result: {
+          ok: false,
+          status: 0,
+          finishReason: null,
+          model: null,
+          text: '',
+          reasoning: null,
+          usage: null,
+          usageRejected: null,
+          attempts: 1,
+          toolCalls: [],
+          ttftMs: null,
+          durationMs: 0,
+          error: `预算上限（--context-budget-usd ${ctx.cfg.contextBudgetUsd}）已达，结尾回显停发`,
+          raw: '',
+        } satisfies ChatResult,
+        evidenceIds: [],
+        blankRetried: false,
+        streamFallback: false,
+        retried: false,
+      }
+    : await chatWithStarveRetry(ctx, {
     probe: 'context',
     label: `tail-echo nonce=${echoNonce}`,
     buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages: echoMessages, temperature: 0, max_tokens: maxTokens }),
@@ -712,15 +858,17 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, echoActualPromptTokens);
     }
   }
-  metrics['tail_echo'] = echoStarved
-    ? 'starved'
-    : echoTransportError
-      ? 'error'
-      : echoEmpty
-        ? 'empty'
-        : echoHit
-          ? 'hit'
-          : 'miss';
+  metrics['tail_echo'] = echoBudgetStopped
+    ? 'budget-stopped'
+    : echoStarved
+      ? 'starved'
+      : echoTransportError
+        ? 'error'
+        : echoEmpty
+          ? 'empty'
+          : echoHit
+            ? 'hit'
+            : 'miss';
   if (echoEmpty) {
     emptySamples += 1;
     emptyEvidenceIds.push(...echoCall.evidenceIds);
@@ -747,7 +895,15 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let boundaryConclusive = false;
   if (!explicitReject && anySuccess && ctx.cfg.deep) {
     boundaryScanned = true;
-    const scan = await scanBoundary(ctx, claimed);
+    const scan = await scanBoundary(ctx, claimed, spend);
+    if (scan.budgetStopped) {
+      budgetStopped = true;
+      findings.push({
+        level: 'info',
+        message: `预算上限（--context-budget-usd ${ctx.cfg.contextBudgetUsd}）已达：边界扫描停发，已发样本不构成完整二分证据，扫描结论作废。`,
+        evidenceIds: scan.evidenceIds,
+      });
+    }
     metrics['boundary'] = scan.detail;
     if (scan.found) {
       findings.push({
@@ -823,7 +979,10 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
-  let headline = `上下文实测通过：标称 ${claimed} tokens 内 needle 全部命中`;
+  const headlineTail = earlyStopped
+    ? `标称 ${claimed} tokens 的 ${(DEPTH_TOP * 100).toFixed(0)}% 档（${depthStats[String(DEPTH_TOP)]?.attempted ?? samplesPerDepth} 发全中）与结尾回显未发现截断（低深度档早停）`
+    : `标称 ${claimed} tokens 内 needle 全部命中`;
+  let headline = `上下文实测通过：${headlineTail}`;
   let verdictFromExplicitReject = false;
 
   if (!anySuccess) {
@@ -1038,6 +1197,28 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     headline = `上下文实测通过：标称 ${claimed} tokens 的其余深度${boundaryConclusive ? '与边界扫描' : '与结尾回显'}未发现截断（缺失 ${missingDepths.map((d) => `${(d * 100).toFixed(0)}%`).join('、')} 有效样本）`;
   }
 
+  // —— 软预算停发门（--context-budget-usd）：任何 context 请求被预算掐断时，覆盖不完整，
+  // 「窗口属实」的 pass 结论不得成立 → 降为无法判定；warn/fail 结论依据已获得的证据，保留并披露。
+  if (level === 'pass' && budgetStopped) {
+    metrics['budget_stopped'] = 1;
+    metrics['budget_usd'] = ctx.cfg.contextBudgetUsd ?? null;
+    metrics['budget_est_spent'] = Math.round(spend.spentEstimate() * 1e6) / 1e6;
+    findings.push({
+      level: 'info',
+      message: `预算上限（--context-budget-usd ${ctx.cfg.contextBudgetUsd}）触发停发（估算已花费约 ${spend.spentEstimate().toFixed(4)}，不含重试与流式回退的真实计费）：部分请求未发送，覆盖不完整，「窗口属实」结论不能成立。`,
+      evidenceIds: [],
+    });
+    return {
+      id: 'context',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: `context 预算上限触发停发（估算花费约 ${spend.spentEstimate().toFixed(4)} / 上限 ${ctx.cfg.contextBudgetUsd}），覆盖不完整，无法给出「窗口属实」结论`,
+      findings,
+      metrics,
+    };
+  }
+
   if (level === 'pass' && !boundaryConclusive) {
     if (maxActualPromptTokens === null) {
       findings.push({
@@ -1079,6 +1260,7 @@ async function differentialSizeProbe(
   claimed: number,
   overrideTokens?: number,
   asLongSample = false,
+  spend?: SpendTracker,
 ): Promise<{ ok: boolean; tokens: number; error: string | null; hit: boolean; sizeRejected: boolean; evidenceIds: string[] }> {
   const tokens = overrideTokens ?? Math.min(1024, Math.max(256, Math.floor(claimed * 0.02)));
   const { recordId, passphrase } = freshNeedleIds(ctx.rng);
@@ -1088,6 +1270,9 @@ async function differentialSizeProbe(
     { role: 'system', content: '你将收到一份文档和问题，只依据文档回答。' },
     { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
   ];
+  if (spend !== undefined && !spend.allow(estimateMessageTokens(messages))) {
+    return { ok: false, tokens, error: `预算上限（--context-budget-usd ${ctx.cfg.contextBudgetUsd}）已达，对照样本停发`, hit: false, sizeRejected: false, evidenceIds: [] };
+  }
   const call = await chatWithStarveRetry(ctx, {
     probe: 'context',
     label: `size-differential control (${tokens} tokens)${asLongSample ? ' long-retest' : ''}`,
@@ -1123,6 +1308,7 @@ async function boundaryShot(
   mid: number,
   label: string,
   pos: 'head' | 'tail',
+  spend?: SpendTracker,
 ): Promise<{ result: ChatResult; nonce: string; estimatedPrompt: number; evidenceIds: string[] }> {
   const { recordId, passphrase } = freshNeedleIds(ctx.rng);
   const filler = buildFiller(ctx.rng, mid);
@@ -1132,6 +1318,29 @@ async function boundaryShot(
     { role: 'system', content: '你将收到一份文档和问题，只依据文档回答。' },
     { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
   ];
+  if (spend !== undefined && !spend.allow(estimateMessageTokens(messages))) {
+    return {
+      result: {
+        ok: false,
+        status: 0,
+        finishReason: null,
+        model: null,
+        text: '',
+        reasoning: null,
+        usage: null,
+        usageRejected: null,
+        attempts: 1,
+        toolCalls: [],
+        ttftMs: null,
+        durationMs: 0,
+        error: `预算上限（--context-budget-usd ${ctx.cfg.contextBudgetUsd}）已达，边界扫描停发`,
+        raw: '',
+      } satisfies ChatResult,
+      nonce: passphrase,
+      estimatedPrompt: estimateMessageTokens(messages),
+      evidenceIds: [],
+    };
+  }
   const call = await chatWithStarveRetry(ctx, {
     probe: 'context',
     label,
@@ -1148,8 +1357,12 @@ async function readBoundaryShot(
   mid: number,
   label: string,
   pos: 'head' | 'tail',
-): Promise<{ verdict: 'read' | 'miss' | 'blank' | 'reject' | 'errored' | 'starved'; actualPromptTokens: number | null; evidenceIds: string[] }> {
-  const shot = await boundaryShot(ctx, mid, label, pos);
+  spend?: SpendTracker,
+): Promise<{ verdict: 'read' | 'miss' | 'blank' | 'reject' | 'errored' | 'starved' | 'budget-stopped'; actualPromptTokens: number | null; evidenceIds: string[] }> {
+  const shot = await boundaryShot(ctx, mid, label, pos, spend);
+  if (!shot.result.ok && /预算上限.*停发/.test(shot.result.error ?? '')) {
+    return { verdict: 'budget-stopped', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
+  }
   if (isStarved(shot.result)) return { verdict: 'starved', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
   if (isSizeRejection(shot.result)) return { verdict: 'reject', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
   if (!shot.result.ok) return { verdict: 'errored', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
@@ -1175,6 +1388,7 @@ async function readBoundaryShot(
 async function scanBoundary(
   ctx: ProbeCtx,
   claimed: number,
+  spend: SpendTracker,
 ): Promise<{
   found: boolean;
   foundAtTokens: number | null;
@@ -1184,6 +1398,7 @@ async function scanBoundary(
   erroredSeen: boolean;
   erroredCount: number;
   sizeRejectCount: number;
+  budgetStopped: boolean;
   actualPromptMax: number | null;
   detail: string;
   evidenceIds: string[];
@@ -1197,22 +1412,29 @@ async function scanBoundary(
   let blankSeen = false;
   let erroredCount = 0;
   let sizeRejectCount = 0;
+  let budgetStopped = false;
   let actualPromptMax: number | null = null;
   for (let step = 0; step < 3; step += 1) {
     const mid = Math.floor((lo + hi) / 2);
     if (mid <= 0) break;
     // —— head/tail 并行探测；任一 shot 星级事件直接终止扫描 ——
     const shots: Array<{ pos: 'head' | 'tail'; verdict: 'read' | 'miss' }> = [];
-    let abort: 'errored' | 'starved' | 'reject' | 'blank' | null = null;
+    let abort: 'errored' | 'starved' | 'reject' | 'blank' | 'budget-stopped' | null = null;
     for (const pos of ['head', 'tail'] as const) {
-      const shot = await readBoundaryShot(ctx, mid, `boundary ${pos} mid=${mid}`, pos);
+      const shot = await readBoundaryShot(ctx, mid, `boundary ${pos} mid=${mid}`, pos, spend);
       evidenceIds.push(...shot.evidenceIds);
       if (shot.actualPromptTokens !== null) actualPromptMax = Math.max(actualPromptMax ?? 0, shot.actualPromptTokens);
-      if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject' || shot.verdict === 'blank') {
+      if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject' || shot.verdict === 'blank' || shot.verdict === 'budget-stopped') {
         abort = shot.verdict;
         break;
       }
       shots.push({ pos, verdict: shot.verdict });
+    }
+    if (abort === 'budget-stopped') {
+      // 预算上限已达：扫描无法继续，已得结论一律不作数（budgetStopped 由调用方统一降级）。
+      budgetStopped = true;
+      foundAtTokens = null;
+      break;
     }
     if (abort === 'starved') {
       // 推理占满预算：该点无正文可判，二分单调性已中断；已得边界也必须作废，
@@ -1260,8 +1482,15 @@ async function scanBoundary(
           mid,
           `boundary ${side.pos} confirm${i + 1} mid=${mid}`,
           side.pos,
+          spend,
         );
         evidenceIds.push(...shot.evidenceIds);
+        if (shot.verdict === 'budget-stopped') {
+          budgetStopped = true;
+          foundAtTokens = null;
+          aborted = true;
+          break;
+        }
         if (shot.actualPromptTokens !== null) actualPromptMax = Math.max(actualPromptMax ?? 0, shot.actualPromptTokens);
         if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject' || shot.verdict === 'blank') {
           if (shot.verdict === 'starved') starvedSeen = true;
@@ -1283,6 +1512,11 @@ async function scanBoundary(
       confirmed = true;
     }
     if (aborted) {
+      if (budgetStopped) {
+        // 确认链遇预算停发：扫描无法继续（调用方统一把结论降级为无法判定）。
+        foundAtTokens = null;
+        break;
+      }
       if (erroredCount > 0) {
         // 确认链遇传输/协议故障：单调性前提被破坏——清空并终止，不定罪。
         foundAtTokens = null;
@@ -1321,6 +1555,7 @@ async function scanBoundary(
     found,
     foundAtTokens,
     explicitReject,
+    budgetStopped,
     starvedSeen,
     blankSeen,
     erroredSeen: erroredCount > 0,

@@ -43,6 +43,9 @@ test Options:
   --deep                    More samples (slower, more tokens)
   --context-samples <n>     Context needle samples per depth, integer in [1, 5] (default: 1; --deep: 5;
                             3 = statistical mode with confirmation resampling; higher = more confidence/cost)
+  --context-budget-usd <n>  Context probe spend cap in the same unit as --price-input/--price-output (must be > 0, finite;
+                            requires both price flags). Soft cap: pre-charges an estimate (input tokens × input price
+                            + full output budget × output price) per request and stops sending once exceeded.
   --seed <n>                Random seed, integer in [1, 2147483646] (default: time-based; with --baseline defaults to baseline seed)
   --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 60)
   --out <dir>               Report output directory (default: reports)
@@ -78,6 +81,7 @@ async function main(argv: string[]): Promise<number> {
         model: { type: 'string' },
         'claimed-context': { type: 'string' },
         'context-samples': { type: 'string' },
+        'context-budget-usd': { type: 'string' },
         expect: { type: 'string' },
         'price-input': { type: 'string' },
         'price-output': { type: 'string' },
@@ -188,6 +192,27 @@ async function main(argv: string[]): Promise<number> {
   }
   const price = priceFlags.price;
 
+  // --context-budget-usd fail-fast：须为有限正数，且必须与 --price-input/--price-output 成对提供
+  // （预算单位与价格一致，逐请求按「估算输入×输入价+输出预算×输出价」预扣）。
+  let contextBudgetUsd: number | undefined;
+  if (values['context-budget-usd'] !== undefined) {
+    const raw = values['context-budget-usd'];
+    const fail = (why: string): number => {
+      console.error(`--context-budget-usd ${why}。收到：${JSON.stringify(raw)}。`);
+      console.error('示例：--context-budget-usd 0.5 --price-input 2 --price-output 8');
+      return 2;
+    };
+    if (!/^[+-]?(\d+(\.\d+)?|\.\d+)$/.test(raw)) return fail('必须是大于 0 的有限数字');
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0 || value > 1e9) return fail('必须是大于 0 且不超过 1e9 的有限数字');
+    if (price === null || price.input === null || price.output === null) {
+      console.error(`--context-budget-usd 必须与 --price-input/--price-output 成对提供（预算单位与价格一致）。收到：${JSON.stringify(raw)}。`);
+      console.error('示例：--context-budget-usd 0.5 --price-input 2 --price-output 8');
+      return 2;
+    }
+    contextBudgetUsd = value;
+  }
+
   // --baseline fail-fast：文件不存在 / 基线畸形都立即 exit 2，不发起任何请求（runner 内的 catch 降级仅供库调用方）
   let baselineData: ReturnType<typeof loadBaseline> | null = null;
   if (values.baseline !== undefined) {
@@ -260,6 +285,7 @@ async function main(argv: string[]): Promise<number> {
     expect,
     deep: values.deep === true,
     contextSamples,
+    contextBudgetUsd,
     seed,
     timeoutMs: timeoutSeconds * 1000,
     retries,

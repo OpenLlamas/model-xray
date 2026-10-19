@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+﻿import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
@@ -345,7 +345,9 @@ function usageResult(promptTokens: number, completionTokens = 16): ChatResult {
     status: 200,
     finishReason: 'stop',
     model: null,
-    text: 'ok',
+    // 正文与 completion=16 对齐（'ok'×32 = 64 ASCII 字符 ≈ 16 估算 token）：
+    // 否则夹具自身构成「completion vs 正文」灌水形态，污染输出侧灌水比对的判定面。
+    text: 'ok'.repeat(32),
     reasoning: null,
     usage: { prompt_tokens: promptTokens, completion_tokens: completionTokens, total_tokens: promptTokens + completionTokens },
     usageRejected: null,
@@ -538,7 +540,7 @@ test('probeBilling: 窗口内存在失败请求 → 实测倍率作废（不得�
     if (req.url === '/v1/dashboard/billing/usage') {
       balanceReads += 1;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? Math.round(expectedCost * 100 * 20) : 0 }));
+      res.end(JSON.stringify({ total_usage: balanceReads <= 2 ? 0 : Math.round(expectedCost * 100 * 20) }));
       return;
     }
     res.writeHead(404).end();
@@ -561,7 +563,7 @@ test('probeBilling: 窗口内存在失败请求 → 实测倍率作废（不得�
         status: 200,
         finishReason: 'stop',
         model: null,
-        text: 'ok',
+        text: 'ok'.repeat(32),
         reasoning: null,
         usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
         usageRejected: null,
@@ -651,6 +653,110 @@ test('probeBilling: completion_tokens 超过请求 max_tokens → warn 70（硬�
   assert.equal(outcome.score, 70);
   assert.equal(outcome.metrics['completion_over_cap'], 10);
   assert.match(outcome.headline, /输出侧计费异常|completion_tokens/);
+});
+
+// ---------- 暗插固定 token（回归截距）/ 输出侧灌水（completion 合计比对，2026-10-19） ----------
+
+test('probeBilling: 恒定加计 500 tokens（暗插系统提示）→ 回归截距 warn 封顶 70，斜率不误触发', async () => {
+  // 等比形状检查的盲区：prompt_tokens = 估算 + 500 对每个长度档恒定加计，
+  // 斜率仍为 1.0、R²=1，只有 x=0 外推的截距暴露该项。
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      return usageResult(estimateMessageTokens(req.messages) + 500);
+    },
+  };
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.level, 'warn');
+  assert.ok((outcome.score ?? 100) <= 70, `score=${outcome.score}`);
+  assert.match(outcome.headline, /截距/);
+  const interceptFinding = outcome.findings.find((f) => /截距/.test(f.message));
+  assert.ok(interceptFinding && interceptFinding.level === 'warn', JSON.stringify(outcome.findings));
+  assert.ok((interceptFinding?.evidenceIds ?? []).length >= 3, '截距 warn 必须携带回归样本证据');
+  assert.ok(!outcome.findings.some((f) => /轨道斜率|按字符数/.test(f.message)), '恒定加计不改变斜率，斜率判定不得误触发');
+  assert.ok((outcome.metrics['intercept_en'] as number) > 120, `intercept_en=${outcome.metrics['intercept_en']}`);
+});
+
+test('probeBilling: 模板级截距（+20 tokens）不触发暗插判定（诚实中转不误报）', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      return usageResult(estimateMessageTokens(req.messages) + 20);
+    },
+  };
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 85);
+  assert.ok(!outcome.findings.some((f) => /截距/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok((outcome.metrics['intercept_en'] as number) < 120, `intercept_en=${outcome.metrics['intercept_en']}`);
+});
+
+test('probeBilling: en 轨道可见 completion 灌水（15 vs 估算 10，×1.5）→ 输出侧合计 warn 封顶 70', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const isEn = text.includes('quick brown fox');
+      // en 可见 completion=15（无推理明细），正文 'ok'×20 的本地估算=10 → 比值 1.5 > 1.35；
+      // zh 保持诚实（10 vs 10），只有 en 轨道触发。completion 均不超过 max_tokens=16 硬矛盾线。
+      const completion = isEn ? 15 : 10;
+      return { ...usageResult(estimateMessageTokens(req.messages), completion), text: 'ok'.repeat(20) };
+    },
+  };
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.level, 'warn');
+  assert.ok((outcome.score ?? 100) <= 70, `score=${outcome.score}`);
+  const inflateFinding = outcome.findings.find((f) => /灌水/.test(f.message));
+  assert.ok(inflateFinding && inflateFinding.level === 'warn', JSON.stringify(outcome.findings));
+  assert.ok(Math.abs((outcome.metrics['completion_ratio_en'] as number) - 1.5) < 0.01, `ratio=${outcome.metrics['completion_ratio_en']}`);
+  assert.ok((inflateFinding?.evidenceIds ?? []).length >= 3, '灌水 warn 必须携带样本证据');
+  assert.ok(!outcome.findings.some((f) => /截距|斜率|R²/.test(f.message)), '夹具保持斜率 1/截距 0，其他判定不得误触发');
+});
+
+test('probeBilling: 推理份额扣减与 finish=length 排除（thinking 端点不误报）', async () => {
+  const counters: Record<'en' | 'zh', number> = { en: 0, zh: 0 };
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const track: 'en' | 'zh' = text.includes('quick brown fox') ? 'en' : 'zh';
+      const index = counters[track];
+      counters[track] += 1;
+      const prompt = estimateMessageTokens(req.messages);
+      const base = { ...usageResult(prompt), text: 'ok'.repeat(20) };
+      if (track === 'en') {
+        if (index === 0) return { ...base, finishReason: 'length' };
+        // completion=16 其中 reasoning=6（真机实证中转对普通复读也报推理明细）：
+        // 可见份额 10 与正文估算 10 一致 → 比值 1.0，不得误报灌水。
+        return { ...base, usage: { ...base.usage!, completion_tokens: 16, reasoning_tokens: 6 } };
+      }
+      return { ...base, usage: { ...base.usage!, completion_tokens: 10, reasoning_tokens: 0 } };
+    },
+  };
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.metrics['completion_pair_samples_en'], 4);
+  assert.equal(outcome.metrics['completion_excluded_en'], 1);
+  assert.ok(Math.abs((outcome.metrics['completion_ratio_en'] as number) - 1) < 0.01, `ratio=${outcome.metrics['completion_ratio_en']}`);
+  assert.ok(!outcome.findings.some((f) => /灌水/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('probeBilling: 输出侧少报（completion 4 vs 估算 10）→ info 披露不扣分', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      const text = req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+      const isEn = text.includes('quick brown fox');
+      const completion = isEn ? 4 : 10;
+      return { ...usageResult(estimateMessageTokens(req.messages), completion), text: 'ok'.repeat(20) };
+    },
+  };
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 85);
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /少报/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /灌水/.test(f.message)));
+  assert.ok((outcome.metrics['completion_ratio_en'] as number) < 0.6, `ratio=${outcome.metrics['completion_ratio_en']}`);
 });
 
 test('probeBilling: 少量请求缺 usage → warn 70，不得凭剩余样本 PASS', async () => {
@@ -792,7 +898,7 @@ test('probeBilling：缓存读 + 二档阶梯价按 computeCostUsd 累计并如�
       balanceReads += 1;
       res.writeHead(200, { 'content-type': 'application/json' });
       // 真实 balance 接口为整数美分；0.28292 USD 只能读出 28 分（0.28 USD），倍率约 0.99。
-      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? Math.round(expectedCost * 100) : 0 }));
+        res.end(JSON.stringify({ total_usage: balanceReads <= 2 ? 0 : Math.round(expectedCost * 100) }));
       return;
     }
     res.writeHead(404).end();
@@ -812,7 +918,7 @@ test('probeBilling：缓存读 + 二档阶梯价按 computeCostUsd 累计并如�
         status: 200,
         finishReason: 'stop',
         model: null,
-        text: 'ok',
+        text: 'ok'.repeat(32),
         reasoning: null,
         usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
         usageRejected: null,
@@ -856,7 +962,7 @@ test('probeBilling：极高倍率（>10×）不再假 fail，改为 warn + maske
     if (req.url === '/v1/dashboard/billing/usage') {
       balanceReads += 1;
       res.writeHead(200, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? Math.round(costAccumulated * 100 * measuredRatio) : 0 }));
+      res.end(JSON.stringify({ total_usage: balanceReads <= 2 ? 0 : Math.round(costAccumulated * 100 * measuredRatio) }));
       return;
     }
     res.writeHead(404).end();
@@ -873,7 +979,7 @@ test('probeBilling：极高倍率（>10×）不再假 fail，改为 warn + maske
         status: 200,
         finishReason: 'stop',
         model: null,
-        text: 'ok',
+        text: 'ok'.repeat(32),
         reasoning: null,
         usage: { prompt_tokens: prompt, completion_tokens: 16, total_tokens: prompt + 16, cached_tokens: 300 },
         usageRejected: null,
@@ -935,7 +1041,7 @@ function contaminatedRetryBillingTest(testName: string, contaminating: boolean, 
       if (req.url === '/v1/dashboard/billing/usage') {
         balanceReads += 1;
         res.writeHead(200, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ total_usage: balanceReads >= 2 ? Math.round(expectedCost * 100) : 0 }));
+      res.end(JSON.stringify({ total_usage: balanceReads <= 2 ? 0 : Math.round(expectedCost * 100) }));
         return;
       }
       res.writeHead(404).end();
@@ -958,7 +1064,7 @@ function contaminatedRetryBillingTest(testName: string, contaminating: boolean, 
           status: 200,
           finishReason: 'stop',
           model: null,
-          text: 'ok',
+          text: 'ok'.repeat(32),
           reasoning: null,
           usage: { prompt_tokens: promptTokens, completion_tokens: 16, total_tokens: promptTokens + 16 },
           usageRejected: null,
@@ -1014,3 +1120,204 @@ contaminatedRetryBillingTest(
   },
 );
 
+
+// ---------- 偷调倍率检测链路补缺（2026-10-19 图纸双审必修：pre 稳定化 / top-up / user 级口径） ----------
+
+function userLevelReading(value: number): BalanceReading {
+  return {
+    value,
+    kind: 'spent_total',
+    unit: 'USD',
+    endpoint: '/api/user/self',
+    currency: null,
+    resolution: 1 / 500000,
+    conversionNote: 'quota_per_unit=500000 (source: /api/status; user-level balance)',
+  };
+}
+
+test('decideRatio：user 级余额来源（/api/user/self）超 1.5 倍 → 禁出 fail，降为 warn + masked fail 披露', () => {
+  const args = {
+    before: userLevelReading(0),
+    after: userLevelReading(0.02),
+    spendDelta: 0.02,
+    expectedCost: 0.01,
+    ratioDropped: 0,
+    regressionLevel: 'pass' as const,
+  };
+  // 用户级口径：该用户全部 key 共享 Δ，其他 key 的并发消费可把倍率推入 (1.5,10]——
+  // >10 不可归因门兜不住（必修 2），定论级 fail 只允许 key 级口径
+  const userScope = decideRatio({ ...args, scope: 'user' });
+  assert.equal(userScope?.verdict, 'warn');
+  assert.equal(userScope?.maskedVerdict, 'fail');
+  assert.equal(userScope?.cap, 70);
+  assert.match(userScope?.finding.message ?? '', /用户级口径/);
+
+  const keyScope = decideRatio({ ...args, scope: 'key' });
+  assert.equal(keyScope?.verdict, 'fail', 'key 级口径出定论 fail');
+
+  const defaultScope = decideRatio(args);
+  assert.equal(defaultScope?.verdict, 'fail', '缺省 scope 兼容旧调用方（按 key 级）');
+
+  // regressionLevel=fail 分支同样受 user 级禁 fail 约束
+  const userScopeRegFail = decideRatio({ ...args, scope: 'user', regressionLevel: 'fail' });
+  assert.equal(userScopeRegFail?.verdict, 'warn');
+  assert.equal(userScopeRegFail?.maskedVerdict, 'fail');
+});
+
+test('probeBilling：pre 快照未即时稳定（窗口前存在未结算消费）→ 实测倍率作废，不得诬告', async () => {
+  let balanceReads = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/v1/dashboard/billing/usage') {
+      balanceReads += 1;
+      // 读数序列（美分）：0 → 100 → 100 → 100：pre 第二次对比才收敛（polls=3 > 2），
+      // 窗口前有异步结算的旧账在 pre 轮询期间入账——起点不可靠，混入会推高倍率
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: balanceReads === 1 ? 0 : 100 }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const baseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`;
+  try {
+    const client: OpenAIClient = {
+      baseUrl,
+      async chat(): Promise<ChatResult> {
+        return usageResult(1000);
+      },
+    };
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = 2;
+    ctx.cfg.priceOutput = 8;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.metrics['ratio_contaminated'], 1);
+    assert.equal(outcome.metrics['measured_ratio'], 'N/A');
+    assert.equal(outcome.metrics['balance_pre_settled'], 0, '首比不稳 → pre 不认净');
+    assert.ok((outcome.metrics['balance_pre_polls'] as number) >= 3);
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'info' && /未即时稳定/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+/** 便宜价 + 整数美分余额 + 可控 usage 的端到端夹具（top-up 判定面）。
+ * 前 2 次余额读数 = 窗口前 0（pre 首比即稳），其后按 addSpend 累计的 USD 圆整为整数美分。 */
+function startCentBalanceFixture(): Promise<{ baseUrl: string; addSpend: (usd: number) => void; close: () => Promise<void> }> {
+  let spentUsd = 0;
+  let probeReads = 0;
+  const server = createServer((req, res) => {
+    if (req.url === '/v1/dashboard/billing/usage') {
+      probeReads += 1;
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: probeReads <= 2 ? 0 : Math.round(spentUsd * 100) }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  return new Promise((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        baseUrl: `http://127.0.0.1:${(server.address() as AddressInfo).port}/v1`,
+        addSpend: (usd: number) => {
+          spentUsd += usd;
+        },
+        close: () => new Promise<void>((done) => server.close(() => done())),
+      });
+    });
+  });
+}
+
+test('probeBilling：应缴金额低于美分刻度门槛 → 自适应补采抬升 Δ 至可判定区间，倍率可出数', async () => {
+  const fixture = await startCentBalanceFixture();
+  try {
+    const prices = { input: 0.15, output: 0.6 };
+    const seenPrompts: number[] = [];
+    const client: OpenAIClient = {
+      baseUrl: fixture.baseUrl,
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        const promptTokens = Math.max(100, estimateMessageTokens(req.messages));
+        seenPrompts.push(promptTokens);
+        fixture.addSpend((promptTokens * prices.input + 16 * prices.output) / 1e6);
+        return usageResult(promptTokens);
+      },
+    };
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = prices.input;
+    ctx.cfg.priceOutput = prices.output;
+    const outcome = await probeBilling(ctx);
+    // 主序列 10 笔 × 小 usage ≈ $0.0016 < 作废门 $0.03：必须触发补采
+    const topups = outcome.metrics['billing_topup_requests'] as number;
+    assert.ok(topups >= 5, `topups=${topups}`);
+    assert.ok(topups <= 8, `topups=${topups}（8 笔封顶）`);
+    assert.ok((outcome.metrics['expected_cost'] as number) >= 0.03, `expected=${outcome.metrics['expected_cost']}`);
+    assert.ok(typeof outcome.metrics['measured_ratio'] === 'number', `ratio=${outcome.metrics['measured_ratio']}`);
+    assert.ok((outcome.metrics['measured_ratio'] as number) > 0.5 && (outcome.metrics['measured_ratio'] as number) < 1.5, `ratio=${outcome.metrics['measured_ratio']}`);
+    assert.equal(outcome.metrics['balance_pre_settled'], 1, 'pre 首比即稳');
+    // 补采请求 = 大 prompt（≥48000 估算 token 的正文），计入窗口但主序列样本数不变
+    assert.ok(seenPrompts.filter((p) => p >= 40000).length === topups, '每笔补采都是最大档正文');
+    assert.equal(outcome.metrics['requests'], 10 + topups);
+    assert.ok(outcome.findings.some((f) => f.level === 'info' && /补采/.test(f.message)), JSON.stringify(outcome.findings));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('probeBilling：超便宜价 8 笔补采也到不了门槛 → 跳过补采不为注定 N/A 的窗口付费', async () => {
+  const fixture = await startCentBalanceFixture();
+  try {
+    const prices = { input: 0.02, output: 0.08 };
+    const client: OpenAIClient = {
+      baseUrl: fixture.baseUrl,
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        const promptTokens = Math.max(100, estimateMessageTokens(req.messages));
+        fixture.addSpend((promptTokens * prices.input + 16 * prices.output) / 1e6);
+        return usageResult(promptTokens);
+      },
+    };
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = prices.input;
+    ctx.cfg.priceOutput = prices.output;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.metrics['billing_topup_requests'], 0, '预检不可达 → 一笔不发');
+    assert.equal(outcome.metrics['billing_topup_skipped'], 1);
+    assert.equal(outcome.metrics['requests'], 10, '主序列 10 笔，无补采');
+    assert.equal(outcome.metrics['measured_ratio'], 'N/A');
+    assert.ok(outcome.findings.some((f) => f.level === 'info' && /跳过补采/.test(f.message)), JSON.stringify(outcome.findings));
+  } finally {
+    await fixture.close();
+  }
+});
+
+test('probeBilling：补采首笔失败 → 立即停并如实污染窗口（不为注定 N/A 的窗口继续付费）', async () => {
+  const fixture = await startCentBalanceFixture();
+  try {
+    const prices = { input: 0.15, output: 0.6 };
+    let topupCalls = 0;
+    const client: OpenAIClient = {
+      baseUrl: fixture.baseUrl,
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        const promptTokens = Math.max(100, estimateMessageTokens(req.messages));
+        if (promptTokens >= 40000) {
+          topupCalls += 1;
+          return errorResult(); // 首笔补采即失败
+        }
+        fixture.addSpend((promptTokens * prices.input + 16 * prices.output) / 1e6);
+        return usageResult(promptTokens);
+      },
+    };
+    const ctx = billingCtx(client);
+    ctx.cfg.priceInput = prices.input;
+    ctx.cfg.priceOutput = prices.output;
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.metrics['billing_topup_requests'], 1);
+    assert.equal(topupCalls, 1, '失败后立即停，不再发第二笔');
+    assert.equal(outcome.metrics['ratio_contaminated'], 1, '失败请求污染窗口');
+    assert.equal(outcome.metrics['measured_ratio'], 'N/A');
+    assert.ok(outcome.findings.some((f) => f.level === 'warn' && /失败/.test(f.message)), JSON.stringify(outcome.findings));
+  } finally {
+    await fixture.close();
+  }
+});
