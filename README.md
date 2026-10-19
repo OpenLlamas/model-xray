@@ -10,19 +10,32 @@
 
 ## English
 
-### Quick start (from source, ~5 min)
+### Quick start: web console, 3 steps (recommended)
 
-Requires **Node.js ≥ 22** (`node --version` to check).
+Form-driven and visual — nothing to memorize, nothing to mis-type. Requires **Node.js ≥ 22** (`node --version` to check).
 
 ```bash
 git clone https://github.com/OpenLlamas/model-xray.git
 cd model-xray
 npm install
 npm run build
-npm link          # optional but recommended: gives you the short `model-xray` command
+npm run ui       # auto-opens http://127.0.0.1:8620 (loopback only)
 ```
 
-Set your API key once — both `test` and `guard` read it; the key never enters the command line or shell history:
+In the page's **One-shot test** tab:
+
+1. **Paste** the station's base URL and model name.
+2. **Tick** what the station claims — capabilities (vision / tool calls / reasoning), claimed context window, claimed prices (enter prices only if you want the cost/rate checks; the more you declare, the deeper the probes run).
+3. **Paste** your API key into the key bar (kept in the local server process only, never echoed) and click **Start**: the CLI runs locally, the log streams live, and the scorecard renders in place.
+
+Reports land in `reports/` as `report-<model>-<YYYY-MM-DD_HH-mm-ss>` (local time) in three formats: `.md` (read this one), `.html` (open in a browser), `.json` (raw evidence). A full run typically costs a cent or two. This path needs no `npm link` and no environment variable.
+
+### CLI usage (optional)
+
+Prefer the terminal:
+
+- **Interactive wizard** (`npm run ask`, Windows): it asks for the endpoint / model / key, previews with a dry-run, confirms, then runs and prints the report path.
+- **Bare command** — set your API key once (`test` and `guard` both read it; the key never enters the command line or shell history):
 
 ```powershell
 # PowerShell
@@ -34,8 +47,6 @@ $env:MODEL_XRAY_KEY = 'sk-your-key'
 export MODEL_XRAY_KEY='sk-your-key'
 ```
 
-Run a one-shot audit:
-
 ```bash
 model-xray test \
   --base-url https://your-relay.example.com/v1 \
@@ -43,15 +54,9 @@ model-xray test \
   --yes
 ```
 
-If you skipped `npm link` (or npm refused due to permissions), replace `model-xray` with `node dist/src/cli.js` everywhere.
+`npm link` (optional, after `npm run build`) gives you the short `model-xray` command; if npm refuses due to permissions, replace `model-xray` with `node dist/src/cli.js` everywhere. Exit code: `0` pass/warn · `1` fail · `2` usage error or inconclusive run (no scorable conclusion).
 
-Prefer a guided flow? Run `npm run ask` (Windows): an interactive terminal wizard asks for the endpoint / model / key, previews with a dry-run, confirms, then runs and prints the report path. Or run `npm run ui` for the local web console (loopback only) — fill in everything in the page, watch the live log, and aggregate channels with live usage/anomaly monitoring; the `guard` always-on proxy is CLI-only. See "Web console" below.
-
-The report lands in `reports/` as three files named `report-<model>-<YYYY-MM-DD_HH-mm-ss>` (local time): `report-<model>-<…>.md` (read this one), `report-<model>-<…>.html` (open in a browser), `report-<model>-<…>.json` (raw evidence). Exit code: `0` pass/warn · `1` fail · `2` usage error or inconclusive run (no scorable conclusion).
-
-### Common tasks
-
-**1) Audit a station once** — the command above. Add whatever you know about the station; unknown extras are simply skipped:
+Know something about the station? Add it — unknown extras are simply skipped (the same fields are form fields in the web console):
 
 | You know | Add to the command |
 |---|---|
@@ -59,16 +64,16 @@ The report lands in `reports/` as three files named `report-<model>-<YYYY-MM-DD_
 | advertised capabilities | `--expect vision,tool,thinking` (default `vision,tool`; use `--expect none` if none claimed) |
 | advertised price per 1M tokens | `--price-input 0.2 --price-output 0.7` — enables the measured-rate probe |
 
-Preview without spending: add `--dry-run` (it prints the planned requests and token estimate, sends nothing). A full run typically costs a cent or two — ours measured ≈ $0.015 per run at $0.2/$0.7 per 1M tokens.
+Preview without spending: add `--dry-run` (it prints the planned requests and token estimate, sends nothing).
 
-**2) Re-audit later, or catch a silent model swap** — keep the `baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json` written by the first run and pass it back:
+**Re-audit later, or catch a silent model swap** — keep the `baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json` written by the first run and pass it back:
 
 ```bash
 model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes \
   --baseline reports/baseline-gpt-4o-2026-10-11_10-09-23.json
 ```
 
-**3) Always-on monitoring (`guard`, CLI-only)** — a local transparent proxy that watches your real client traffic and scores it live (the console no longer starts or stops it):
+**Always-on monitoring (`guard`, CLI-only)** — a local transparent proxy that watches your real client traffic and scores it live (the console no longer starts or stops it):
 
 ```powershell
 # 1) key via environment variable only (guard has no --key flag by design)
@@ -80,13 +85,7 @@ model-xray guard --base-url https://your-relay.example.com/v1 `
 #    with the client's API key set to the SAME value as MODEL_XRAY_KEY
 ```
 
-Keep using your client normally: every 20 forwarded requests prints a live scorecard (availability / accounting / identity / latency / cost; rolling window = last 100 requests), anomalies alert immediately, and everything lands in `reports/guard/guard-YYYYMMDD.jsonl` (metadata only). `Ctrl+C` settles the final window before exit.
-
-**4) Do it all from the local web console** (nothing leaves your machine):
-
-```bash
-npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
-```
+What it scores per request is detailed in "Guard: local always-on monitor" below.
 
 ### How to read the result
 
@@ -167,7 +166,7 @@ npm run ui     # opens http://127.0.0.1:8620 automatically (loopback only)
 
 ### Guard: local always-on monitor (P2)
 
-`guard` runs a transparent local forwarding proxy that watches **real traffic** instead of firing one-shot probes (startup commands are under "Common tasks" above). What it watches per request:
+`guard` runs a transparent local forwarding proxy that watches **real traffic** instead of firing one-shot probes (startup commands are under "CLI usage" above). What it watches per request:
 
 - **Model consistency** — request `model` vs the model the endpoint actually answers with; a mismatch alerts immediately (`model_mismatch`). Ids are compared after canonicalization (lowercase, separators `. _ - /` removed), because relays commonly re-spell the same id (`glm-5.3-flash` → `glm-5-3-flash`); a different family or version still alerts.
 - **Token accounting** — SSE/JSON responses are parsed for `usage` (bytes pass through untouched); negative or inconsistent token counts raise `usage_invalid`. Reported `cached_tokens` / `reasoning_tokens` details are captured when present.
@@ -187,7 +186,7 @@ Two problems dominate the relay market, and both are designed to be invisible:
 - **Faking (model swap / lighter variant)** — the relay serves a lighter sibling from the same family in place of the flagship: e.g. `glm-5.3-flash` standing in for `glm-5.3`. The docs, the self-reported model name, and everyday answers all look right, so it is nearly impossible to notice in normal use; only probes that compare the requested model against the endpoint's self-described identity / answer fingerprints catch it.
 - **Hidden rate markup** — sticker prices look normal while the billing backend quietly applies a modest multiplier (e.g. 1.5×): no single bill looks alarming, so eyeballing statements never catches it; only an absolute check — measured spend ÷ (claimed price × self-reported usage) — produces a verdict.
 
-Prefer the local web console (`npm run ui`) over a bare CLI run: the page lets you tick the claimed capabilities (vision / tool calls / reasoning) visually, enter the claimed context window and claimed prices (input/output per 1M tokens, optional cached-read rate and long-context second tier), pin a seed for reproducible re-tests, and add enhanced samples — **the more you declare, the deeper the probes run**. Hand-writing CLI arguments invites format mistakes (missing items, typos, wrong separators); ticking the wrong — or fewer — capabilities makes the corresponding probes pass as "unclaimed" or misfire, so using the page's checkboxes prevents this class of format errors from skewing the audit. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
+Best run from the web console (see "Web console" below): tick the claimed capabilities and enter the claimed prices in the form — the more you declare, the deeper the probes run, and page checkboxes avoid the CLI format mistakes (missing items, typos, wrong separators) that can skew the audit: a wrongly-ticked or missing capability makes its probes pass as "unclaimed" or misfire. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
 
 Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): a relay served `glm-5.3-flash` in place of `glm-5.3` and set the rate to 1.5×. One "Start test" run caught it: all 6 identity probes echoed back a different model (requested `glm-5.3`, upstream echoed `glm-5.3-flash` — suspected swap/channel change), the measured rate came out 1.5 > 1.5 claimed (fail, capped at 30), plus 32/62 empty non-streaming bodies as further evidence — final score 45 · fail (billing hard red line caps the total). The sticker prices on the page looked perfectly normal; without entering them and actually measuring, nothing would have surfaced.
 
@@ -237,19 +236,32 @@ v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-rep
 
 `model-xray` 是一个开源 CLI，用实证手段检测兼容 OpenAI 协议的 LLM 接入点是否存在**模型真伪 / 掺水**问题（换壳、降智、截断上下文、虚标 token 计数等中转站常见套路）。它不要求你相信任何厂商的话：直接探测端点行为，产出可分享的红绿报告。
 
-### 快速开始（从源码，约 5 分钟）
+### 快速开始：Web 控制台三步走（推荐）
 
-需要 **Node.js ≥ 22**（用 `node --version` 确认）。
+全程表单可视化——无参数要背、无格式可写错。需要 **Node.js ≥ 22**（用 `node --version` 确认）。
 
 ```bash
 git clone https://github.com/OpenLlamas/model-xray.git
 cd model-xray
 npm install
 npm run build
-npm link          # 可选但推荐：此后可用短命令 model-xray（npm 报权限错误则跳过）
+npm run ui       # 自动打开 http://127.0.0.1:8620（仅本机回环）
 ```
 
-设置 API key（`test` 与 `guard` 都读它；key 不进命令行、不进 shell 历史）：
+在「一次性检测」标签页里：
+
+1. **粘贴**中转站的 base-url 和模型名；
+2. **勾选**站方宣称的能力（视觉 / 工具调用 / 推理）、标称上下文窗口、标称价格（价格只有想抓计费问题时才需要填；声明得越全，探针跑得越深）；
+3. **粘贴** API key 到本页 key 栏（只存本地服务进程、绝不回显），点「开始检测」：CLI 在本机真实运行，日志实时流式滚动，评分卡原位渲染。
+
+报告落盘到 `reports/`，文件名主干 `report-<模型名>-<YYYY-MM-DD_HH-mm-ss>`（本地时间）三份：`.md`（看这份）、`.html`（浏览器打开）、`.json`（原始证据）。一整轮通常只花几分钱。此路径无需 `npm link`、无需环境变量。
+
+### 命令行运行（可选）
+
+偏好终端时：
+
+- **交互式向导**（Windows）：`npm run ask`——逐项询问端点/模型/key，可先 dry-run 预估，确认后执行并输出报告路径。
+- **裸命令**——先把 key 设进环境变量（`test` 与 `guard` 都读它；key 不进命令行、不进 shell 历史）：
 
 ```powershell
 # PowerShell
@@ -261,8 +273,6 @@ $env:MODEL_XRAY_KEY = 'sk-你的key'
 export MODEL_XRAY_KEY='sk-你的key'
 ```
 
-跑一轮审计：
-
 ```bash
 model-xray test \
   --base-url https://your-relay.example.com/v1 \
@@ -270,15 +280,9 @@ model-xray test \
   --yes
 ```
 
-（跳过 `npm link` 的话，把命令里的 `model-xray` 换成 `node dist/src/cli.js` 即可。）
+`npm run build` 之后可选 `npm link` 拿到短命令 `model-xray`（npm 报权限错误则把 `model-xray` 换成 `node dist/src/cli.js`）。退出码：`0` 通过/可疑 · `1` 不通过 · `2` 用法错误或未得出结论。
 
-不想记参数？运行 `npm run ask`（Windows）：交互式终端向导逐项询问端点/模型/key，可先 dry-run 预估，确认后执行并输出报告路径。或运行 `npm run ui`（本地 Web 控制台，仅回环）：参数与 key 全部在网页录入，实时查看日志（「API 聚合实时监控」本版暂未上线，后需迭代，控制台入口已隐藏）。`guard` 常驻代理仅命令行可用。详见下文「Web 控制台」。
-
-报告落盘到 `reports/`，文件名主干为 `report-<模型名>-<YYYY-MM-DD_HH-mm-ss>`（本地时间）三份：`report-<模型名>-<…>.md`（看这份）、`report-<模型名>-<…>.html`（浏览器打开）、`report-<模型名>-<…>.json`（原始证据）。退出码：`0` 通过/可疑 · `1` 不通过 · `2` 用法错误或未得出结论。
-
-### 常用场景（照抄即可）
-
-**1）只审计一次** —— 就是上面的命令。知道什么就补什么，不知道的项自动跳过：
+知道站方什么就补什么，不知道的项自动跳过（这些字段在 Web 控制台里都是表单项）：
 
 | 你知道 | 加上 |
 |---|---|
@@ -286,16 +290,16 @@ model-xray test \
 | 宣称能力 | `--expect vision,tool,thinking`（默认 `vision,tool`；都没宣称用 `--expect none`） |
 | 标称价格（每百万 tokens） | `--price-input 0.2 --price-output 0.7` —— 启用实测倍率 |
 
-想先看会发什么请求、大约花多少：加 `--dry-run`（不发任何请求）。一整轮通常只花几分钱——实测 53 样本 ≈ $0.015（按 $0.2/$0.7 每 M tokens）。
+想先看会发什么请求、大约花多少：加 `--dry-run`（不发任何请求）。
 
-**2）过段时间复测 / 抓偷换模型** —— 保留第一次产出的 `baseline-<模型名>-<YYYY-MM-DD_HH-mm-ss>.json`，复测时带上：
+**过段时间复测 / 抓偷换模型** —— 保留第一次产出的 `baseline-<模型名>-<YYYY-MM-DD_HH-mm-ss>.json`，复测时带上：
 
 ```bash
 model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes \
   --baseline reports/baseline-gpt-4o-2026-10-11_10-09-23.json
 ```
 
-**3）常驻监控（`guard`，仅命令行）** —— 本地透明代理，盯真实客户端流量并实时打分（控制台不再提供启停入口）：
+**常驻监控（`guard`，仅命令行）** —— 本地透明代理，盯真实客户端流量并实时打分（控制台不再提供启停入口）：
 
 ```powershell
 # ① key 只走环境变量（guard 没有 --key 旗标，key 不进命令行历史）
@@ -307,13 +311,7 @@ model-xray guard --base-url https://your-relay.example.com/v1 `
 #    并把客户端 key 设为与 MODEL_XRAY_KEY 相同的值
 ```
 
-之后正常用你的客户端：每 20 个已转发请求打印一次实时评分卡（可用性/计量/身份/时延/成本；滚动窗口 = 最近 100 个请求），异常立即告警，全部写入 `reports/guard/guard-YYYYMMDD.jsonl`（只记元数据）。`Ctrl+C` 退出前会先结算最后一个窗口。
-
-**4）本地 Web 控制台一站式操作**（数据不出本机）：
-
-```bash
-npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
-```
+逐请求盯什么、评分卡长什么样，见下文「Guard：本地常驻监控」。
 
 ### 结果怎么读
 
@@ -394,7 +392,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 ### Guard：本地常驻监控（P2）
 
-`guard` 启动一个本地透明转发代理，盯**真实流量**而不是一次性探测（启动命令见「常用场景 3」）。逐请求盯什么：
+`guard` 启动一个本地透明转发代理，盯**真实流量**而不是一次性探测（启动命令见上文「命令行运行（可选）」）。逐请求盯什么：
 
 - **模型一致性** —— 请求的 `model` 与端点实际应答的模型不一致，立即告警（`model_mismatch`）。比较前先归一（小写、去掉 `. _ - /` 分隔符），因为中转站常把同一 id 改写（`glm-5.3-flash` → `glm-5-3-flash`）；族名或版本号不同仍然照报。
 - **Token 记账** —— 解析 SSE/JSON 响应里的 `usage`（字节原样透传）；token 为负或分项对不上报 `usage_invalid`。响应里带 `cached_tokens` / `reasoning_tokens` 明细时会一并捕获入账。
@@ -414,7 +412,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 - **掺假（换壳 / 轻量版冒充）**：用同家族的轻量版顶替旗舰模型——例如拿 `glm-5.3-flash` 冒充 `glm-5.3`。文档、模型自述、日常问答看起来都正常，常规使用极难察觉；只有对照「请求的模型名 vs 端点自述身份 / 应答指纹」的探针才抓得住。
 - **偷调倍率**：标价看着正常，后台却悄悄设一个不太夸张的倍率（如 1.5×）——单笔账单金额不大、倍率「不离谱」，靠肉眼对账单几乎发现不了；只有绝对对账——实测扣费 ÷（宣称价格 × 自报 usage）——才能定论。
 
-建议优先用 Web 控制台（`npm run ui`）而不是裸命令行：页面里可以**可视化勾选**宣称能力（视觉 / 工具调用 / 推理）、填宣称上下文窗口、录入宣称价格（输入/输出单价，可选缓存读与长上下文二档阶梯价）、固定 seed 复测、加增强样本——**你声明得越全，探针跑得越彻底**。手写 CLI 参数容易写错格式（漏项、拼错、分隔符不对），勾错/漏勾宣称能力会让对应探针直接按「未宣称」放行或误报——用页面勾选能从源头避免这类格式问题造成的检测不准。计费核价只在录入宣称价格后启用，想抓倍率就必须填价格。
+推荐用 Web 控制台实测（见「Web 控制台」）：页面**可视化勾选**宣称能力、录入标称价格——声明得越全，探针跑得越深，且页面勾选能避免手写 CLI 参数的格式错误（漏项、拼错、分隔符不对）：勾错或漏勾宣称能力会让对应探针直接按「未宣称」放行或误报，从源头造成检测不准。计费核价只在录入宣称价格后启用，想抓倍率就必须填价格。
 
 真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实测倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。
 
@@ -432,7 +430,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 注意：
 
-- `guard` 透明代理仅命令行可用（启动方式见「常用场景 3」）：它要求客户端 key 与 `MODEL_XRAY_KEY` 完全一致，适合长期盯真实流量，也是当前唯一的长期监控路径（控制台内的实时用量/告警面板随「API 聚合」一并暂未上线，后需迭代）；控制台不托管 guard 进程。
+- `guard` 透明代理仅命令行可用（启动方式见上文「命令行运行（可选）」）：它要求客户端 key 与 `MODEL_XRAY_KEY` 完全一致，适合长期盯真实流量，也是当前唯一的长期监控路径（控制台内的实时用量/告警面板随「API 聚合」一并暂未上线，后需迭代）；控制台不托管 guard 进程。
 - 服务只绑定 127.0.0.1；所有写操作 API 都要求携带注入页面的会话 token。报告文件仅从 `reports/` 提供，带扩展名白名单与路径穿越防护。
 - key 只存于本地服务进程（或环境变量 `MODEL_XRAY_KEY`）；key 栏仅位于「模型检测」页；绝不写日志（敏感串脱敏）、绝不出现在命令预览里。
 - 旧的纯静态轻壳已移除；若页面脱离本地服务直接打开，会降级为只读提示（仍可预览可复制命令）。
