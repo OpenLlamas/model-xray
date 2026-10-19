@@ -64,10 +64,10 @@ function isNegated(text: string, index: number, length: number): boolean {
   // 「not only/not just/isn't just」「不只/不仅」是强调而非否认（"I am not only OpenAI" 仍与
   // openai 关联），若当否定处理会把真实族归属漏判，削弱换壳检测——先于否定分支排除。
   const notOnly = /\b(?:not|n['’]t)\s+(?:only|just|merely)\b[^,;.!?\n]{0,24}$/i.test(seg) || /(?:不只|不仅)/.test(seg);
-  // 前缀否定：分句尾部的 not/never 或缩写式 n't（如 "I am not "、"不是"、"并非…"）
+  // 前缀否定：分句尾部的 not/never 或缩写式 n't（如 "I am not "）、"不是/并非/不叫…"）
   if (!notOnly && /\b(?:not|never)\b[^,;.!?\n]{0,24}$/i.test(seg)) return true;
   if (!notOnly && /[a-z]['’]t\b[^,;.!?\n]{0,24}$/i.test(seg)) return true;
-  if (!notOnly && /(?:不是|并非|否认)[^，,。;；!?！？\n]{0,12}$/.test(seg)) return true;
+  if (!notOnly && /(?:不是|并非|不叫|否认)[^，,。;；!?！？\n]{0,12}$/.test(seg)) return true;
   if (!notOnly && /非\s*$/.test(seg)) return true;
   // 后缀否定：「X is not me / OpenAI is not this model / 不是本模型」等形式
   if (/\b(?:is|are|was|were)(?:\s+not|\s*n['’]t|n['’]t)\s+(?:me|this\s+(?:ai\s+)?model|my\s+(?:ai\s+)?model)\b/i.test(after)) return true;
@@ -252,6 +252,122 @@ function extractClaimedVersion(text: string): string | null {
 /** 提取文本中全部 X.Y(.Z) 版本号（lowercase 集合，交集比较用）。 */
 function extractComparableVersions(text: string): Set<string> {
   return new Set((text.match(COMPARABLE_VERSION_RE) ?? []).map((v) => v.toLowerCase()));
+}
+
+// —— 自述具体型号后缀比对（审计钉 ⑤：glm-5.3 实际是 glm-5.3-flash 的核心取证面）——
+// 场景：中转把请求模型换成同族更轻变体（glm-5.3 → glm-5.3-flash、gpt-4.1 → gpt-4.1-mini）。
+// 族指纹（glm）一致、X.Y 版本号一致，既有族/版本判定全部失明；唯一暴露面是自述带出了
+// 具体变体名。判定只比对「族前缀 + 版本锚点 + 变体段」这一精确形态，避免全文字符串猜测。
+
+/**
+ * 目标模型名解析（vendor 剥离 + 小写）：族前缀（可含字母段，如 claude-3）、X.Y(.Z) 版本锚点、
+ * 可选变体段。无 X.Y 版本（gpt-4o、claude-3-5 整名无小数点）返回 null——该形态无版本锚点，
+ * 变体比对无从谈起，换壳检测由回显字段与族指纹兜底，不做无锚点猜测。
+ */
+const TARGET_IDENTITY_RE = /^([a-z][a-z0-9]*(?:-[a-z][a-z0-9]*)*?)[-\s]?(\d+(?:\.\d+)?)(?:[-\s]([a-z][a-z0-9]{0,15}))?$/;
+
+interface TargetModelIdentity {
+  prefix: string;
+  version: string;
+  variant: string | null;
+}
+
+function parseTargetModelIdentity(model: string): TargetModelIdentity | null {
+  const m = stripVendorPrefix(model).trim().toLowerCase().match(TARGET_IDENTITY_RE);
+  if (m === null) return null;
+  const prefix = m[1] ?? '';
+  const version = m[2] ?? '';
+  if (prefix === '' || version === '') return null;
+  return { prefix, version, variant: m[3] ?? null };
+}
+
+/** 正则转义（动态拼装 claimed 匹配正则用：候选文本不直接进 RegExp 字符类，仅整体转义）。 */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** claimed 侧匹配正则：族前缀 + 分隔符等价版本号（glm-5.3 / glm 5.3 / GLM-5-3 均命中）+ 可选变体段。
+ * 变体段分隔符只认 [-._]（不含空白）：「GLM-5.3 by Zhipu」里变体组若允许空白会吞掉
+ * 后续普通英文词（by/from/made）产出「变体 by」假冲突（红队实证于 2026-10-19 用例）。 */
+function buildClaimedModelPattern(identity: TargetModelIdentity): RegExp {
+  const versionPattern = escapeRegExp(identity.version).replace(/\\\./g, '[.\\-_\\s]?');
+  return new RegExp(
+    `${escapeRegExp(identity.prefix)}[-\\s]?${versionPattern}(?:[-._]([a-z][a-z0-9]{0,15}))?`,
+    'gi',
+  );
+}
+
+/** 变体段归一：去 benign 滚动别名尾缀与裸别名词（latest/preview/…）后的比较形态；
+ * 剥空视为无变体声明（与回显判定 BENIGN_ALIAS_SUFFIXES 同口径，不诬告）。 */
+function normalizeClaimedVariant(variant: string): string {
+  let v = variant.toLowerCase().trim();
+  for (;;) {
+    const m = v.match(/^(.*)-(latest|preview|beta|exp|experimental)$/);
+    if (m === null) break;
+    v = m[1] ?? '';
+  }
+  if (/^(latest|preview|beta|exp|experimental)$/.test(v)) return '';
+  return v;
+}
+
+/** 不确定语境（本分句内）：模型自己也经常拿不准身份，不确定声明不构成矛盾证据。 */
+const UNCERTAINTY_CLAUSE_RE = /可能|大概|也许|或许|不确定|也许|maybe|perhaps|might\s+be|could\s+be|猜/i;
+
+interface ClaimedVariantScan {
+  /** 各冲突变体命中的样本（key=归一化变体名，value=样本 evidenceId 列表） */
+  conflicts: Map<string, string[]>;
+  /** 冲突样本总数（每样本至多计 1 次） */
+  conflictSamples: number;
+  /** 精确版本题是否命中冲突 */
+  exactQuestionConflict: boolean;
+  /** 目标带变体但自述只认领族+版本（更窄声明，如 glm-5.3-flash 自述 glm-5.3）的样本数 */
+  narrowerClaims: number;
+  /** 全部捕获到的自述具体型号展示形态（去重） */
+  claimedDisplays: Set<string>;
+}
+
+function scanClaimedVariants(
+  samples: readonly IdentitySample[],
+  identity: TargetModelIdentity,
+): ClaimedVariantScan {
+  const pattern = buildClaimedModelPattern(identity);
+  const scan: ClaimedVariantScan = {
+    conflicts: new Map(),
+    conflictSamples: 0,
+    exactQuestionConflict: false,
+    narrowerClaims: 0,
+    claimedDisplays: new Set(),
+  };
+  for (const sample of samples) {
+    const text = sample.result.text;
+    let sampleConflict = false;
+    for (const match of text.matchAll(pattern)) {
+      const index = match.index ?? -1;
+      if (index < 0) continue;
+      // 否定语境（复用族判定的分句否定检测）与不确定语境都不构成自报身份
+      if (isNegated(text, index, match[0].length)) continue;
+      const clause =
+        text.slice(0, index + match[0].length).split(/[，,。;；!?！？\n]/).pop() ?? text;
+      if (UNCERTAINTY_CLAUSE_RE.test(clause)) continue;
+      const claimed = match[0].replace(/\s+/g, ' ').trim();
+      scan.claimedDisplays.add(claimed);
+      const variant = normalizeClaimedVariant(match[1] ?? '');
+      if (variant === identity.variant) continue; // 变体一致：同型号自述，正常
+      if (variant === '') {
+        // 目标带变体、自述只认领族+版本：可能是简写，也可能是自述被「提升」为旗舰名——
+        // 不诬告优先，单独计数披露，不进冲突。
+        if (identity.variant !== null) scan.narrowerClaims += 1;
+        continue;
+      }
+      sampleConflict = true;
+      const evidence = scan.conflicts.get(variant) ?? [];
+      evidence.push(sample.evidenceId);
+      scan.conflicts.set(variant, evidence);
+      if (sample.question === EXACT_VERSION_QUESTION) scan.exactQuestionConflict = true;
+    }
+    if (sampleConflict) scan.conflictSamples += 1;
+  }
+  return scan;
 }
 
 // —— 人格注入检测（F2，v0.2.2 起）——
@@ -724,6 +840,45 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       });
       score = Math.min(score, 90);
       if (level === 'pass') level = 'warn';
+    }
+  }
+  // —— 自述具体型号后缀比对（审计钉 ⑤）：族+版本一致但变体不一致 = 同族异版本换壳的自述证据。
+  //    场景：请求 glm-5.3 实际服务 glm-5.3-flash——族指纹与 X.Y 版本号全部一致，既有判定失明，
+  //    唯一暴露面是自述带出的具体变体名（精确版本题与随机题的多源一致性）。
+  const targetIdentity = parseTargetModelIdentity(ctx.cfg.model);
+  if (targetIdentity !== null) {
+    const scan = scanClaimedVariants(samples, targetIdentity);
+    metrics['claimed_variant_conflicts'] = scan.conflictSamples;
+    metrics['claimed_variants'] = scan.claimedDisplays.size > 0 ? [...scan.claimedDisplays].sort().join('/') : 'none';
+    if (scan.narrowerClaims > 0) metrics['claimed_narrower_claims'] = scan.narrowerClaims;
+    // 触发口径（不诬告优先）：精确版本题 1 次冲突（专门提问的直接回答），或 ≥2 条样本自述
+    // 同一个冲突变体（多源一致）；零散不同变体各 1 次只 info 披露不定罪。
+    const consistentVariant = [...scan.conflicts.values()].some((ids) => ids.length >= 2);
+    if (scan.exactQuestionConflict || consistentVariant) {
+      const variants = [...scan.conflicts.entries()].sort((a, b) => b[1].length - a[1].length).map(([v]) => v);
+      findings.push({
+        level: 'warn',
+        message: `请求模型 ${ctx.cfg.model}，自述具体型号为 ${variants.join('/')}：族与版本号一致但变体不一致，同族异版本（疑似降级/轻量版冒充；自述单独不定罪，需与回显/质量探针合看）。`,
+        evidenceIds: [...scan.conflicts.values()].flat(),
+      });
+      score = Math.min(score, 80);
+      if (level === 'pass') {
+        level = 'warn';
+        headline = `自述具体型号与请求不一致（请求 ${ctx.cfg.model}，自述 ${variants.join('/')}）：同族异版本，疑似降级换壳`;
+      }
+    } else if (scan.conflictSamples > 0) {
+      findings.push({
+        level: 'info',
+        message: `自述出现的具体型号变体（${[...scan.conflicts.keys()].join('/')}）与请求 ${ctx.cfg.model} 不一致，但各只出现 1 次、无多源一致性：仅披露不定罪。`,
+        evidenceIds: [...scan.conflicts.values()].flat(),
+      });
+    }
+    if (scan.narrowerClaims > 0) {
+      findings.push({
+        level: 'info',
+        message: `${scan.narrowerClaims} 条自述只认领到「族+版本」而无变体段（目标为 ${ctx.cfg.model}）：可能是简写或自述被改写为旗舰名，证据不足以指控。`,
+        evidenceIds: [],
+      });
     }
   }
   // d) 少量混合声明：未达多数告警线，但「目标族 + 其他族」同时出现仍不能算「未见异常」。

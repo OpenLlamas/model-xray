@@ -1,11 +1,11 @@
 import { basename } from 'node:path';
 import type { ChatMessage, Finding, Level, ProbeCtx, ProbeOutcome, RunConfig } from '../types.js';
 import { computeCostUsd, type ModelPrice } from '../gateway/pricing.js';
-import { estimateMessageTokens } from '../tokens.js';
+import { estimateMessageTokens, estimateTokens } from '../tokens.js';
 import { linearRegression, mean } from '../stats.js';
 import { failureDigest } from '../diagnostics.js';
 import { recordCall } from '../evidence.js';
-import { probeBalance, spendBetween, type BalanceReading } from '../balance.js';
+import { probeBalanceStable, spendBetween, type BalanceReading } from '../balance.js';
 import { decideTokenReference, type TokenReferenceDecision } from '../token-reference.js';
 import { PROBESET_VERSION } from '../assets.js';
 
@@ -22,6 +22,23 @@ const BILLING_MAX_TOKENS = 16;
  * 不得因缺绝对对账悬置为 insufficient。
  */
 const SHAPE_ONLY_SCORE = 85;
+
+/**
+ * 暗插固定 token 判定阈值：回归截距（x=0 外推的恒定项）超过该值即「与输入长度无关的恒定加计」。
+ * 依据：本地估算的模板开销 +4/消息，诚实中转/网关的系统提示与模板余量约 10-50 tokens；
+ * 120 以上的截距不可能由估算噪声产生（2026-10-19 图纸双审：r2≥0.9 才判，防非线性噪声外推失真）。
+ */
+const INTERCEPT_WARN_TOKENS = 120;
+
+/** 输出侧灌水判定：仅 en 轨道 Σcompletion_tokens / Σ本地估算 > 1.35 判疑似灌水（容忍 ±35% 估算误差）。 */
+const COMPLETION_INFLATE_RATIO = 1.35;
+/** 输出侧少报披露线（对用户有利方向仅 info 披露，不扣分）。 */
+const COMPLETION_UNDERREPORT_RATIO = 0.6;
+
+/** 自适应补采：单笔回声请求的目标 prompt token 数（比标准最大档大 2 倍，最大化单笔 Δ 抬升）。 */
+const TOPUP_PROMPT_TOKENS = 48000;
+/** 自适应补采笔数上限：窗口花费的硬性边界（另有按宣称价的美元预算守门）。 */
+const TOPUP_MAX_REQUESTS = 8;
 
 function resolveClaimedPrice(cfg: RunConfig): { price: ModelPrice | null; error: string | null } {
   const input = cfg.priceInput;
@@ -90,10 +107,14 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   }
   let expectedCost = 0;
   let ratioSamples = 0;
-  // 第一个计费请求之前查 balanceBefore（余额查询不是 chat 调用，不记 evidence）
-  const balanceBefore: BalanceReading | null = priceEnabled
-    ? await probeBalance(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
+  // 第一个计费请求之前查 balanceBefore：pre 快照同样做稳定化轮询，且必须「首比即稳」（polls≤2）。
+  // 窗口前未结算的消费在 pre 之后入账会混入 Δ 推高倍率 → 假 fail（post 侧误差方向是漏计、偏向诚实结论，
+  // pre 侧是诬告方向，不对称从严）：短窗内读数仍在动即视同起点不可靠，实测倍率按不可归因作废。
+  const balanceBeforeStable = priceEnabled
+    ? await probeBalanceStable(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
     : null;
+  const balanceBefore = balanceBeforeStable?.reading ?? null;
+  const balancePreClean = balanceBeforeStable !== null && balanceBeforeStable.settled && balanceBeforeStable.polls <= 2;
 
   interface Track {
     lang: 'en' | 'zh';
@@ -126,6 +147,15 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let completionZeroWithText = 0;
   let completionOverCap = 0;
   const completionAnomalyEvidenceIds: string[] = [];
+  /** 输出侧灌水比对（Σ可见 completion vs Σ正文本地估算）：仅采「可归因」样本——finish=stop 且
+   * 非空正文的样本，其可见 completion 理论上等于正文 token 数；length 截断样本的隐藏份额
+   * 不可知，一律排除（宁漏报不误报）；reasoning_tokens 是 completion 子集（真机实证中转对
+   * 普通复读也常报 1），按扣减推理份额归因。zh 轨 CJK 估算偏差（1字/token vs 实际 ~0.65）
+   * 使基线比值天然偏低，只披露不判定。 */
+  const completionSums: Record<'en' | 'zh', { reported: number; local: number; samples: number; excluded: number; evidenceIds: string[] }> = {
+    en: { reported: 0, local: 0, samples: 0, excluded: 0, evidenceIds: [] },
+    zh: { reported: 0, local: 0, samples: 0, excluded: 0, evidenceIds: [] },
+  };
   /** 窗口内发生重试的请求（attempts>1，含纯 429/503 网关拒绝后的干净重试）：仅作观测，不单独定罪 */
   let retriedRequests = 0;
   const retryEvidenceIds: string[] = [];
@@ -216,6 +246,22 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         completionOverCap += 1;
         completionAnomalyEvidenceIds.push(evidence.id);
       }
+      // 输出侧灌水比对采集：finish=stop + 非空正文 + completion>0 才计入对（见 completionSums 注释）。
+      // 归因口径：reasoning_tokens 是 completion 的子集（真机实证中转对普通复读也常报 1），
+      // 直接排除会令检查在真实中转上失明——改为扣减推理份额后比对可见部分。
+      {
+        const sums = completionSums[lang];
+        const reasoning = result.usage.reasoning_tokens ?? 0;
+        const visibleReported = completion - reasoning;
+        if (result.finishReason === 'stop' && completion > 0 && result.text.trim().length > 0 && visibleReported > 0) {
+          sums.reported += visibleReported;
+          sums.local += estimateTokens(result.text);
+          sums.samples += 1;
+          sums.evidenceIds.push(evidence.id);
+        } else {
+          sums.excluded += 1;
+        }
+      }
       // 浮点累加误差分析：本处求和至多 n=12 项（deep 档 12 笔计费请求），
       // IEEE754 双精度求和的相对误差上界 ≈ n·2⁻⁵³ ≈ 1.3e-15，
       // 与倍率判定阈值（0.5/0.8/1.1/1.5；相邻最小间隔 0.3）相差 14+ 个数量级，可忽略；
@@ -240,10 +286,99 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     }
   }
 
-  // 序列结束后查 balanceAfter
-  const balanceAfter: BalanceReading | null = priceEnabled
-    ? await probeBalance(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
+  // 自适应补采（top-up）：应缴金额低于余额最小刻度 3 倍时（如整数美分类余额端点 + 便宜模型，
+  // 应缴 $0.02 → 精度噪声支配倍率）decideRatio 必然 N/A——余额端点明明可用却测不出倍率。
+  // 主序列后、post 快照前追加最大档回声请求抬升 Δ 至可判定区间。守门（2026-10-19 图纸双审必修）：
+  // 仅窗口干净（无失败/无污染重试）且 pre 首比即稳、余额为 USD 口径、至少 1 个有效计价样本时才付费；
+  // 8 笔封顶 + 硬预算（按宣称价 3× 目标额，已含重试最坏放大）；预估到不了作废门槛则直接跳过
+  // （不为注定 N/A 的窗口付费）；补采中一旦出现不可归因事件（失败/污染重试/usage 缺失）立即停。
+  // 补采样本不进回归轨道/输出侧比对（固定档重复会破坏 x 分布），只进 Δ 与应缴金额。
+  let topupRequests = 0;
+  let topupExpected = 0;
+  let topupSkipped = false;
+  if (
+    priceEnabled &&
+    price !== null &&
+    ratioSamples > 0 &&
+    balanceBefore !== null &&
+    balancePreClean &&
+    balanceBefore.unit === 'USD' &&
+    Number.isFinite(balanceBefore.resolution) &&
+    (balanceBefore.resolution as number) > 0 &&
+    failures.length === 0 &&
+    contaminatingRetries === 0
+  ) {
+    const resolution = balanceBefore.resolution as number;
+    const gateFloor = 3 * resolution;
+    const target = 5 * resolution;
+    const budget = 3 * target;
+    if (expectedCost >= gateFloor && expectedCost < target) {
+      // 已过作废门只是略噪：不补采（省用户花费），维持现有判定
+    } else if (expectedCost < gateFloor) {
+      const topupBody = buildEnglish(TOPUP_PROMPT_TOKENS);
+      const topupPrompt = `请逐字复述下面这段文本，不要添加任何其他内容。\n\n${topupBody}\n\n（本段校验编号 ${ctx.rng.nonce(5)}）`;
+      const topupMessages: ChatMessage[] = [{ role: 'user', content: topupPrompt }];
+      const estPrompt = estimateMessageTokens(topupMessages);
+      const perReqExpected = computeCostUsd(
+        { prompt_tokens: estPrompt, completion_tokens: BILLING_MAX_TOKENS, cached_tokens: null },
+        price,
+      );
+      if (expectedCost + TOPUP_MAX_REQUESTS * perReqExpected < gateFloor) {
+        // 预检：8 笔全部有效也到不了作废门槛 → 补采注定无效，如实披露后放弃
+        topupSkipped = true;
+      } else {
+        let stopped = false;
+        while (!stopped && topupRequests < TOPUP_MAX_REQUESTS && expectedCost < target) {
+          if (topupExpected + 3 * perReqExpected > budget) break; // 硬预算守门（含重试最坏 ×3）
+          const result = await ctx.client.chat({
+            model: ctx.cfg.model,
+            messages: topupMessages,
+            temperature: 0,
+            max_tokens: BILLING_MAX_TOKENS,
+            retryEmpty: false,
+          });
+          const evidence = recordCall(ctx.evidence, {
+            probe: 'billing',
+            label: `billing topup ${topupRequests + 1} target=${TOPUP_PROMPT_TOKENS}`,
+            request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: BILLING_MAX_TOKENS, messages: topupMessages },
+            result,
+          });
+          topupRequests += 1;
+          requests += 1;
+          if (result.attempts > 1) {
+            retriedRequests += 1;
+            retryEvidenceIds.push(evidence.id);
+          }
+          if (!result.ok) {
+            failures.push(`topup@${TOPUP_PROMPT_TOKENS}: ${result.error ?? 'error'}`);
+            failureErrors.push(result.error ?? 'error');
+            failureEvidenceIds.push(evidence.id);
+            stopped = true; // 窗口已被污染，后续补采注定 N/A，立即停
+          } else if (result.contaminatingRetry === true) {
+            contaminatingRetries += 1;
+            contaminatingEvidenceIds.push(evidence.id);
+            stopped = true;
+          } else if (!result.usage) {
+            usageMissing += 1; // ratioDropped → 保守 info，不再为注定降级的窗口付费
+            stopped = true;
+          } else {
+            const cost = computeCostUsd(result.usage, price);
+            expectedCost += cost;
+            ratioSamples += 1;
+            topupExpected += cost;
+          }
+        }
+      }
+    }
+  }
+
+  // 序列结束后查 balanceAfter：post 快照做稳定化轮询（异步结算延迟下单次读数会让 Δ 偏小、
+  // 把诚实站点误判成低报倍率；连续两次一致才认稳定，仍不稳定则 Δ 判不可归因，见下方污染闸）。
+  const balanceAfterStable = priceEnabled
+    ? await probeBalanceStable(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
     : null;
+  const balanceAfter = balanceAfterStable?.reading ?? null;
+  const balancePostSettled = balanceAfterStable?.settled ?? null;
   const spendDelta = balanceBefore !== null && balanceAfter !== null ? spendBetween(balanceBefore, balanceAfter) : null;
   if (priceEnabled) {
     const reading = balanceBefore ?? balanceAfter;
@@ -257,8 +392,17 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     metrics['balance_endpoint'] = reading ? reading.endpoint : null;
     metrics['balance_unit'] = reading ? reading.unit : null;
     metrics['balance_resolution'] = reading && Number.isFinite(reading.resolution) ? (reading.resolution as number) : null;
+    metrics['balance_conversion'] = reading?.conversionNote ?? null;
     metrics['balance_before'] = balanceBefore ? balanceBefore.value : null;
     metrics['balance_after'] = balanceAfter ? balanceAfter.value : null;
+    metrics['balance_pre_settled'] = balanceBeforeStable ? (balancePreClean ? 1 : 0) : null;
+    metrics['balance_pre_polls'] = balanceBeforeStable?.polls ?? null;
+    metrics['balance_post_settled'] = balancePostSettled === null ? null : balancePostSettled ? 1 : 0;
+    metrics['balance_post_polls'] = balanceAfterStable?.polls ?? null;
+    metrics['balance_scope'] = balanceBefore ? (balanceBefore.endpoint === '/api/user/self' ? 'user' : 'key') : null;
+    metrics['billing_topup_requests'] = topupRequests;
+    metrics['billing_topup_expected_usd'] = round(topupExpected);
+    if (topupSkipped) metrics['billing_topup_skipped'] = 1;
     metrics['spend_delta'] = spendDelta;
     metrics['expected_cost'] = round(expectedCost);
     metrics['ratio_samples'] = ratioSamples;
@@ -311,6 +455,40 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     score = Math.min(score, 70);
     level = escalate(level, 'warn');
     if (level !== 'fail') headline = 'completion_tokens 与响应正文/请求上限矛盾，输出侧计费异常';
+  }
+
+  // 输出侧灌水判定（en 轨道，≥3 个可归因样本；zh 仅披露，见 completionSums 注释）。
+  const enSums = completionSums.en;
+  const completionRatioEn = enSums.samples >= 3 && enSums.local > 0 ? enSums.reported / enSums.local : null;
+  metrics['completion_ratio_en'] = completionRatioEn !== null && Number.isFinite(completionRatioEn) ? round(completionRatioEn) : 'N/A';
+  metrics['completion_pair_samples_en'] = enSums.samples;
+  metrics['completion_excluded_en'] = enSums.excluded;
+  const zhSums = completionSums.zh;
+  metrics['completion_ratio_zh'] =
+    zhSums.samples > 0 && zhSums.local > 0 && Number.isFinite(zhSums.reported / zhSums.local)
+      ? round(zhSums.reported / zhSums.local)
+      : 'N/A';
+  metrics['completion_pair_samples_zh'] = zhSums.samples;
+  metrics['completion_excluded_zh'] = zhSums.excluded;
+  if (completionRatioEn !== null && Number.isFinite(completionRatioEn)) {
+    if (completionRatioEn > COMPLETION_INFLATE_RATIO) {
+      findings.push({
+        level: 'warn',
+        message: `输出侧 completion 合计为正文本地估算的 ×${round(completionRatioEn)}（${enSums.samples} 笔可见 completion 合计 ${enSums.reported} vs 估算合计 ${enSums.local}）：疑似输出 token 灌水。本地估算按 ASCII 4 字符/token（非精确 tokenizer），仅判定 35% 以上的系统性偏大；截断（finish=length）样本已排除，推理份额已按 reasoning_tokens 扣减。`,
+        evidenceIds: [...enSums.evidenceIds],
+      });
+      score = Math.min(score, 70);
+      level = escalate(level, 'warn');
+      if (level !== 'fail' && headline === defaultHeadline) {
+        headline = `输出侧 completion_tokens 为正文估算的 ×${round(completionRatioEn)}，疑似输出 token 灌水`;
+      }
+    } else if (completionRatioEn < COMPLETION_UNDERREPORT_RATIO) {
+      findings.push({
+        level: 'info',
+        message: `输出侧 completion 合计仅为正文本地估算的 ×${round(completionRatioEn)}：少报方向对用户有利，仅披露不扣分（估算口径见 metrics.completion_ratio_en）。`,
+        evidenceIds: [...enSums.evidenceIds],
+      });
+    }
   }
 
   if (contaminatingRetries > 0) {
@@ -386,6 +564,20 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
           evidenceIds: [...track.evidenceIds],
         });
       }
+      // 暗插固定 token 判定：回归斜率正常（等比缩放/计数缩放不可见）时，恒定加计只体现在截距上。
+      // 仅在线性拟合成立（r2≥0.9）时判——非线性噪声下 x=0 外推不可信（图纸双审必修守卫）。
+      if (Number.isFinite(reg.r2) && reg.r2 >= 0.9 && Number.isFinite(reg.intercept) && reg.intercept > INTERCEPT_WARN_TOKENS) {
+        findings.push({
+          level: 'warn',
+          message: `${track.lang} 轨道回归截距 ${round(reg.intercept)} tokens（>${INTERCEPT_WARN_TOKENS}）：各长度档都被恒定加计与输入长度无关的固定 token，疑似暗插系统提示/网关模板固定开销（斜率 ${round(reg.slope)} 正常，等比形状检查无法发现该项）。`,
+          evidenceIds: [...track.evidenceIds],
+        });
+        score = Math.min(score, 70);
+        level = escalate(level, 'warn');
+        if (level !== 'fail' && headline === defaultHeadline) {
+          headline = `usage 回归截距 ${round(reg.intercept)} tokens（${track.lang} 轨道）：疑似暗插固定 token`;
+        }
+      }
     }
     const enTrack = tracks.find((t) => t.lang === 'en') as Track;
     const zhTrack = tracks.find((t) => t.lang === 'zh') as Track;
@@ -448,6 +640,29 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (failures.length > 0) {
     contaminationReasons.push(`审计窗口内存在 ${failures.length} 笔失败请求（提示 token 可能已被计费但 usage 未知，应缴金额分母不完整）`);
   }
+  if (balancePostSettled === false) {
+    contaminationReasons.push(
+      `序列结束后的余额读数在 ${balanceAfterStable?.polls ?? 0} 次轮询内仍在变化（异步结算延迟或账户级并发流量），Δ扣费无法归因到本次窗口`,
+    );
+  }
+  if (balanceBeforeStable !== null && !balancePreClean) {
+    contaminationReasons.push(
+      `序列开始前的余额读数未即时稳定（${balanceBeforeStable.polls} 次读数仍在变化）：窗口前存在未结算消费或账户级并发流量，Δ起点不可靠，混入旧账会推高倍率`,
+    );
+  }
+  if (topupRequests > 0) {
+    findings.push({
+      level: 'info',
+      message: `应缴金额低于余额最小刻度 3 倍（精度噪声门），已自动补采 ${topupRequests} 笔采样抬升 Δ 至可判定区间：按宣称价预计追加 $${round(topupExpected)}（补采请求已计入审计窗口，真实扣费计入 Δ、声明费计入应缴金额；8 笔与 3× 目标额预算双封顶）。`,
+      evidenceIds: [],
+    });
+  } else if (topupSkipped) {
+    findings.push({
+      level: 'info',
+      message: `应缴金额 ${round(expectedCost)} 低于余额最小刻度 3 倍，且按 ${TOPUP_MAX_REQUESTS} 笔补采上限预估仍无法达到可判定门槛，跳过补采（不为注定 N/A 的窗口付费），实测倍率按精度噪声作废。`,
+      evidenceIds: [],
+    });
+  }
   let ratioDecision: RatioDecision | null;
   if (priceEnabled && contaminationReasons.length > 0) {
     metrics['ratio_contaminated'] = 1;
@@ -471,6 +686,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
           expectedCost,
           ratioDropped: usageMissing,
           regressionLevel,
+          scope: balanceBefore?.endpoint === '/api/user/self' ? 'user' : 'key',
         })
       : null;
   }
@@ -596,6 +812,13 @@ export interface RatioArgs {
   expectedCost: number;
   ratioDropped: number;
   regressionLevel: Level;
+  /**
+   * 余额口径：'key' = key/请求级端点（new-api /api/usage/token、dashboard 类）；
+   * 'user' = 用户级端点（/api/user/self，该用户全部 key 共享）。用户级口径下其他 key 的
+   * 离散消费可把 Δ 推入 (1.5,10] 区间——>10 不可归因门兜不住（2026-10-19 图纸双审必修），
+   * 故该来源禁出 fail（降为 warn + 披露），定论级指控只允许 key 级口径。缺省按 'key'。
+   */
+  scope?: 'key' | 'user';
 }
 
 export interface RatioDecision {
@@ -617,6 +840,7 @@ export interface RatioDecision {
  */
 export function decideRatio(args: RatioArgs): RatioDecision | null {
   const { before, after, spendDelta, expectedCost, ratioDropped, regressionLevel } = args;
+  const scope = args.scope ?? 'key';
   // 证据不足一律 N/A + info，不加罚
   if (before === null || after === null) {
     return na('余额端点不可用或返回未知 schema（如 /dashboard/billing/usage 的 total_usage 非整数美分）：无法建立可比余额读数，实测倍率无法验证（中转站可通过禁用/改写余额接口规避此项，建议在其后台人工核对）。');
@@ -709,6 +933,19 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
   if (regressionLevel === 'fail') {
     // usage 回归失败 → usage 虚增只会压小 ratio，ratio 是真实倍率的下限
     if (ratio > 1.5) {
+      if (scope === 'user') {
+        return {
+          verdict: 'warn',
+          maskedVerdict: 'fail',
+          cap: 70,
+          ratio,
+          finding: {
+            level: 'warn',
+            message: `实测倍率 ${round(ratio)} > 1.5，但余额来源为用户级口径（/api/user/self，该用户全部 key 共享 Δ）：无法排除其他 key 并发消费混入，按不诬告原则降为 warn（底层档位 fail 仅记录于 metrics），建议以 key 级余额端点复测。`,
+            evidenceIds: [],
+          },
+        };
+      }
       return {
         verdict: 'fail',
         maskedVerdict: null,
@@ -734,6 +971,19 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
     };
   }
   if (ratio > 1.5) {
+    if (scope === 'user') {
+      return {
+        verdict: 'warn',
+        maskedVerdict: 'fail',
+        cap: 70,
+        ratio,
+        finding: {
+          level: 'warn',
+          message: `实测倍率 ${round(ratio)} > 1.5：实际扣费显著高于按宣称价格与自报 usage 的应缴金额；但余额来源为用户级口径（/api/user/self，该用户全部 key 共享 Δ），无法排除其他 key 并发消费混入，按不诬告原则降为 warn（底层档位 fail 仅记录于 metrics），建议以 key 级余额端点复测。`,
+          evidenceIds: [],
+        },
+      };
+    }
     return {
       verdict: 'fail',
       maskedVerdict: null,

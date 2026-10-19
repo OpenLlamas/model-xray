@@ -95,3 +95,20 @@ test('质量漂移：seed 不同 → 该项跳过且不产出任何质量 notes'
   assert.equal(diff.items.filter((i) => i.probeId === 'quality').length, 0);
   assert.equal(diff.notes.filter((n) => n.includes('质量')).length, 0);
 });
+
+test('质量漂移：metricVersion 口径不同（旧两次机会 vs pass@1）→ 跳过质量对比并注明，不产出扣分项', () => {
+  // 2026-10-19 pass@1 改口径：旧基线 accuracy 是两次机会口径，混比会把「复采样恢复」
+  // 误读成漂移（基线 0.5 两次机会 ≈ pass@1 0.58 时更是反向假漂移）——必须跳过。
+  const oldBaseline = { ...base(0.5, 6, 12), quality: { accuracy: 0.5, mainCorrect: 6, mainTotal: 12 } };
+  const current = { ...base(0.42, 5, 12), quality: { accuracy: 0.42, mainCorrect: 5, mainTotal: 12, metricVersion: 'pass1' } };
+  const diff = diffBaseline(oldBaseline, current);
+  assert.equal(diff.comparable, true, '其余维度仍可比');
+  assert.equal(diff.items.filter((i) => i.probeId === 'quality').length, 0);
+  assert.ok(diff.notes.some((n) => /口径与本次不同|重建基线/.test(n)), JSON.stringify(diff.notes));
+  // 同口径（双 pass1）→ 正常比较（此处 50% → 42% 降幅 8% < 15% → 无项）
+  const same = diffBaseline(
+    { ...oldBaseline, quality: { accuracy: 0.5, mainCorrect: 6, mainTotal: 12, metricVersion: 'pass1' } },
+    current,
+  );
+  assert.equal(same.items.filter((i) => i.probeId === 'quality').length, 0);
+});

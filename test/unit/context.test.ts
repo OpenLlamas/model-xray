@@ -138,7 +138,8 @@ test('context: 仅 1 个有效 needle 样本（其余空流）→ insufficient�
 });
 
 test('context: 25% 档 1/3 未命中（其余全部命中 + 结尾回显通过）→ warn 55，不判「窗口不实」', async () => {
-  const { client } = scriptedContextClient((index) => (index === 1 ? 'miss' : 'hit'), 'auto');
+  // 降序执行：0..2=90%、3..5=75%、6..8=50%、9..11=25%；25% 档第 2 个样本未命中
+  const { client } = scriptedContextClient((index) => (index === 10 ? 'miss' : 'hit'), 'auto');
   const outcome = await probeContext(makeCtx(client));
   assert.equal(outcome.status, 'ok');
   assert.equal(outcome.level, 'warn', `稀疏样本不得定罪：${outcome.headline}`);
@@ -151,7 +152,8 @@ test('context: 25% 档 1/3 未命中（其余全部命中 + 结尾回显通过�
 
 test('context: 25% 档整档零命中 + 结尾回显通过 → fail 15（头部被裁剪的指纹仍能检出）', async () => {
   // 头部被裁剪指纹：25% 档首轮 0/3、确认性复采仍 0/3（共 0/6），高深度与结尾回显全部正常
-  const script = [0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0];
+  // 降序执行：0..8（90%/75%/50%）全命中；9..11=25% 档全 miss；12..14=25% 确认性复采全 miss
+  const script = [1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0];
   const { client, requests } = scriptedContextClient((index) => (script[index]! > 0 ? 'hit' : 'miss'), 'auto');
   const outcome = await probeContext(makeCtx(client));
   assert.equal(outcome.level, 'fail');
@@ -163,11 +165,11 @@ test('context: 25% 档整档零命中 + 结尾回显通过 → fail 15（头部�
 });
 
 test('context: 高深度命中率随深度单调下降（保留尾部型截断）→ 确认性复采复现后 fail 10', async () => {
-  // 25% 3/3；50%/75% 各 1/3；90% 0/3 → 全部高深度档命中率低于低深度档且 ≥2 档有未命中
+  // 降序执行：25% 3/3；90%/75%/50% 各 0/3 → 全部高深度档命中率低于低深度档且 ≥2 档有未命中
   // 非 --deep（n=3）需确认性复采：复采同样按退化作答才定罪（miss_pattern 记 *_confirmed）
-  // 首轮 12 个样本：25% 3/3，三个高深度档各 0/3；复采 90%（0/3）、75%（0/3）、基线 25%（3/3）
+  // 复采按降序可疑档 [90%,75%] + 基线 25%：90%（0/3）、75%（0/3）、25%（3/3）
   // → 基线复核后 6/6，两档 0/6：Fisher 精确检验 P=1/924，Bonferroni×3 后仍 ≤ α=0.01 → 定罪
-  const script = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1];
+  const script = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0, 1, 1, 1];
   const { client } = scriptedContextClient((index) => (script[index]! > 0 ? 'hit' : 'miss'), 'auto');
   const outcome = await probeContext(makeCtx(client));
   assert.equal(outcome.level, 'fail', outcome.headline);
@@ -177,9 +179,9 @@ test('context: 高深度命中率随深度单调下降（保留尾部型截断�
 });
 
 test('context: 单调恶化首轮信号经确认性复采不复现 → 降为 warn 55，不定罪', async () => {
-  // 首轮：25% 3/3、三个高深度档各 0/3（看似整档不可读）；复采 25%（再 0/3）与 50%（全命中）
+  // 降序首轮：25% 3/3、三个高深度档各 0/3（看似整档不可读）；复采 90%（全命中）、75%（全命中）、25%（再 0/3）
   // → 合并后低深度 3/6 与 50% 3/6 不再分出高低，整档零命中档位未复核 → 判为注意力噪声
-  const script = [1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1];
+  const script = [0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1];
   const { client } = scriptedContextClient((index) => (script[index]! > 0 ? 'hit' : 'miss'), 'auto');
   const outcome = await probeContext(makeCtx(client));
   assert.equal(outcome.level, 'warn', `复采不复现不得定罪：${outcome.headline}`);
@@ -197,9 +199,9 @@ test('context: 孤立零星未命中（浅档 2/3 + 最深档 2/3，中间档全
 
 test('context: 400 尺寸类显式拒绝 → fail 15（差分验证通过后才成立）', async () => {
   const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
-  // 索引 0..2 = 25% 档命中；3..11 = 深档全部 400；12/13 = 差分短输入对照（512/1024 tokens，需均成功）；
-  // 14 = 最小被拒深度（25%）的配对长样本复验（须仍被拒，400 可复现才算与长度相关）
-  const { client } = scriptedContextClient((index) => (index < 3 || (index >= 12 && index <= 13) ? 'hit' : tooLong()), tooLong());
+  // 降序：0..8 = 90%/75%/50% 档整档 400；9..11 = 25% 档命中；12/13 = 差分短输入对照（512/1024 tokens，需均成功）；
+  // 14 = 最小被拒高深度档（50%）的配对长样本复验（须仍被拒，400 可复现才算与长度相关）
+  const { client } = scriptedContextClient((index) => (index < 9 || index === 14 ? tooLong() : 'hit'), tooLong());
   const outcome = await probeContext(makeCtx(client));
   assert.equal(outcome.level, 'fail', outcome.headline);
   assert.equal(outcome.score, 15);
@@ -210,11 +212,12 @@ test('context: 400 尺寸类显式拒绝 → fail 15（差分验证通过后才�
 
 test('context: 50% 档可读、75%/90% 整档 400 → 显式拒绝前沿从 75% 起成立，fail 15', async () => {
   const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
-  // 25%/50% 命中；75%/90% 整档 400；12/13 = 短输入对照成功；14 = 在最小整档被拒深度（75%）复验仍 400。
+  // 降序：0..2=90%、3..5=75% 整档 400；6..11=50%/25% 命中；12/13 = 短输入对照成功；
+  // 14 = 最小整档被拒高深度档（75%）复验仍 400。
   const { client } = scriptedContextClient((index) => {
+    if (index < 6) return tooLong();
     if (index >= 12 && index <= 13) return 'hit';
     if (index === 14) return tooLong();
-    if (index >= 6) return tooLong();
     return 'hit';
   }, tooLong());
   const outcome = await probeContext(makeCtx(client));
@@ -227,13 +230,12 @@ test('context: 50% 档可读、75%/90% 整档 400 → 显式拒绝前沿从 75% 
 
 test('context: 50% 档首样本偶发 400 后成功、75%/90% 整档 400 → 复验取 75% 前沿，不因 50% 偶发 400 漏判', async () => {
   const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
-  // 50% 首样本 400、同档其余成功；75%/90% 整档 400。
+  // 降序：0..5=90%/75% 整档 400；6=50% 首样本 400、7..8 同档命中；9..11=25% 命中。
   // 14 = 长样本复验：只有发到 75%（约 24000 tokens）才被拒；若错发到 50%（约 16000 tokens）会成功。
   // 这钉住复验长度必须取「首个整档被拒的高深度档」，而不是该档内任意一次 400 的最小深度。
   const { client } = scriptedContextClient((index, prompt) => {
-    if (index >= 12 && index <= 13) return 'hit';
     if (index === 14) return prompt.length > 22000 ? tooLong() : 'hit';
-    if (index === 3 || index >= 6) return tooLong();
+    if (index <= 6) return tooLong();
     return 'hit';
   }, tooLong());
   const outcome = await probeContext(makeCtx(client));
@@ -474,7 +476,7 @@ test('context: 部分深度空响应且仅一档命中 → insufficient（不得
   assert.equal(outcome.status, 'insufficient');
   assert.equal(outcome.score, null);
   assert.equal(outcome.level, 'unknown');
-  assert.equal(outcome.metrics['missing_depths'], '25%,90%');
+  assert.equal(outcome.metrics['missing_depths'], '90%,25%');
   assert.match(outcome.headline, /仅在 2\/4 个深度获得有效样本/);
   assert.equal(requests.length, 4, '覆盖不全时不得再发 90% 结尾回显');
   assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
@@ -493,16 +495,17 @@ test('context --deep: 部分深度全空 + 结尾回显空响应 → insufficien
       if (prompt.includes('结尾核对')) return hitResult('');
       const index = call;
       call += 1;
-      // --deep 每档 5 样本：0..4=25%、5..9=50%、10..14=75%、15..19=90%；20 起为边界扫描
-      if (index < 10 || index >= 20) return hitResult(nonceOf(prompt));
-      return hitResult('');
+      // --deep 每档 5 样本（降序）：0..4=90%、5..9=75% 空响应；10..19=50%/25% 命中；20 起边界扫描命中
+      if (index < 10) return hitResult('');
+      if (index < 20) return hitResult(nonceOf(prompt));
+      return hitResult(passphraseOf(prompt));
     },
   };
   const outcome = await probeContext(makeCtx(client, true));
   assert.equal(outcome.status, 'insufficient', outcome.headline);
   assert.equal(outcome.score, null);
   assert.equal(outcome.level, 'unknown');
-  assert.equal(outcome.metrics['missing_depths'], '75%,90%');
+  assert.equal(outcome.metrics['missing_depths'], '90%,75%');
   assert.match(outcome.headline, /结尾回显未取得/);
   assert.equal(call, 26, '边界扫描 3 步 × 2 位置应全部读取，且结论应为证据不足');
 });
@@ -519,20 +522,19 @@ test('context --deep: 部分深度无有效样本但其余深度与边界扫描�
       if (prompt.includes('结尾核对')) return hitResult(passphraseOf(prompt));
       const index = call;
       call += 1;
-      // --deep 每档 5 样本：0..4=25%、5..9=50% 命中；10..19=75%/90% 空响应；20 起边界扫描命中
-      if (index < 10) return hitResult(passphraseOf(prompt));
-      if (index < 20) return hitResult('');
+      // --deep 每档 5 样本（降序）：0..9=90%/75% 空响应；10..19=50%/25% 命中；20 起边界扫描命中
+      if (index < 10) return hitResult('');
       return hitResult(passphraseOf(prompt));
     },
   };
   const outcome = await probeContext(makeCtx(client, true));
   assert.equal(outcome.level, 'pass', outcome.headline);
   assert.equal(outcome.score, 100);
-  assert.equal(outcome.metrics['missing_depths'], '75%,90%');
-  assert.match(outcome.headline, /缺失 75%、90%/);
+  assert.equal(outcome.metrics['missing_depths'], '90%,75%');
+  assert.match(outcome.headline, /缺失 90%、75%/);
   assert.ok(!/needle 全部命中/.test(outcome.headline), outcome.headline);
   assert.ok(
-    outcome.findings.some((f) => f.level === 'info' && /没有有效 needle 样本/.test(f.message) && /75%、90%/.test(f.message)),
+    outcome.findings.some((f) => f.level === 'info' && /没有有效 needle 样本/.test(f.message) && /90%、75%/.test(f.message)),
     JSON.stringify(outcome.findings),
   );
 });
@@ -540,7 +542,8 @@ test('context --deep: 部分深度无有效样本但其余深度与边界扫描�
 test('context: 低成本 1 样本档的未命中只报疑似 warn，不直接判 fail', async () => {
   // 每档 1 样本时，低深度 0/1 + 高深度未命中曾被直接判「窗口不实」（10 分 fail）。
   // 单样本未命中是注意力噪声的高发区：低成本档只作筛查，定论必须 --context-samples 3/--deep。
-  const { client } = scriptedContextClient((index) => (index === 0 || index === 2 ? 'miss' : 'hit'), 'hit');
+  // 降序：0=90% 未命中 + 3=25% 未命中（低深度整档零命中 + 高深度未命中形态）
+  const { client } = scriptedContextClient((index) => (index === 0 || index === 3 ? 'miss' : 'hit'), 'hit');
   const ctx = makeCtx(client);
   ctx.cfg.contextSamples = 1;
   const outcome = await probeContext(ctx);
@@ -664,4 +667,148 @@ test('context ⑤: --deep 边界扫描完整走完（确定性证据）→ usage
   assert.equal(outcome.metrics['boundary_conclusive'], 1);
   assert.match(String(outcome.metrics['boundary'] ?? ''), /found=n\/a/);
   assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /实测最大输入仅/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+// ---------- 2026-10-19 降序执行：早停（0.9 档全中 + usage 校准可信）与 --context-budget-usd 软预算 ----------
+
+/** 命中所有 needle/echo（复述文档里的校验口令）且 usage 按本地估算 × scale 实算的客户端，带请求捕获。 */
+function capturedUsageClient(
+  scale: number | null,
+  override?: (index: number, req: ChatRequest, prompt: string) => ChatResult | undefined,
+): { client: OpenAIClient; requests: ChatRequest[] } {
+  const requests: ChatRequest[] = [];
+  let needleIndex = 0;
+  return {
+    requests,
+    client: {
+      baseUrl: 'http://127.0.0.1:0/v1',
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        requests.push(req);
+        const last = req.messages[req.messages.length - 1];
+        const prompt = typeof last?.content === 'string' ? last.content : '';
+        const isEcho = prompt.includes('结尾核对');
+        const custom = override?.(needleIndex, req, prompt);
+        if (!isEcho) needleIndex += 1;
+        if (custom !== undefined) return custom;
+        const aligned = estimateMessageTokens(req.messages);
+        const base = hitResult(passphraseOf(prompt));
+        const promptTokens = scale === null ? 10 : Math.round(aligned * scale);
+        return { ...base, usage: { prompt_tokens: promptTokens, completion_tokens: 5, total_tokens: promptTokens + 5 } };
+      },
+    },
+  };
+}
+
+test('context 早停：90% 档 2 发全中 + usage 校准可信 → 低深度档全部跳过，pass 100（3 请求）', async () => {
+  const { client, requests } = capturedUsageClient(1);
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.status, 'ok', outcome.headline);
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['early_stopped'], 1);
+  assert.equal(outcome.metrics['early_stopped_depths'], '75%,50%,25%');
+  assert.match(String(outcome.metrics['depth_hits']), /0\.9:2\/2/);
+  assert.match(String(outcome.metrics['depth_hits']), /0\.25:skipped/);
+  assert.equal(outcome.metrics['missing_depths'], undefined, '早停档不算缺失深度');
+  assert.equal(requests.length, 3, '90% 档 2 发 + 结尾回显 1 发，低档不再发送');
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /早停/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(outcome.headline.includes('低深度档早停'), outcome.headline);
+});
+
+test('context 早停不触发：usage 不可信（prompt_tokens=10）→ 4 档全发（不省任何发送量）', async () => {
+  const { client, requests } = capturedUsageClient(null);
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.metrics['early_stopped'], undefined);
+  assert.equal(requests.length, 9, '4 档 × 2 发 + 结尾回显，早停被 usage 不可信阻断');
+});
+
+test('context 早停不触发：90% 档有未命中 → 低档照常执行（低档证据保留）', async () => {
+  const { client, requests } = capturedUsageClient(1, (index, req) => {
+    if (index === 1) return hitResult('未找到相关记录');
+    const aligned = estimateMessageTokens(req.messages);
+    const prompt = req.messages[req.messages.length - 1];
+    const content = typeof prompt?.content === 'string' ? prompt.content : '';
+    return { ...hitResult(passphraseOf(content)), usage: { prompt_tokens: aligned, completion_tokens: 5, total_tokens: aligned + 5 } };
+  });
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 55);
+  assert.equal(outcome.metrics['early_stopped'], undefined);
+  assert.equal(requests.length, 9, '90% 档存在未命中 → 其余 3 档照常发送');
+});
+
+test('context 早停不触发：低成本单样本档（不足 2 发）→ 4 档全发', async () => {
+  const { client, requests } = capturedUsageClient(1);
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 1;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.metrics['early_stopped'], undefined);
+  assert.equal(requests.length, 5, '单样本档不发早停：4 档 + 回显');
+});
+
+test('context 早停不触发：90% 档有空响应（该档不干净）→ 低档照常执行', async () => {
+  const { client, requests } = capturedUsageClient(1, (index) => (index === 1 ? hitResult('') : undefined));
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.metrics['early_stopped'], undefined);
+  assert.equal(requests.length, 9, '90% 档混入空响应 → 该档不干净，不早停');
+});
+
+test('context --context-budget-usd：回显前预算耗尽（早停成立）→ pass 不得宣告，insufficient + 停发披露', async () => {
+  const { client, requests } = capturedUsageClient(1);
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  ctx.cfg.priceInput = 2;
+  ctx.cfg.priceOutput = 8;
+  ctx.cfg.contextBudgetUsd = 0.15; // 90% 档 2 发（约 0.06/发）后耗尽：回显预算停发
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.status, 'insufficient', outcome.headline);
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.equal(outcome.metrics['budget_stopped'], 1);
+  assert.equal(outcome.metrics['tail_echo'], 'budget-stopped');
+  assert.equal(requests.length, 2, '预算耗尽后不再发送任何请求（连结尾回也不发）');
+  assert.ok(outcome.headline.includes('预算上限'), outcome.headline);
+  assert.ok(outcome.findings.some((f) => /预算上限/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('context --context-budget-usd：needle 中途停发（90% 档有未命中）→ 已获证据的 warn 结论保留', async () => {
+  // 预算 0.2：90% 档 2 发（miss+hit）→ 75% 档首发后耗尽；低档与回显全部停发。
+  // 已得证据（90% 档 1/2 未命中）→ highMiss warn 55；warn 不是「窗口属实」宣告，预算停发不推翻它。
+  const { client, requests } = capturedUsageClient(null, (index) => (index === 0 ? hitResult('未找到相关记录') : undefined));
+  const ctx = makeCtx(client);
+  ctx.cfg.contextSamples = 2;
+  ctx.cfg.priceInput = 2;
+  ctx.cfg.priceOutput = 8;
+  ctx.cfg.contextBudgetUsd = 0.2;
+  const outcome = await probeContext(ctx);
+  assert.equal(outcome.status, 'ok', outcome.headline);
+  assert.equal(outcome.level, 'warn', '预算停发不影响已得未命中证据的 warn 结论');
+  assert.equal(outcome.score, 55);
+  assert.equal(outcome.metrics['budget_stopped'], 1);
+  assert.ok(typeof outcome.metrics['budget_est_spent'] === 'number' && (outcome.metrics['budget_est_spent'] as number) > 0);
+  assert.equal(requests.length, 3, '90% 档 2 发 + 75% 档 1 发后停发');
+});
+
+test('context createSpendTracker：未配价时直通；估算非有限值立即停发', async () => {
+  const { createSpendTracker } = await import('../../src/probes/context.js');
+  const base = { claimedContext: null, expect: [], deep: false, baseUrl: '', apiKey: '', model: '', seed: 1, timeoutMs: 0, retries: 0, outDir: '', html: false, yes: true, quiet: true } as RunConfig;
+  const inert = createSpendTracker(base);
+  assert.equal(inert.allow(Number.POSITIVE_INFINITY), true, '未配置预算时直通');
+  const tracker = createSpendTracker({ ...base, priceInput: 1, priceOutput: 0, contextBudgetUsd: 0.0025 });
+  assert.equal(tracker.allow(2000), true, '2000 tokens × 1 元/M = 0.002 ≤ 0.0025');
+  assert.equal(tracker.allow(Number.POSITIVE_INFINITY), false, '估算非有限值 → 停发');
+  assert.equal(tracker.allow(1), false, '停发后不再放行');
+  assert.equal(tracker.exhausted(), true);
 });

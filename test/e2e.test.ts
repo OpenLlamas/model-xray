@@ -337,7 +337,7 @@ test('e2e dead endpoint yields insufficient probes, not a false pass', async () 
 });
 
 test('e2e price flags produce measured-ratio metrics from balance delta', async () => {
-  const mock = await createMockServer({ mode: 'honest', balanceSeries: [9950, 10000] });
+  const mock = await createMockServer({ mode: 'honest', balanceSeries: [9950, 9950, 10000, 10000] });
   try {
     const report = await audit(mock, { priceInput: 2.5, priceOutput: 10 });
     const billing = report.outcomes.find((o) => o.id === 'billing');
@@ -604,16 +604,20 @@ test('e2e thinking-starve: 401 endpoint makes no starvation retries (request-cou
 
 // --- F1 复采样抗噪 / 防洗白（v0.2.2）：mock retry-fix 端到端 ---
 
-test('e2e retry-fix (perturb=3): first-answer noise recovered by resample → quality pass 100 (two-chance rule)', async () => {
-  // 端点对前 3 个主题首答 +1 扰动、同题面重放返回正确答案——复采样答对按两次机会口径计为正确。
+test('e2e retry-fix (perturb=3): first-answer noise mostly recovered → pass@1 9/12 首答自达 0.9 线 → pass 92', async () => {
+  // 端点对前 3 个主题首答 +1 扰动、同题面重放返回正确答案——pass@1 主口径下首答 9/12 = 0.75
+  // < 0.9 → warn；复采样恢复 3 题仅披露（recovered metric + info finding）。
+  // 注：本测试名与旧两次机会口径「pass 100」的差别是 2026-10-19 裁决的主指标变更。
   const mock = await createMockServer({ mode: 'retry-fix' });
   try {
     const report = await audit(mock, { expect: ['vision', 'tool'] });
     const quality = report.outcomes.find((o) => o.id === 'quality');
     assert.ok(quality);
-    assert.equal(quality?.level, 'pass', quality?.headline);
-    assert.equal(quality?.score, 100);
-    assert.equal(quality?.metrics['main'], '12/12');
+    assert.equal(quality?.level, 'warn', quality?.headline);
+    assert.equal(quality?.score, 75);
+    assert.match(quality?.headline ?? '', /首答 9\/12/);
+    assert.equal(quality?.metrics['main'], '9/12');
+    assert.equal(quality?.metrics['main_recovered'], '12/12');
     assert.equal(quality?.metrics['retried'], 3);
     assert.equal(quality?.metrics['recovered'], 3);
     // 复采样请求（temperature 0.7）必须以证据形式留痕：首答 + 复采样双证据
@@ -628,7 +632,7 @@ test('e2e retry-fix (perturb=3): first-answer noise recovered by resample → qu
   }
 });
 
-test('e2e retry-fix whitewash guard (perturb=12): all topics first-wrong → quality warn capped 80 with recovery disclosure', async () => {
+test('e2e retry-fix whitewash guard (perturb=12): all topics first-wrong → pass@1 0/12，复采恢复 → warn 封顶 80', async () => {
   const mock = await createMockServer({ mode: 'retry-fix', retryFixPerturb: 12 });
   try {
     const report = await audit(mock, { expect: [] });
@@ -636,10 +640,10 @@ test('e2e retry-fix whitewash guard (perturb=12): all topics first-wrong → qua
     assert.ok(quality);
     assert.equal(quality?.level, 'warn', quality?.headline);
     assert.equal(quality?.score, 80);
-    assert.equal(quality?.metrics['main'], '12/12');
+    assert.equal(quality?.metrics['main'], '0/12');
+    assert.equal(quality?.metrics['main_recovered'], '12/12');
     assert.equal(quality?.metrics['recovered'], 12);
-    assert.match(quality?.headline ?? '', /过半主题需复采样才对/);
-    assert.ok(quality?.findings.some((f) => f.level === 'warn' && /过半主题依赖复采样才答对/.test(f.message)));
+    assert.match(quality?.headline ?? '', /首答仅 0\/12，复采样恢复至 12\/12/);
     assert.ok(quality?.findings.some((f) => f.level === 'info' && /恢复率异常高/.test(f.message)));
     assert.equal(report.overall, 'warn', '质量防洗白告警必须传导到 overall');
   } finally {
@@ -673,27 +677,29 @@ test('e2e persona-inject endpoint: brand persona in self-description → identit
 
 // --- F3 token-reference：全量等比虚增（线性回归不可见）的端到端识别 ---
 
-test('e2e usage-scale 1.3 without --token-reference gives shape-only usage verdict (pass 85, disclosure kept)', async () => {
-  // billing 核验对象是 usage：全量等比虚增对回归/常量检测不可见（形状不变），
-  // 无参考/无余额对账时给出用法层面的明确判定（pass 85 + 「未做绝对对账」披露），
-  // 不再整体悬置为 insufficient（2026-10-19 用户口径：本维度只验证 usage 是否准确无误）；
-  // ×1.3 本身仍只有 --token-reference / 价格+余额对账能定罪。
+test('e2e usage-scale 1.3 without --token-reference: prompt 侧形状不可见，输出侧 completion 合计比对抓到 warn', async () => {
+  // billing 核验对象是 usage：全量等比虚增对 prompt 回归/常量检测不可见（形状不变）；
+  // 2026-10-19 起新增输出侧合计比对——completion 同倍率虚增使 Σ可见completion/Σ正文估算 系统性
+  // 偏大（本夹具 ×1.5 > 1.35），无需 token-reference 即给出「疑似输出 token 灌水」warn（封顶 70）。
+  // prompt 侧等比缩放仍未定罪：绝对定论仍需 --token-reference / 价格+余额对账。
   const mock = await createMockServer({ mode: 'usage-scale', usageScale: 1.3 });
   try {
     const report = await audit(mock);
     const billing = report.outcomes.find((o) => o.id === 'billing');
     assert.ok(billing);
     assert.equal(billing?.status, 'ok', billing?.headline);
-    assert.equal(billing?.level, 'pass');
-    assert.equal(billing?.score, 85);
-    assert.match(billing?.headline ?? '', /未发现造假证据/);
-    assert.match(billing?.headline ?? '', /未做绝对对账/);
-    assert.equal(billing?.metrics['absolute_reconciliation'], 0);
-    assert.equal(billing?.metrics['evidence_level'], 'shape-only');
+    assert.equal(billing?.level, 'warn');
+    assert.ok((billing?.score ?? 100) <= 70, `score=${billing?.score}`);
+    assert.match(billing?.headline ?? '', /灌水/);
     assert.ok(
-      billing?.findings.some((f) => f.level === 'info' && /全量等比缩放/.test(f.message)),
+      billing?.findings.some((f) => f.level === 'warn' && /输出侧 completion 合计/.test(f.message)),
       JSON.stringify(billing?.findings),
     );
+    assert.ok(
+      (billing?.metrics['completion_ratio_en'] as number) > 1.35,
+      `completion_ratio_en=${String(billing?.metrics['completion_ratio_en'])}`,
+    );
+    assert.equal(billing?.metrics['absolute_reconciliation'], 0);
     assert.notEqual(report.total, null);
   } finally {
     mock.server.close();
@@ -760,6 +766,71 @@ test('e2e usage-scale 1.3 with honest baseline flags billing slope drift (regres
 });
 
 // --- F3 CLI 子进程：fail-fast 零请求 + 正常审计退出契约 ---
+
+test('cli: --context-budget-usd without price flags exits 2 with zero requests', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-budget-'));
+  try {
+    const result = await runCli([
+      'test',
+      '--base-url',
+      mock.baseUrl,
+      '--key',
+      'k',
+      '--model',
+      'gpt-4o',
+      '--claimed-context',
+      '8000',
+      '--context-budget-usd',
+      '0.5',
+      '--out',
+      dir,
+    ]);
+    assert.equal(result.status, 2, result.stderr);
+    assert.match(result.stderr, /--context-budget-usd 必须与 --price-input\/--price-output 成对提供/);
+    assert.match(result.stderr, /示例：--context-budget-usd 0\.5 --price-input 2 --price-output 8/);
+    assert.equal(mock.state.served, 0, 'fail-fast 阶段不得发起任何请求');
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('cli: --context-budget-usd with non-numeric value exits 2 with zero requests', async () => {
+  const mock = await createMockServer({ mode: 'honest' });
+  const dir = mkdtempSync(join(tmpdir(), 'mx-cli-budget-bad-'));
+  try {
+    // 注意：'-0.5' 会被 parseArgs 判为「ambiguous option argument」参数错误（另类 exit 2），不列入本用例
+    for (const bad of ['abc', 'NaN', 'Infinity', '0']) {
+      const result = await runCli([
+        'test',
+        '--base-url',
+        mock.baseUrl,
+        '--key',
+        'k',
+        '--model',
+        'gpt-4o',
+        '--claimed-context',
+        '8000',
+        '--context-budget-usd',
+        bad,
+        '--price-input',
+        '2',
+        '--price-output',
+        '8',
+        '--out',
+        dir,
+      ]);
+      assert.equal(result.status, 2, `--context-budget-usd ${bad} 应 exit 2：${result.stderr}`);
+      assert.match(result.stderr, /--context-budget-usd 必须是大于 0/);
+      assert.ok(result.stderr.includes(JSON.stringify(bad)), `错误信息须回显收到值：${result.stderr}`);
+      assert.equal(mock.state.served, 0, 'fail-fast 阶段不得发起任何请求');
+    }
+  } finally {
+    mock.server.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 test('cli: --token-reference to a missing file exits 2 with zero requests', async () => {
   const mock = await createMockServer({ mode: 'honest' });

@@ -79,6 +79,10 @@ export function createClient(options: ClientOptions): OpenAIClient {
       }
     }
     let lastResult: ChatResult | null = null;
+    // 端点兼容：部分网关拒绝 temperature 参数（400 参数校验错）。校验失败不进入推理、不计费，
+    // 故去参重发一次（不占 httpRetries/retries 预算、不构成计费污染）；成功后在结果上留披露标志。
+    let effectiveReq: ChatRequest = req;
+    let temperatureDropped = false;
     // 计费污染标记（请求级粘性，一旦置真不再复位）：200（哪怕空正文）或「可能已执行」的
     // 408/409/500/502/504/超时/网络错误之后才重试 → true；仅 429/503（网关层拒绝、未进入
     // 推理、通常不计费）后的重试保持 false。billing 据此区分「可能重复计费」与「上游抖动」。
@@ -97,9 +101,22 @@ export function createClient(options: ClientOptions): OpenAIClient {
         await sleep(waitMs);
       }
       emit({ seq: requestSeq, attempt, kind: 'start', promptTokensEstimate });
-      lastResult = await attemptChat(chatUrl, options, req);
+      lastResult = await attemptChat(chatUrl, options, effectiveReq);
+      if (
+        !temperatureDropped &&
+        !lastResult.ok &&
+        lastResult.status === 400 &&
+        effectiveReq.temperature !== undefined &&
+        /temperature/i.test(lastResult.error ?? '')
+      ) {
+        const { temperature: _dropped, ...rest } = effectiveReq;
+        effectiveReq = rest as ChatRequest;
+        temperatureDropped = true;
+        lastResult = await attemptChat(chatUrl, options, effectiveReq);
+      }
       // 记录实际尝试次数：计费探针用它识别「审计窗口内存在重试」的重复计费风险
-      lastResult.attempts = attempt;
+      lastResult.attempts = attempt + (temperatureDropped ? 1 : 0);
+      lastResult.temperatureDropped = temperatureDropped;
       lastResult.contaminatingRetry = contaminating;
       lastResult.retryAfterMs = lastResult.retryAfterMs ?? null;
       if (isQuotaExhaustion(lastResult.status, lastResult.error)) {

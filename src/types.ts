@@ -94,6 +94,11 @@ export interface ChatResult {
   contaminatingRetry?: boolean;
   /** 端点在响应头给出的 Retry-After（毫秒；缺失/无法解析为 null），用于重试退避对齐服务端节奏。 */
   retryAfterMs?: number | null;
+  /**
+   * 端点以 400 拒绝 temperature 参数后已去参重发并成功（部分网关不支持该参数）。
+   * 参数校验失败不进入推理、通常不计费；该标志仅供证据/报告披露，不影响计费污染判定。
+   */
+  temperatureDropped?: boolean;
   toolCalls: ToolCall[];
   ttftMs: number | null;
   durationMs: number;
@@ -189,6 +194,8 @@ export interface EvidenceResponse {
   usageRejected: UsageRejection | null;
   /** 实际尝试次数（≥1，重试后成功则 >1） */
   attempts: number;
+  /** 端点 400 拒绝 temperature 后已去参重发（披露用） */
+  temperatureDropped: boolean;
   toolCallCount: number;
   /** 首个 choice 的 finish_reason；报告 JSON 序列化为 snake_case finish_reason（见 report/json.ts） */
   finishReason: string | null;
@@ -227,6 +234,8 @@ export interface RunConfig {
   contextSamples?: number;
   /** context 确认性复采每档样本数（仅 contextSamples>=3 的标准档使用；缺省 2，--deep 3）。 */
   contextConfirmSamples?: number;
+  /** context 软预算上限（与 --price-input/--price-output 同单位，按「估算输入×输入价+输出预算×输出价」逐请求预扣）；超限停发，须与价格成对提供。 */
+  contextBudgetUsd?: number;
   /** billing 目标长度档位（内部/测试用；缺省标准 5 档、--deep 6 档）。 */
   billingLevels?: number[];
   seed: number;
