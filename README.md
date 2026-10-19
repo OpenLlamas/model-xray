@@ -187,7 +187,7 @@ Two problems dominate the relay market, and both are designed to be invisible:
 - **Faking (model swap / lighter variant)** — the relay serves a lighter sibling from the same family in place of the flagship: e.g. `glm-5.3-flash` standing in for `glm-5.3`. The docs, the self-reported model name, and everyday answers all look right, so it is nearly impossible to notice in normal use; only probes that compare the requested model against the endpoint's self-described identity / answer fingerprints catch it.
 - **Hidden rate markup** — sticker prices look normal while the billing backend quietly applies a modest multiplier (e.g. 1.5×): no single bill looks alarming, so eyeballing statements never catches it; only an absolute check — measured spend ÷ (claimed price × self-reported usage) — produces a verdict.
 
-Prefer the local web console (`npm run ui`) over a bare CLI run: the page lets you tick the claimed capabilities (vision / tool calls / reasoning), enter the claimed context window and claimed prices (input/output per 1M tokens, optional cached-read rate and long-context second tier), pin a seed for reproducible re-tests, and add enhanced samples — **the more you declare, the deeper the probes run**. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
+Prefer the local web console (`npm run ui`) over a bare CLI run: the page lets you tick the claimed capabilities (vision / tool calls / reasoning) visually, enter the claimed context window and claimed prices (input/output per 1M tokens, optional cached-read rate and long-context second tier), pin a seed for reproducible re-tests, and add enhanced samples — **the more you declare, the deeper the probes run**. Hand-writing CLI arguments invites format mistakes (missing items, typos, wrong separators); ticking the wrong — or fewer — capabilities makes the corresponding probes pass as "unclaimed" or misfire, so using the page's checkboxes prevents this class of format errors from skewing the audit. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
 
 Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): a relay served `glm-5.3-flash` in place of `glm-5.3` and set the rate to 1.5×. One "Start test" run caught it: all 6 identity probes echoed back a different model (requested `glm-5.3`, upstream echoed `glm-5.3-flash` — suspected swap/channel change), the measured rate came out 1.5 > 1.5 claimed (fail, capped at 30), plus 32/62 empty non-streaming bodies as further evidence — final score 45 · fail (billing hard red line caps the total). The sticker prices on the page looked perfectly normal; without entering them and actually measuring, nothing would have surfaced.
 
@@ -210,7 +210,7 @@ Notes:
 
 ### API gateway: observability & data guarantees
 
-The local API gateway (Web console tab 2) records every forwarded request into a local SQLite ledger and watches channels for anomalies in real time. **It is temporarily disabled in this version** — the tab is hidden and all console `/api/gateway/*` endpoints return 503. The guarantees below describe the implemented behavior that ships when the feature is re-enabled; the verification scripts remain runnable because they exercise the gateway modules directly:
+The local API gateway (Web console tab 2) records every forwarded request into a local SQLite ledger and watches channels for anomalies in real time. **It is temporarily disabled in this version** — the tab is hidden and all console `/api/gateway/*` endpoints return 503 (a request without a valid session token is still rejected with 403 first). The guarantees below describe the implemented behavior that ships when the feature is re-enabled; the verification scripts remain runnable because they exercise the gateway modules directly:
 
 - **Ledger** — `reports/gateway-ledger.db`: structure metadata only (origin / channel / alias / status / tokens / cost / TTFT — no message content; channel keys are never written). Runtime data, gitignored.
 - **Retention** — nothing is cleaned up automatically in this version: archive or delete the whole file when needed. Don't delete single rows — that breaks the hash chain by design; archiving means moving/renaming the whole database.
@@ -219,7 +219,7 @@ The local API gateway (Web console tab 2) records every forwarded request into a
 - **Degraded, never blocking** — if a ledger write fails, forwarding continues unchanged; the observation gap is disclosed (console banner + `status().degraded`), never silently absorbed.
 - **Anomaly alerts** — per-channel rolling window of the last 100 observations: model-name mismatch ≥ 2, error rate > 50% (n ≥ 5), any truncated response (n ≥ 3),  malformed `usage` > 30% (n ≥ 10), TTFT too high (uncontaminated samples n ≥ 20 and p95 ≥ 300 ms — an absolute floor, not a history comparison).  The same (channel, kind) alerts at most once per 30 min (suppressed repeats are counted and disclosed via `status().alertSuppressed`); all alerts stay silent  for the first 5 min after gateway start (`status().alertSilenceRemainingMs`; sticky `alertSilenceWasActive` discloses that the silence window was in effect).  Each event carries up to 10 evidence request ids to drill into via the ledger.
 - **TTFT dual gauge + contamination guard** — each settlement carries two independent clocks:  `ttft_upstream_ms` (request sent → first content frame from upstream; for **non-streaming** responses there is no intermediate frame, so the clock measures to full-body arrival — compare TTFT only between same-mode samples) and `ttft_client_ms` (request accepted → first byte written to the client;  recorded for error relays too, NULL only when nothing was ever written — never a fake 0).  An event-loop delay ≥ 50 ms during a sample window marks the upstream sample contaminated: still recorded in the ledger (`ttft_contaminated = 1`, raw value kept)  but excluded from p50/p95, so a stalled machine cannot pollute the latency stats.
-- **Console endpoints (token required)** — `GET /api/gateway/status`, `GET /api/gateway/usage`, `GET /api/gateway/events`, channel CRUD under `/api/gateway/channels`, and `POST /api/gateway/probe-models` (one-click upstream model-list probe) exist on the console port (8620) only; the data plane (8621) exposes no management endpoints.
+- **Console endpoints (token required)** — `GET /api/gateway/status`, `GET /api/gateway/usage`, `GET /api/gateway/events`, channel CRUD under `/api/gateway/channels`, and `POST /api/gateway/probe-models` (one-click upstream model-list probe) exist on the console port (8620) only; the data plane runs on a separate loopback port (random by default, configurable) and exposes no management endpoints.
 - **Verification scripts** — each guarantee above maps to a runnable check (`npm run <script>`):
   `verify:sse` (byte-sliced SSE replay + UTF-8 boundary + usage rejection), `verify:usage` (usage validation matrix: the four rejection reasons of the usage validator),
   `verify:ledger` (hash chain + tamper detection + idempotent settle/recover), `verify:crash` (real SIGKILL crash recovery), `verify:leak` (canary key never in ledger/logs),
@@ -412,7 +412,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 - **掺假（换壳 / 轻量版冒充）**：用同家族的轻量版顶替旗舰模型——例如拿 `glm-5.3-flash` 冒充 `glm-5.3`。文档、模型自述、日常问答看起来都正常，常规使用极难察觉；只有对照「请求的模型名 vs 端点自述身份 / 应答指纹」的探针才抓得住。
 - **偷调倍率**：标价看着正常，后台却悄悄设一个不太夸张的倍率（如 1.5×）——单笔账单金额不大、倍率「不离谱」，靠肉眼对账单几乎发现不了；只有绝对对账——实测扣费 ÷（宣称价格 × 自报 usage）——才能定论。
 
-建议优先用 Web 控制台（`npm run ui`）而不是裸命令行：页面里可以勾选宣称能力（视觉 / 工具调用 / 推理）、填宣称上下文窗口、录入宣称价格（输入/输出单价，可选缓存读与长上下文二档阶梯价）、固定 seed 复测、加增强样本——**你声明得越全，探针跑得越彻底**。计费核价只在录入宣称价格后启用，想抓倍率就必须填价格。
+建议优先用 Web 控制台（`npm run ui`）而不是裸命令行：页面里可以**可视化勾选**宣称能力（视觉 / 工具调用 / 推理）、填宣称上下文窗口、录入宣称价格（输入/输出单价，可选缓存读与长上下文二档阶梯价）、固定 seed 复测、加增强样本——**你声明得越全，探针跑得越彻底**。手写 CLI 参数容易写错格式（漏项、拼错、分隔符不对），勾错/漏勾宣称能力会让对应探针直接按「未宣称」放行或误报——用页面勾选能从源头避免这类格式问题造成的检测不准。计费核价只在录入宣称价格后启用，想抓倍率就必须填价格。
 
 真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实测倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。
 
@@ -435,7 +435,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 ### API 网关：观测与数据保证
 
-本地 API 网关（Web 控制台第 2 页）把每个已转发请求记入本地 SQLite 账本，并实时监控渠道异常。**本版暂未上线**——该标签已隐藏、控制台 `/api/gateway/*` 端点回 503；下文为该功能上线后的已实现行为（验收脚本直接跑网关模块，仍可执行）：
+本地 API 网关（Web 控制台第 2 页）把每个已转发请求记入本地 SQLite 账本，并实时监控渠道异常。**本版暂未上线**——该标签已隐藏、控制台 `/api/gateway/*` 端点回 503（未携带有效会话 token 的请求仍先回 403）；下文为该功能上线后的已实现行为（验收脚本直接跑网关模块，仍可执行）：
 
 - **账本** —— `reports/gateway-ledger.db`：只含结构元数据（origin/渠道/别名/状态/token/费用/TTFT，无任何正文；渠道 key 绝不写入）。属运行时数据、已 gitignore。
 - **保留策略** —— 本版不自动清理：需要时整库归档或删除——不要手删单行（会按设计触发断链报告）；归档即整体移动/改名数据库文件。
@@ -444,7 +444,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 - **降级不阻断** —— 账本写失败时转发照常；观测缺口显式披露（控制台横幅 + `status().degraded`），绝不静默吞掉。
 - **异常告警** —— 按渠道滚动窗口（最近 100 条观测）：模型名不一致 ≥2；错误率 >50%（n≥5）；出现截断（n≥3）；usage 畸形 >30%（n≥10）；TTFT 偏高（未污染样本 n≥20 且 p95≥300ms——绝对下限，不与历史比较）。  同一 (渠道, 类别) 30 分钟内至多告警一次（重复触发的压制次数经 `status().alertSuppressed` 如实披露）；网关启动后前 5 分钟全体静默（`status().alertSilenceRemainingMs`；`alertSilenceWasActive` 粘性披露静默期曾生效）。每条事件附最多 10 条证据请求 id，可到账本下钻核对。
 - **TTFT 双口径 + 污染防护** —— 每笔结算两个独立时钟：ttft_upstream_ms（请求发出 → 上游首个内容帧）与 ttft_client_ms（请求进网关 → 向客户端写出首个字节；错误体转发同样打点，全程无写入才为 NULL——绝不写 0 冒充）。  样本窗口内事件循环延迟 ≥ 50ms 时该上游样本标记污染：照实入账（`ttft_contaminated=1`，原始值保留）但不进 p50/p95，机器卡顿不会污染时延统计。
-- **控制台端点（须 token）** —— `GET /api/gateway/status`、`GET /api/gateway/usage`、`GET /api/gateway/events`、`/api/gateway/channels` 下的渠道 CRUD、`POST /api/gateway/probe-models`（一键探测上游模型列表）仅存在于控制台端口（8620）；数据面（8621）不暴露任何管理端点。
+- **控制台端点（须 token）** —— `GET /api/gateway/status`、`GET /api/gateway/usage`、`GET /api/gateway/events`、`/api/gateway/channels` 下的渠道 CRUD、`POST /api/gateway/probe-models`（一键探测上游模型列表）仅存在于控制台端口（8620）；数据面跑在独立的回环端口上（缺省随机分配，可指定），不暴露任何管理端点。
 - **验收脚本** —— 上文每条保证都对应一条可运行检查（`npm run <脚本>`）：
   verify:sse（逐字节切割 SSE 回放 + UTF-8 边界 + usage 拒收）· verify:usage（usage 校验矩阵：四类拒收口径）· verify:ledger（hash 链 + 篡改检出 + 幂等结算/恢复）·
   verify:crash（真实 SIGKILL 崩溃恢复）· verify:leak（金丝雀 key 绝不入账本/日志）· verify:ttft（仅角色假首帧剔除）· verify:tz（时间戳 epoch 毫秒口径）·
