@@ -14,10 +14,19 @@ test('usage extractor normalizes cents to USD as spent_total', () => {
     kind: 'spent_total',
     unit: 'USD',
     currency: null,
+    resolution: 0.01,
   });
   assert.equal(usage.extract({}), null);
   assert.equal(usage.extract({ total_usage: '1234' }), null);
   assert.equal(usage.extract({ total_usage: Number.NaN }), null);
+});
+
+test('usage extractor rejects non-integer cents (unknown unit/schema)', () => {
+  // 真机回归：某中转站返回 13058.6184，按 ÷100 读成 USD 后与 $0.019 应缴作比，产出 142.975× 假 fail。
+  // OpenAI 规范该字段为整数美分；非整数说明单位不是美分，必须拒绝而不是猜。
+  assert.equal(usage.extract({ total_usage: 13058.6184 }), null);
+  assert.equal(usage.extract({ total_usage: 99.5 }), null);
+  assert.deepEqual(usage.extract({ total_usage: 1234.0 }), usage.extract({ total_usage: 1234 }));
 });
 
 test('credit_grants extractor maps total_available to balance USD', () => {
@@ -26,6 +35,7 @@ test('credit_grants extractor maps total_available to balance USD', () => {
     kind: 'balance',
     unit: 'USD',
     currency: null,
+    resolution: 0.01,
   });
   assert.equal(grants.extract({ total_available: '50' }), null);
   assert.equal(grants.extract({ success: true }), null);
@@ -37,6 +47,7 @@ test('self extractor unwraps data.quota only on success=true (one-api/new-api sc
     kind: 'balance',
     unit: 'quota',
     currency: null,
+    resolution: 1,
   });
   assert.equal(self.extract({ success: false, data: { quota: 500000 } }), null);
   assert.equal(self.extract({ success: true, data: { quota: '500000' } }), null);
@@ -73,7 +84,7 @@ test('probeBalance reads scripted usage from the mock server', async () => {
     assert.equal(first?.unit, 'USD');
     assert.equal(first?.value, 1.0);
     const second = await probeBalance(mock.baseUrl, 'test-key', 2000);
-    assert.equal(second?.value, 0.995);
+    assert.equal(second?.value, 0.99);
   } finally {
     mock.server.close();
   }

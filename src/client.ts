@@ -12,6 +12,18 @@ import type {
 } from './types.js';
 
 const RETRYABLE_STATUS = new Set([408, 409, 429, 500, 502, 503, 504]);
+/**
+ * 网关层明确拒绝的状态：请求未进入推理（503 system cpu overloaded / 429 限流即典型），
+ * 通常不计费，故仅这类失败后的重试不判为计费污染。408/409/500/502/504/超时/网络错误
+ * 可能服务端已执行并计费（POST 非幂等），保持污染口径。
+ */
+const GATEWAY_REJECTED_STATUS = new Set([429, 503]);
+/** Retry-After 采纳上限：端点要求等待超过 5s 时不傻等（按本地退避节奏继续，宁可少样本不拖死审计）。 */
+const RETRY_AFTER_CAP_MS = 5000;
+/** httpRetries 缺省（未显式提供时）：与旧行为（=retries）不同，独立给 2 → 最多 3 次尝试。 */
+const DEFAULT_HTTP_RETRIES = 2;
+/** 运行级重试总预算缺省：防止端点整体过载时重试放大请求量、反而延长过载窗口。 */
+const DEFAULT_RETRY_BUDGET = 24;
 
 /** 额度耗尽（区别于普通限流）：命中后整个审计熔断，避免继续空发请求与输出碎片化证据。 */
 const QUOTA_EXHAUSTED =
@@ -35,6 +47,8 @@ export function createClient(options: ClientOptions): OpenAIClient {
   const chatUrl = `${baseUrl}/chat/completions`;
   let seq = 0;
   let quotaError: string | null = null;
+  // 运行级重试总预算（跨所有请求共享）：防止端点整体过载时重试放大请求量、反而延长过载窗口
+  let retryBudgetLeft = Math.max(0, options.retryBudget ?? DEFAULT_RETRY_BUDGET);
 
   function emit(event: RequestProgressEvent): void {
     const callback = options.onRequest;
@@ -65,12 +79,29 @@ export function createClient(options: ClientOptions): OpenAIClient {
       }
     }
     let lastResult: ChatResult | null = null;
-    for (let attempt = 1; attempt <= options.retries + 1; attempt += 1) {
-      if (attempt > 1) await sleep(backoffMs(attempt));
+    // 计费污染标记（请求级粘性，一旦置真不再复位）：200（哪怕空正文）或「可能已执行」的
+    // 408/409/500/502/504/超时/网络错误之后才重试 → true；仅 429/503（网关层拒绝、未进入
+    // 推理、通常不计费）后的重试保持 false。billing 据此区分「可能重复计费」与「上游抖动」。
+    let contaminating = false;
+    let httpRetriesLeft = Math.max(0, options.httpRetries ?? DEFAULT_HTTP_RETRIES);
+    let emptyRetriesLeft = Math.max(0, options.retries);
+    let retryAfterPendingMs: number | null = null;
+    for (let attempt = 1; ; attempt += 1) {
+      if (attempt > 1) {
+        // Retry-After 优先（429/503 时端点给出的等待建议），超过 5s 上限按上限等待；
+        // 其余按本地指数退避。两者都加抖动避免并发重试踩同一节拍。
+        const waitMs = retryAfterPendingMs !== null
+          ? Math.max(250, Math.min(RETRY_AFTER_CAP_MS, retryAfterPendingMs)) + Math.floor(Math.random() * 250)
+          : backoffMs(attempt);
+        retryAfterPendingMs = null;
+        await sleep(waitMs);
+      }
       emit({ seq: requestSeq, attempt, kind: 'start', promptTokensEstimate });
       lastResult = await attemptChat(chatUrl, options, req);
       // 记录实际尝试次数：计费探针用它识别「审计窗口内存在重试」的重复计费风险
       lastResult.attempts = attempt;
+      lastResult.contaminatingRetry = contaminating;
+      lastResult.retryAfterMs = lastResult.retryAfterMs ?? null;
       if (isQuotaExhaustion(lastResult.status, lastResult.error)) {
         quotaError = lastResult.error;
       }
@@ -86,18 +117,36 @@ export function createClient(options: ClientOptions): OpenAIClient {
       });
       // 配额耗尽不是抖动：立即返回，不消耗重试预算。
       if (quotaError !== null) return lastResult;
-      // 可重试 = 明确的可重试状态码（408/409/429/5xx），或 200 空正文（空流/空 content；
-      // 上游收下请求却零产出，与端点 cpu 过载同源的抖动；completion=0 无输出计费，
-      // 重试只重复计 prompt 小额）。finish_reason=length 的截断不在此重试（由探针升预算处理）。
-      // attempts 如实递增，计费探针的「窗口内存在重试」污染口径照常生效；其余错误绝不重试。
-      const retryable =
-        (!lastResult.ok && RETRYABLE_STATUS.has(lastResult.status)) ||
-        (lastResult.ok &&
-          req.retryEmpty !== false &&
-          (lastResult.error === 'empty stream' || isRetryableEmpty(lastResult)));
-      if (!retryable) return lastResult;
+      // 可重试分类（各自独立预算，运行级总预算兜底防放大）：
+      // ① 非 ok 且状态码在白名单 → 扣 httpRetries 预算。429/503 为网关层拒绝（未进入推理），
+      //    不污染计费口径并优先采纳 Retry-After；408/409/500/502/504 可能已执行 → 污染。
+      // ② 200 空正文（空流/空 content）→ 扣 retries 预算，可能已按 prompt 计费 → 污染。
+      //    finish_reason=length 的截断不在此重试（由探针升预算处理）。
+      // ③ 其余错误绝不重试。attempts 如实递增。
+      let retryable = false;
+      if (!lastResult.ok && RETRYABLE_STATUS.has(lastResult.status)) {
+        if (!GATEWAY_REJECTED_STATUS.has(lastResult.status)) {
+          contaminating = true;
+        } else if (lastResult.retryAfterMs !== null) {
+          retryAfterPendingMs = lastResult.retryAfterMs;
+        }
+        retryable = httpRetriesLeft > 0;
+      } else if (
+        lastResult.ok &&
+        req.retryEmpty !== false &&
+        (lastResult.error === 'empty stream' || isRetryableEmpty(lastResult))
+      ) {
+        contaminating = true;
+        retryable = emptyRetriesLeft > 0;
+      }
+      if (!retryable || retryBudgetLeft <= 0) {
+        lastResult.contaminatingRetry = contaminating;
+        return lastResult;
+      }
+      retryBudgetLeft -= 1;
+      if (lastResult.ok) emptyRetriesLeft -= 1;
+      else httpRetriesLeft -= 1;
     }
-    return lastResult ?? errorResult('no attempt executed');
   }
 
   return {
@@ -135,7 +184,13 @@ async function attemptChat(url: string, options: ClientOptions, req: ChatRequest
 
     if (!response.ok) {
       const errorText = await safeReadBody(response);
-      return errorResult(`HTTP ${response.status}: ${truncate(errorText, 500)}`, response.status, Date.now() - started);
+      return errorResult(
+        `HTTP ${response.status}: ${truncate(errorText, 500)}`,
+        response.status,
+        Date.now() - started,
+        '',
+        parseRetryAfterMs(response.headers.get('retry-after')),
+      );
     }
 
     // 端点兼容：部分中转站无视 stream:false 强制回 SSE（实测 new-api 网关即如此）。
@@ -257,6 +312,8 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
     usage,
     usageRejected: reason,
     attempts: 1,
+    contaminatingRetry: false,
+    retryAfterMs: null,
     toolCalls,
     ttftMs: null,
     durationMs,
@@ -328,6 +385,8 @@ function buildStreamResult(agg: SseAggregate, status: number, durationMs: number
     usage: agg.usage,
     usageRejected: agg.usage !== null ? null : (agg.usageRejected ?? 'missing'),
     attempts: 1,
+    contaminatingRetry: false,
+    retryAfterMs: null,
     toolCalls,
     ttftMs,
     durationMs,
@@ -451,7 +510,7 @@ async function safeReadBody(response: Response): Promise<string> {
   }
 }
 
-function errorResult(message: string, status = 0, durationMs = 0, partialText = ''): ChatResult {
+function errorResult(message: string, status = 0, durationMs = 0, partialText = '', retryAfterMs: number | null = null): ChatResult {
   return {
     ok: false,
     status,
@@ -462,12 +521,24 @@ function errorResult(message: string, status = 0, durationMs = 0, partialText = 
     usage: null,
     usageRejected: null,
     attempts: 1,
+    contaminatingRetry: false,
+    retryAfterMs,
     toolCalls: [],
     ttftMs: null,
     durationMs,
     error: message,
     raw: '',
   };
+}
+
+/** 解析 Retry-After 响应头（仅秒数形式；HTTP-date 含字母、非法值、负值一律返回 null 不采纳）。 */
+function parseRetryAfterMs(value: string | null): number | null {
+  if (value === null) return null;
+  const trimmed = value.trim();
+  if (trimmed === '' || /[a-zA-Z]/.test(trimmed)) return null;
+  const seconds = Number(trimmed);
+  if (!Number.isFinite(seconds) || seconds < 0) return null;
+  return Math.round(seconds * 1000);
 }
 
 function backoffMs(attempt: number): number {

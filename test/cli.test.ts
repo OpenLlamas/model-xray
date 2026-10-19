@@ -80,7 +80,8 @@ test('cli: remote endpoint without --yes on non-TTY exits 2 with --yes/--dry-run
 });
 
 test('cli: honest endpoint exits 0 and writes md/html/json reports', async () => {
-  const mock = await createMockServer({ mode: 'honest' });
+  // 提供宣称价格 + 可编程余额（1.0 倍计费）作为绝对对账：billing 100（纯形状证据时为 85）。
+  const mock = await createMockServer({ mode: 'honest', balanceRate: 1 });
   const out = mkdtempSync(join(tmpdir(), 'model-xray-'));
   try {
     const result = await runCli([
@@ -93,6 +94,10 @@ test('cli: honest endpoint exits 0 and writes md/html/json reports', async () =>
       'gpt-4o',
       '--claimed-context',
       '2000',
+      '--price-input',
+      '2',
+      '--price-output',
+      '8',
       '--seed',
       '11',
       '--out',

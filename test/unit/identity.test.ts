@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectPersonaBrands, probeIdentity } from '../../src/probes/identity.js';
+import { detectPersonaBrands, familiesIn, probeIdentity } from '../../src/probes/identity.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
@@ -120,7 +120,8 @@ test('identity: self-id fully starved (non-empty truncation) → insufficient, n
 
 test('identity: partial starvation — starved samples excluded from identical stats (invalid samples)', async () => {
   // 2 个有效样本逐字一致 + 3 个 starved 相同截断文本：
-  // starved 无效 → 有效样本 2 个（<3），不触发逐字一致 WARN，starved 记入无效样本。
+  // starved 无效 → 有效样本 2 个（<3），不触发逐字一致 WARN，starved 记入无效样本；
+  // 少于 3 条有效自述不足以证明身份维度通过，保持 insufficient（不出 PASS 100）。
   const { client } = stubClient([
     okResult('I am gpt-4o, made by OpenAI.'),
     okResult('I am gpt-4o, made by OpenAI.'),
@@ -131,9 +132,10 @@ test('identity: partial starvation — starved samples excluded from identical s
   ]);
   const ctx = makeCtx(client);
   const outcome = await probeIdentity(ctx);
-  assert.equal(outcome.status, 'ok');
-  assert.equal(outcome.score, 100);
-  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.match(outcome.headline, /有效自述样本不足（2 条）/);
   assert.equal(outcome.metrics['samples'], 2);
   assert.equal(outcome.metrics['identical_samples'], 1);
   assert.equal(outcome.metrics['starved_samples'], 3);
@@ -166,6 +168,145 @@ test('identity: 仅 1 条有效自述（其余空流）→ insufficient 不出�
   assert.equal(outcome.status, 'insufficient', JSON.stringify(outcome.findings));
   assert.equal(outcome.score, null);
   assert.match(outcome.headline, /有效自述样本不足（1 条）/);
+});
+
+test('identity: 仅 1 条有效自述且指向他族 → insufficient warn，不 falsified', async () => {
+  const { client } = stubClient([
+    okResult('I am Claude, made by Anthropic.'),
+    okResult(''),
+    okResult(''),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /有效自述样本不足（1 条）/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /1 条指向其他模型族/.test(f.message)));
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+test('identity: 仅 2 条有效自述且均指向他族 → insufficient warn，不得 PASS 100', async () => {
+  const { client } = stubClient([
+    okResult('I am Claude, made by Anthropic.'),
+    okResult('I am Claude, made by Anthropic.'),
+    okResult(''),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /有效自述样本仅 2 条且存在族失配/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /2 条指向其他模型族/.test(f.message)));
+});
+
+test('identity: 2 条他族 + 1 条中性 + 2 空响应 → 多数告警 warn 60（空响应不稀释分母）', async () => {
+  const { client } = stubClient([
+    okResult('I am Claude, made by Anthropic.'),
+    okResult('I am Claude, made by Anthropic.'),
+    okResult('I am an AI assistant.'),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 60);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /2\/3/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /多数自述（2\/3）/.test(f.message)));
+});
+
+test('identity: 5 条「我是 GPT-4o，也是 Claude」混合声明 → warn 60，不得 falsified/不得假通过', async () => {
+  const mixed = 'I am GPT-4o by OpenAI, and I am also Claude by Anthropic.';
+  const { client } = stubClient([
+    okResult(mixed),
+    okResult(mixed),
+    okResult(mixed),
+    okResult(mixed),
+    okResult(mixed),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 60);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /混合/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /混合声明/.test(f.message)));
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+test('identity: 1 条混合声明 + 4 条目标自述 → warn 80，不得 PASS 100', async () => {
+  const { client } = stubClient([
+    okResult('I am GPT-4o by OpenAI, and I am also Claude by Anthropic.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 80);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /混合声明 1\/5/);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /混合声明 1\/5/.test(f.message)));
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+test('identity: 合法比较句「I am GPT-4o similar to Claude」不触发混合告警', async () => {
+  const { client } = stubClient([
+    okResult('I am GPT-4o similar to Claude.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult('I am GPT-4o by OpenAI.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.level, 'pass');
+  assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /混合声明/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: 3 条有效自述全部他族 + 2 空响应 → falsified fail 0（空响应不稀释定罪分母）', async () => {
+  const { client } = stubClient([
+    okResult('I am Claude, made by Anthropic.'),
+    okResult('I am Claude, made by Anthropic.'),
+    okResult('I am Claude, made by Anthropic.'),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 0);
+  assert.equal(outcome.level, 'fail');
+  assert.match(outcome.headline, /身份矛盾/);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每条有效自述都指向其他模型族/.test(f.message)));
+});
+
+test('identity: 2 字族名「豆包」也计入有效自述 → 3 条他族 + 2 空响应 fail 0', async () => {
+  const { client } = stubClient([
+    okResult('豆包'),
+    okResult('豆包'),
+    okResult('豆包'),
+    okResult(''),
+    okResult(''),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok', JSON.stringify(outcome.findings));
+  assert.equal(outcome.score, 0);
+  assert.equal(outcome.level, 'fail');
+  assert.match(outcome.headline, /身份矛盾/);
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每条有效自述都指向其他模型族/.test(f.message)));
 });
 
 test('identity: non-stream blank self-id falls back to stream and recovers (disclosed, no N/A)', async () => {
@@ -458,7 +599,7 @@ test('identity: falsified requires unanimous mismatch — 5/5 mismatch with expe
   assert.equal(outcome.status, 'ok');
   assert.equal(outcome.score, 0);
   assert.equal(outcome.level, 'fail');
-  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每次自述都指向其他模型族/.test(f.message)));
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每条有效自述都指向其他模型族/.test(f.message)));
 });
 
 test('identity: 4/5 mismatch (one sample consistent) → majority warn, not falsified', async () => {
@@ -513,7 +654,7 @@ test('identity: incident regression — glm-5.3-flash endpoint self-describes Mi
   assert.equal(outcome.score, 0);
   assert.equal(outcome.level, 'fail');
   assert.equal(outcome.metrics['families'], 'minimax', 'minimax 已入别名表，families 不再是 none');
-  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每次自述都指向其他模型族/.test(f.message)));
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每条有效自述都指向其他模型族/.test(f.message)));
 });
 
 test('identity: minimax target self-describes MiniMax → pass with families=minimax (no longer none+PASS)', async () => {
@@ -719,6 +860,31 @@ test('identity F2: persona hit coexists with falsified verdict without softening
   assert.ok(outcome.findings.some((f) => f.level === 'warn' && /自述出现非模型族人格名：NovaRelay/.test(f.message)));
 });
 
+test('identity: falsified + upstream echo mismatch keeps fail verdict (echo must not soften fail)', async () => {
+  // 真机 2026-10-19：5 条自述全部指向 DeepSeek，且 6/6 回显 deepseek-flash；
+  // falsified 已构成 fail 0，回显告警只能追加证据，不能把 level 改回 warn（否则报告自相矛盾）。
+  const echo = (results: ChatResult[]): ChatResult[] => results.map((r) => ({ ...r, model: 'deepseek-flash' }));
+  const { client } = stubClient(
+    echo([
+      okResult('I am DeepSeek.'),
+      okResult('我是 DeepSeek 的助手。'),
+      okResult('DeepSeek is my model.'),
+      okResult('I am DeepSeek assistant.'),
+      okResult('我由深度求索开发。'),
+      schemaOk(),
+    ]),
+  );
+  const outcome = await probeIdentity(makeCtx(client, { model: 'glm-5.3-flash' }));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.equal(outcome.score, 0);
+  assert.match(outcome.headline, /身份矛盾/);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /上游回显/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
 test('identity F2: unknown target family → persona scan skipped (no baseline to compare against)', async () => {
   const personaOnly = Array.from({ length: 5 }, () => okResult('I am NovaRelay assistant.'));
   const { client } = stubClient([...personaOnly, okResult(COMPLETE_SCHEMA_JSON)]);
@@ -727,4 +893,125 @@ test('identity F2: unknown target family → persona scan skipped (no baseline t
   assert.match(outcome.headline, /不在已知别名表/);
   assert.equal(outcome.metrics['persona_hits'], 'none');
   assert.ok(!outcome.findings.some((f) => /人格名/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+// ---------- 2026-10-18 审计缺陷 ④：否定语境（"I am Claude, not OpenAI." 不得同时声明 openai） ----------
+
+test('familiesIn: 否定句中被否定的别名不构成声明', () => {
+  // 前缀否定（英文 not）
+  assert.deepEqual([...familiesIn('I am Claude, not OpenAI.')].sort(), ['claude']);
+  assert.deepEqual([...familiesIn('I am GPT-4o, not Claude.')].sort(), ['gpt']);
+  // 后缀否定（X is not me）
+  assert.deepEqual([...familiesIn('OpenAI is not me; I am Claude.')].sort(), ['claude']);
+  // 中文否定
+  assert.deepEqual([...familiesIn('我不是 OpenAI 的模型，我是 GLM。')].sort(), ['glm']);
+  // 未否定时照常声明（防误杀）
+  assert.deepEqual([...familiesIn('I am GPT-4o, made by OpenAI.')].sort(), ['gpt']);
+  assert.deepEqual([...familiesIn('I am Claude by Anthropic.')].sort(), ['claude']);
+  // 「not only / not just / 不只 / 不仅」是强调不是否认：仍声明该族（防过度否定漏判）
+  assert.deepEqual([...familiesIn('I am not only OpenAI; I am GPT-4o.')].sort(), ['gpt']);
+  assert.deepEqual([...familiesIn("I'm not just OpenAI, I'm also Claude.")].sort(), ['claude', 'gpt']);
+  assert.deepEqual([...familiesIn('我不只是 OpenAI 的用户，我是 Claude。')].sort(), ['claude', 'gpt']);
+});
+
+function qwenSelfResults(): ChatResult[] {
+  return [
+    okResult('I am qwen2.5-72b-instruct, made by Alibaba.'),
+    okResult('我是 qwen2.5-72b-instruct，由阿里巴巴开发。'),
+    okResult("I'm the qwen2.5-72b-instruct model."),
+    okResult('我来自阿里巴巴的 qwen2.5-72b-instruct。'),
+    okResult('qwen2.5-72b-instruct is my model name.'),
+  ];
+}
+
+test('identity: 目标 gpt 的端点 5 条 "I am Claude, not OpenAI." → 只声明 claude → falsified fail 0', async () => {
+  // 红队实证：不识别否定时该句会同时声明 {claude, gpt}，与期望族 gpt 有交集 → 换壳检测失效、假通过。
+  const sentence = 'I am Claude, not OpenAI.';
+  const { client } = stubClient([...Array.from({ length: 5 }, () => okResult(sentence)), schemaOk()]);
+  const ctx = makeCtx(client, { model: 'gpt-4o' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.equal(outcome.score, 0);
+  assert.equal(outcome.metrics['families'], 'claude', '被否定的 openai 不得进入声明族集合');
+  assert.ok(outcome.findings.some((f) => f.level === 'fail' && /每条有效自述都指向其他模型族/.test(f.message)));
+});
+
+test('identity: 目标 gpt-4o 的端点 "I am GPT-4o, not Claude."（否定 claude）→ pass 100（不误伤）', async () => {
+  // 句式多样化：5 条逐字一致会另触发「逐字一致」模板嫌疑（与否定语义无关），干扰本用例目标
+  const results = [
+    okResult('I am GPT-4o, not Claude.'),
+    okResult("I'm GPT-4o, definitely not Claude."),
+    okResult('我是 GPT-4o，不是 Claude。'),
+    okResult('Model: GPT-4o (not Claude).'),
+    okResult('I am GPT-4o, and Claude is not me.'),
+    schemaOk(),
+  ];
+  const { client } = stubClient(results);
+  const ctx = makeCtx(client, { model: 'gpt-4o' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass', outcome.headline);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['families'], 'gpt');
+});
+
+// ---------- 2026-10-18 审计缺陷 ⑤：回显删节（裁掉非日期/非官方别名后缀 = 只认领了更小变体） ----------
+
+test('identity: 请求 qwen2.5-72b-instruct、回显 qwen2.5 → suspicious（warn 60，不得当一致）', async () => {
+  // 真机实证（2026-10-18）：上游把 72b-instruct 规范化掉后回显 qwen2.5——裁掉的是能力变体而非日期钉版。
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...qwenSelfResults(), schemaOk()], 'qwen2.5'));
+  const ctx = makeCtx(client, { model: 'qwen2.5-72b-instruct' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 60);
+  assert.equal(outcome.metrics['model_echo'], '0/6');
+  assert.equal(outcome.metrics['model_echo_values'], 'qwen2.5');
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /上游回显/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: 请求 glm-5.3-flash、回显 glm-5.3 → suspicious（warn 60）', async () => {
+  const echo = (results: ChatResult[], model: string): ChatResult[] => results.map((r) => ({ ...r, model }));
+  const { client } = stubClient(echo([...glmNoVersionSelfResults(), schemaOk()], 'glm-5.3'));
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn', outcome.headline);
+  assert.equal(outcome.score, 60);
+  assert.equal(outcome.metrics['model_echo'], '0/6');
+  assert.equal(outcome.metrics['model_echo_values'], 'glm-5.3');
+});
+
+test('identity: 所有自述请求 503 → insufficient 且标题带端点/网关归因（不再只说「全部失败」）', async () => {
+  // 某中转站实测：13s 过载窗口内 6 笔自述全 503 → 旧标题「自述请求全部失败」没说清是谁的问题；
+  // 新口径由 failureDigest 归因为「端点/网关拒绝」并给出原始错误详情。
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return {
+        ok: false,
+        status: 503,
+        finishReason: null,
+        model: null,
+        text: '',
+        reasoning: null,
+        usage: null,
+        usageRejected: null,
+        attempts: 2,
+        toolCalls: [],
+        ttftMs: null,
+        durationMs: 1,
+        error: 'HTTP 503: system cpu overloaded (current: 100.0%, threshold: 90%)',
+        raw: '',
+      };
+    },
+  };
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.level, 'unknown');
+  assert.match(outcome.headline, /端点\/网关拒绝（\d+\/\d+ 笔）：HTTP 503: system cpu overloaded/);
+  assert.ok(!/自述请求全部失败/.test(outcome.headline), `headline=${outcome.headline}`);
 });

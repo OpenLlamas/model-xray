@@ -4,6 +4,8 @@ export interface BalanceReading {
   unit: string; // 'USD' | 'quota' 等，仅标注不换算
   endpoint: string; // 命中的 path，用于两次查询同源校验
   currency: string | null;
+  /** 读数最小分辨率（与 value 同单位）：低于 3×resolution 的差值只能视为精度噪声，不得用于倍率判定 */
+  resolution?: number;
 }
 
 export type BalanceExtraction = Omit<BalanceReading, 'endpoint'>;
@@ -19,9 +21,11 @@ export const BALANCE_ENDPOINTS: readonly BalanceEndpoint[] = [
     path: '/dashboard/billing/usage',
     extract(json) {
       const totalUsage = json['total_usage'];
-      if (typeof totalUsage !== 'number' || !Number.isFinite(totalUsage)) return null;
-      // OpenAI 官方该字段单位为美分，extractor 内除以 100 归一为美元
-      return { value: totalUsage / 100, kind: 'spent_total', unit: 'USD', currency: null };
+      // 只认 OpenAI 的整数美分 schema：非整数说明该字段不是美分（可能是美元/quota/自造单位），
+      // 误按 ÷100 读取会产出数量级错误的倍率（2026-10-18 真机 13058.6184 → 142.975× 假 fail）。
+      if (typeof totalUsage !== 'number' || !Number.isFinite(totalUsage) || !Number.isInteger(totalUsage)) return null;
+      // OpenAI 官方该字段单位为美分，extractor 内除以 100 归一为美元；字段本身为美分整数，分辨率 0.01 USD
+      return { value: totalUsage / 100, kind: 'spent_total', unit: 'USD', currency: null, resolution: 0.01 };
     },
   },
   {
@@ -29,7 +33,7 @@ export const BALANCE_ENDPOINTS: readonly BalanceEndpoint[] = [
     extract(json) {
       const totalAvailable = json['total_available'];
       if (typeof totalAvailable !== 'number' || !Number.isFinite(totalAvailable)) return null;
-      return { value: totalAvailable, kind: 'balance', unit: 'USD', currency: null };
+      return { value: totalAvailable, kind: 'balance', unit: 'USD', currency: null, resolution: 0.01 };
     },
   },
   {
@@ -40,8 +44,8 @@ export const BALANCE_ENDPOINTS: readonly BalanceEndpoint[] = [
       if (typeof data !== 'object' || data === null || Array.isArray(data)) return null;
       const quota = (data as Record<string, unknown>)['quota'];
       if (typeof quota !== 'number' || !Number.isFinite(quota)) return null;
-      // one-api / new-api 系真实 schema：data.quota 为剩余额度（quota 单位）
-      return { value: quota, kind: 'balance', unit: 'quota', currency: null };
+      // one-api / new-api 系真实 schema：data.quota 为剩余额度（quota 单位，整数粒度）
+      return { value: quota, kind: 'balance', unit: 'quota', currency: null, resolution: 1 };
     },
   },
 ];

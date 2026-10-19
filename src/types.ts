@@ -85,6 +85,15 @@ export interface ChatResult {
   usageRejected: UsageRejection | null;
   /** 实际尝试次数（含首次；重试后成功则 >1），供计费污染闸判断重复计费风险 */
   attempts: number;
+  /**
+   * 本次调用的重试是否可能造成重复计费（请求级粘性：一旦置真不再复位；缺省/undefined 视为 false）。
+   * 置真条件：①任一次尝试拿到 200 后才重试（哪怕正文为空，上游可能已按 prompt 计费）；
+   * ②重试前的失败状态属于「可能已执行」的 408/409/500/502/504/超时/网络错误。
+   * 保持 false：仅 429/503 这类网关层明确拒绝（未进入推理、通常不计费）后才重试。
+   */
+  contaminatingRetry?: boolean;
+  /** 端点在响应头给出的 Retry-After（毫秒；缺失/无法解析为 null），用于重试退避对齐服务端节奏。 */
+  retryAfterMs?: number | null;
   toolCalls: ToolCall[];
   ttftMs: number | null;
   durationMs: number;
@@ -114,6 +123,17 @@ export interface ClientOptions {
   apiKey: string;
   timeoutMs: number;
   retries: number;
+  /**
+   * 408/409/429/5xx 的重试预算（默认 2 → 最多 3 次尝试）。与 retries（200 空正文重试）分开：
+   * 网关层拒绝的 503/429 通常未进入推理且不计费，容忍更高的重试；200 空正文可能已按 prompt 计费，
+   * 沿用较小预算。缺省等于 retries，保持旧调用方行为不变。
+   */
+  httpRetries?: number;
+  /**
+   * 运行级重试总预算（所有请求共享；默认 24）。防止端点整体过载时重试放大请求量、反而延长过载窗口。
+   * 耗尽后不再重试，如实返回最后一次结果（由探针判未判定，而非静默跳过）。
+   */
+  retryBudget?: number;
   /** 每请求进度回调（CLI/WebUI 实时展示用）；回调抛错不影响审计 */
   onRequest?: (event: RequestProgressEvent) => void;
   /** 配额熔断后继续调用时抛 QuotaExhaustedError（审计用），默认为 false（返回 429 结果）。 */
@@ -212,6 +232,8 @@ export interface RunConfig {
   seed: number;
   timeoutMs: number;
   retries: number;
+  /** 408/409/429/5xx 的重试预算（缺省 2 → 最多 3 次尝试）；与 retries（200 空正文重试）分开。 */
+  httpRetries?: number;
   /** 空响应（HTTP 200 无正文）时是否自动改用流式重发一次；缺省 true（可用 false 关闭，测试/特殊端点用）。 */
   streamFallback?: boolean;
   outDir: string;

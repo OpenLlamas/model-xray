@@ -16,8 +16,11 @@ const COLORS: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
 
 const KNOWN = new Set(['vision', 'tool', 'thinking']);
 
-/** 明确「能力被拒绝」白名单：仅 400（服务端请求级明确拒绝，如内容/形态不受支持）。其余一切失败一律视为证据不足。 */
-const EXPLICIT_REJECT = new Set<number>([400]);
+/** 明确「能力被拒绝」白名单：400/415/422 为服务端请求级明确拒绝（内容/形态/媒体类型不受支持）。
+ *  400 之外补 415（Unsupported Media Type）与 422（Unprocessable Entity）：图像/工具调用被
+ *  端点以这两类状态码明确拒绝时，与 400 同属「能力不存在」的直接证据（2026-10-18 审计缺陷 ⑦）；
+ *  其余一切失败（0/5xx/鉴权/限流/路由/未知 status）一律视为证据不足。 */
+const EXPLICIT_REJECT = new Set<number>([400, 415, 422]);
 
 /** 失败归因：仅白名单内的 4xx 构成「能力不存在」证据；0/5xx/鉴权/限流/路由/未知 status 一律 inconclusive（降 na）。 */
 function classifyFailure(status: number): 'reject' | 'inconclusive' {
@@ -41,12 +44,15 @@ export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = { claimed: claimed.join(',') };
   const parts: number[] = [];
+  /** 宣称但证据不足（na）的可评分能力：不得在其余项通过时静默消失并输出「全部通过」。 */
+  const unverified: string[] = [];
 
   if (claimed.includes('vision')) {
     const vision = await runVision(ctx, findings);
     if (vision.state === 'pass') parts.push(1);
     else if (vision.state === 'partial') parts.push(0.5);
     else if (vision.state === 'fail') parts.push(0);
+    else unverified.push('vision');
     metrics['vision'] = vision.state;
   }
   if (claimed.includes('tool')) {
@@ -54,12 +60,14 @@ export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (tool.state === 'pass') parts.push(1);
     else if (tool.state === 'partial') parts.push(0.5);
     else if (tool.state === 'fail') parts.push(0);
+    else unverified.push('tool');
     metrics['tool'] = tool.state;
   }
   if (claimed.includes('thinking')) {
     const thinking = await runThinking(ctx, findings);
     metrics['thinking'] = thinking;
   }
+  if (unverified.length > 0) metrics['unverified'] = unverified.join(',');
 
   if (parts.length === 0) {
     return {
@@ -77,12 +85,25 @@ export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let level: ProbeOutcome['level'] = score >= 100 ? 'pass' : score >= 60 ? 'warn' : 'fail';
   // 全部为部分证据（0.5）时抬升为 warn：无法完整验证不应等同「能力不存在」。
   if (level === 'fail' && parts.length > 0 && parts.every((p) => p >= 0.5)) level = 'warn';
+  if (level === 'pass' && unverified.length > 0) {
+    // 已测项全过、但仍有宣称能力未取得证据：只能判「部分无法判定」，不能输出 100 分「全部通过」。
+    return {
+      id: 'capability',
+      status: 'insufficient',
+      score: null,
+      level: 'unknown',
+      headline: `标称能力部分无法判定：${unverified.join('、')} 未取得有效证据（已测项通过）`,
+      findings,
+      metrics,
+    };
+  }
+  const unverifiedNote = unverified.length > 0 ? `；${unverified.join('、')} 未判定` : '';
   const headline =
     level === 'pass'
       ? '标称能力全部实测通过'
       : level === 'warn'
-        ? `标称能力部分异常（得分 ${score}）`
-        : '标称能力实测失败：存在宣称但不可用的能力';
+        ? `标称能力部分异常（得分 ${score}${unverifiedNote}）`
+        : `标称能力实测失败：存在宣称但不可用的能力${unverifiedNote}`;
   return { id: 'capability', status: 'ok', score, level, headline, findings, metrics };
 }
 
@@ -158,7 +179,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
       continue;
     }
     okCount += 1;
-    if (containsColorWord(result.text, color.name)) correct += 1;
+    if (parseSingleColorWord(result.text) === color.name) correct += 1;
   }
 
   if (starvedCount > 0) {
@@ -191,7 +212,9 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   }
 
   if (okCount === 0) {
-    if (failCount > 0 && failStatuses.every((s) => classifyFailure(s) === 'reject')) {
+    // 三个图像请求全部被 4xx 显式拒绝才算「能力不存在」；只有 1-2 次拒绝、其余空/截断时
+    // 端点毕竟接受过部分图像请求，不能把个别 400/415/422 当成全量能力否定。
+    if (failCount === 3 && failStatuses.every((s) => classifyFailure(s) === 'reject')) {
       findings.push({
         level: 'fail',
         message: '标称支持 vision，但端点对图像请求明确返回 4xx 拒绝：该能力不存在。',
@@ -216,9 +239,16 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
       return { state: 'na' };
     }
     const codes = [...new Set(failStatuses)].join('/');
+    const reasons = [
+      failCount > 0 ? `${failCount} 次请求失败（状态码 ${codes}）` : '',
+      emptyCount > 0 ? `${emptyCount} 次空响应` : '',
+      starvedCount > 0 ? `${starvedCount} 次推理占满预算` : '',
+    ]
+      .filter((s) => s !== '')
+      .join('、');
     findings.push({
       level: 'warn',
-      message: `vision 探针全部请求失败（状态码 ${codes}），无法判定（鉴权/限流/传输故障不代表能力缺失）。`,
+      message: `vision 探针未取得有效作答（${reasons}），无法判定（鉴权/限流/传输故障/空响应不代表能力缺失）。`,
       evidenceIds,
     });
     return { state: 'na' };
@@ -244,18 +274,68 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   }
   const emptyNote = emptyCount > 0 ? `，另有 ${emptyCount} 次空响应` : '';
   const detail = failCount === 0 ? `仅 ${correct}/${okCount} 次识别正确${emptyNote}` : `${correct}/${okCount} 次识别正确，另有 ${failCount} 次请求失败${emptyNote}`;
+  if (correct === 0 && okCount >= 2) {
+    // 至少 2 个有效作答全部识别错误（含多词/词表外回答）：单色图 + 8 色候选中随机猜的正确率约 1/8，
+    // 0/2 或 0/3 才作为「vision 不可用」的失败证据。0/1 只有一次有效样本，随机猜错率 7/8，
+    // 不足以定罪（2026-10-18 审计缺陷 ⑥：旧口径把 0/3 记 partial → 50 分，与本轮 0/1 假 fail 是两侧问题）。
+    findings.push({
+      level: 'fail',
+      message: `vision 失败：${detail}（8 色随机，全部有效作答均未识别出正确颜色）。`,
+      evidenceIds,
+    });
+    return { state: 'fail' };
+  }
+  if (correct === 0) {
+    // 仅 1 个有效作答且未命中：其余样本空响应/截断/失败，无法区分「随机猜错」与「能力不存在」。
+    findings.push({
+      level: 'warn',
+      message: `vision 有效样本仅 ${okCount}/3 次且未识别出正确颜色（${emptyCount} 次空响应、${starvedCount} 次推理截断、${failCount} 次请求失败）：证据不足，无法判定。`,
+      evidenceIds,
+    });
+    return { state: 'na' };
+  }
   findings.push({
-    level: 'fail',
-    message: `vision 可疑：${detail}（8 色随机，全部正确且无失败才通过）。`,
+    level: 'warn',
+    message: `vision 可疑：${detail}（8 色随机，全部正确且无失败才通过；部分错误按部分证据处理）。`,
     evidenceIds,
   });
   return { state: 'partial' };
 }
 
-/** 归一化词边界判色：小写后按非字母切词，整词等于基础色名才算命中；禁止 includes 子串（"reddish"/"crimson" 不得命中）。 */
-function containsColorWord(text: string, color: string): boolean {
-  const words = text.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 0);
-  return words.includes(color);
+const COLOR_NAMES = new Set(COLORS.map((c) => c.name));
+const COLOR_ALTERNATION = [...COLOR_NAMES, 'grey'].join('|');
+/** 并列颜色列表分隔：逗号（可带 or/and/nor）或空格连接的并列词。 */
+const COLOR_LIST_SEP = `(?:\\s*,\\s*(?:(?:or|and|nor)\\s+)?|\\s*\\/\\s*|\\s+(?:or|and|nor)\\s+)`;
+/** 否定语境（not/no/never/non/cannot + 冠词/副词 + 并列颜色列表）先行剔除，
+ *  避免 "not blue" 被当成在描述蓝色，也避免 "not blue or green" 只删掉 blue 后把 green 误认成唯一颜色。 */
+const NEGATED_COLOR_RE = new RegExp(
+  `\\b(?:not|no|never|non|cannot)[\\s-]+(?:(?:a|an|the|be|very|too|really|so|even|truly|actually|exactly|quite)\\s+)*(?:${COLOR_ALTERNATION})\\b(?:${COLOR_LIST_SEP}(?:${COLOR_ALTERNATION})\\b)*`,
+  'g',
+);
+const CONTRACTION_NOT_RE = /\b(?:is|are|was|were|do|does|did|can|could|would|should|must)\s*n['’]?t\b/g;
+/** "not only/just/merely/simply red" 不是「不是红色」，而是「不止红色」——单色题应视为无可判定。 */
+const NOT_ONLY_RE = /\bnot\s+(?:only|just|merely|simply)\b/;
+
+/**
+ * 归一化词边界判色：只认「全文恰好只有一个词表内颜色词」的回答。
+ * 旧实现（includes 单词检测）的缺陷（2026-10-18 审计缺陷 ⑥）：回答 "red green blue" 会因
+ * 包含目标的颜色词而计分，端点靠输出全部颜色名就能假通过——单色图问题不存在多个正确颜色。
+ * 规则：小写后先剔除否定短语（not blue / isn't blue），再按非字母切词；grey/gray 等价；
+ * 去重后恰好 1 个词表内颜色词才返回该词，否则 null。
+ */
+export function parseSingleColorWord(text: string): string | null {
+  const normalized = text
+    .toLowerCase()
+    .replace(CONTRACTION_NOT_RE, ' not ')
+    .replace(NEGATED_COLOR_RE, ' ');
+  if (NOT_ONLY_RE.test(normalized)) return null;
+  const words = normalized
+    .split(/[^a-z]+/)
+    .filter((w) => w.length > 0)
+    .map((w) => (w === 'grey' ? 'gray' : w))
+    .filter((w) => COLOR_NAMES.has(w));
+  const unique = [...new Set(words)];
+  return unique.length === 1 ? unique[0]! : null;
 }
 
 function echoTool(): ToolDef {

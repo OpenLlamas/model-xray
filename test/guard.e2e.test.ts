@@ -343,13 +343,13 @@ test('guard e2e：换模型 → model_mismatch 告警（stderr + journal anomaly
 });
 
 test('guard e2e：对账 k=1.3（可编程余额倍率）→ ratio≈1.3 verdict=warn', async () => {
-  // mock usage 固定 {10,2,12}，价格 2/8 → 单请求成本 (10×2+2×8)/1e6=3.6e-5，两请求 7.2e-5
-  // balanceRate=1.3 → 余额扣减 = 1.3 × 7.2e-5 → guard 实测倍率恰为 1.3 → DRIFT warn 档
-  const mock = await createMockServer({ mode: 'honest', balanceBase: 1000, balanceRate: 1.3, priceInput: 2, priceOutput: 8 });
+  // mock usage 固定 {10,2,12}，价格 4000/5000 → 单请求成本 (10×4000+2×5000)/1e6=0.05，两请求 0.1；
+  // balanceRate=1.3 → 余额扣减 0.13 USD（整数美分 13），guard 实测倍率恰为 1.3 → DRIFT warn 档。
+  const mock = await createMockServer({ mode: 'honest', balanceBase: 1000, balanceRate: 1.3, priceInput: 4000, priceOutput: 5000 });
   const port = await findFreePort();
   const outDir = makeTempDir('guard-e2e-k13-');
   const guard = startGuard(
-    ['guard', '--base-url', mock.baseUrl, '--port', String(port), '--out', outDir, '--price-input', '2', '--price-output', '8', '--reconcile-minutes', '15'],
+    ['guard', '--base-url', mock.baseUrl, '--port', String(port), '--out', outDir, '--price-input', '4000', '--price-output', '5000', '--reconcile-minutes', '15'],
     { ...process.env, MODEL_XRAY_KEY: GUARD_KEY },
   );
   try {
@@ -368,8 +368,8 @@ test('guard e2e：对账 k=1.3（可编程余额倍率）→ ratio≈1.3 verdict
     const reconcile = journal.reconciles[0];
     assert.ok(reconcile);
     assert.equal(reconcile.requests, 2);
-    const expectedCost = (2 * (10 * 2 + 2 * 8)) / 1e6;
-    // journal 数值统一 6 位小数圆整（9.36e-5 → 9.4e-5），容差取圆整半步 5e-7 的富余
+    const expectedCost = (2 * (10 * 4000 + 2 * 5000)) / 1e6;
+    // journal 数值统一 6 位小数圆整（0.13 → 0.13），容差取 1e-6 富余
     assert.ok(Math.abs((reconcile.cost ?? 0) - expectedCost) < 1e-6, `cost=${reconcile.cost} 期望 ${expectedCost}`);
     assert.ok(Math.abs((reconcile.spendDelta ?? 0) - 1.3 * expectedCost) < 1e-6, `spendDelta=${reconcile.spendDelta}`);
     assert.ok(Math.abs((reconcile.ratio ?? 0) - 1.3) < 1e-9, `ratio=${reconcile.ratio} 期望 1.3`);

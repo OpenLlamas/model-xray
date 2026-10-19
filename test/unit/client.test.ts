@@ -656,3 +656,124 @@ test('client: key quota exhausted opens circuit, skips retries, and sends no fur
     server.close();
   }
 });
+
+test('client: 503 在 httpRetries 独立预算内重试并采纳 Retry-After，成功后非污染', async () => {
+  // 端点过载形态（2026-10-19 某中转站实测）：网关层 503（system cpu overloaded）未进入推理、
+  // 通常不计费 → 重试不算计费污染；httpRetries（默认 2）与 retries（200 空正文）分开计预算。
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    if (calls <= 2) {
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '0' });
+      res.end(JSON.stringify({ error: { message: 'system cpu overloaded', code: 'system_cpu_overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 },
+      }),
+    );
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0, httpRetries: 2, retryBudget: 8 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
+    assert.equal(calls, 3, 'retries=0 不应影响 503 的独立预算（httpRetries=2 → 3 次尝试）');
+    assert.equal(result.ok, true);
+    assert.equal(result.text, 'pong');
+    assert.equal(result.attempts, 3);
+    assert.equal(result.contaminatingRetry, false, '503 网关拒绝后的重试不得污染计费口径');
+  } finally {
+    server.close();
+  }
+});
+
+test('client: 500 重试属可能已执行 → contaminatingRetry 粘性为 true', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    if (calls === 1) {
+      res.writeHead(500, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'injected transient 500' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 },
+      }),
+    );
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0, httpRetries: 2, retryBudget: 8 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: false });
+    assert.equal(result.ok, true);
+    assert.equal(result.attempts, 2);
+    assert.equal(result.contaminatingRetry, true, '500 可能服务端已执行并计费，重试必须判污染');
+  } finally {
+    server.close();
+  }
+});
+
+test('client: contaminatingRetry 粘性——200 空流触发重试后，即使中途 503 也保持污染', async () => {
+  // 层 3 审查必修项：200空→503→200 的交错序列不得被后续 5xx 重置为非污染。
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    if (calls === 1) {
+      res.writeHead(200, { 'content-type': 'text/event-stream' });
+      res.end('data: [DONE]\n\n');
+      return;
+    }
+    if (calls === 2) {
+      res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '0' });
+      res.end(JSON.stringify({ error: { message: 'system cpu overloaded' } }));
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(
+      JSON.stringify({
+        model: 'm',
+        choices: [{ index: 0, message: { role: 'assistant', content: 'pong' }, finish_reason: 'stop' }],
+        usage: { prompt_tokens: 7, completion_tokens: 2, total_tokens: 9 },
+      }),
+    );
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 1, httpRetries: 2, retryBudget: 8 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true });
+    assert.equal(calls, 3);
+    assert.equal(result.ok, true);
+    assert.equal(result.attempts, 3);
+    assert.equal(result.contaminatingRetry, true, '第一次尝试已可能按 prompt 计费，粘性污染不得复位');
+  } finally {
+    server.close();
+  }
+});
+
+test('client: 运行级 retryBudget 耗尽后不再重试（防端点过载时重试放大）', async () => {
+  let calls = 0;
+  const server = createServer((req, res) => {
+    calls += 1;
+    res.writeHead(503, { 'content-type': 'application/json', 'retry-after': '0' });
+    res.end(JSON.stringify({ error: { message: 'system cpu overloaded' } }));
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0, httpRetries: 2, retryBudget: 1 });
+    const first = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'a' }], stream: false });
+    assert.equal(first.attempts, 2, '预算 1 → 只允许 1 次重试（2 次尝试）');
+    const second = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'b' }], stream: false });
+    assert.equal(second.attempts, 1, '预算耗尽后不再重试，如实返回最后一次结果');
+    assert.equal(calls, 3, '总请求数 = 2（首个请求）+ 1（第二个请求不再重试）');
+  } finally {
+    server.close();
+  }
+});

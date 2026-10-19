@@ -457,6 +457,13 @@ export async function createConsoleServer(options = {}) {
       }
       args.push('--timeout', timeout);
     }
+    const httpRetries = typeof body.httpRetries === 'string' ? body.httpRetries.trim() : '';
+    if (httpRetries !== '') {
+      if (!/^\d+$/.test(httpRetries) || Number(httpRetries) > 6) {
+        throw new Error(`httpRetries 必须是 0-6 的整数（408/409/429/5xx 网关拒绝的重试预算）。收到：${JSON.stringify(httpRetries)}。示例：2`);
+      }
+      args.push('--http-retries', httpRetries);
+    }
     const out = typeof body.out === 'string' ? body.out.trim() : '';
     if (out !== '') {
       // UI 承诺「结果页内渲染」：out 越出仓库范围会导致报告无法经 /api/reports/file 读回，提前拒绝

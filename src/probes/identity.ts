@@ -1,4 +1,5 @@
 import type { ChatMessage, ProbeCtx, ProbeOutcome, ChatResult, Finding } from '../types.js';
+import { failureDigest } from '../diagnostics.js';
 import { IDENTITY_QUESTIONS, SCHEMA_PROBES } from '../assets.js';
 import { PROBE_BUDGETS, chatWithBlankFallback, isBlankAnswer, isStarved } from './starve.js';
 
@@ -49,10 +50,72 @@ interface IdentitySample {
   evidenceId: string;
 }
 
-function familiesIn(text: string): Set<string> {
+/**
+ * 否定语境检测（2026-10-18 审计缺陷 ④）：模型常用「I am Claude, not OpenAI.」这类否定句
+ * 排除他人家族；若不识别否定，单句会同时声明被否定族（红队实证：5 条
+ * 「I am Claude, not OpenAI.」样本声明 {claude, gpt}，与期望族 gpt 有交集 → 换壳检测失效）。
+ * 判定只面向别名匹配所在的分句，保守实现：任一侧能读出针对该匹配的否定即视为否定。
+ */
+function isNegated(text: string, index: number, length: number): boolean {
+  const before = text.slice(0, index);
+  const after = text.slice(index + length, index + length + 40);
+  // 分句切片：句读号/换行/转折词之后才是作用于本匹配的分句
+  const seg = before.split(/[，,。;；!?！？\n]|\b(?:but|however)\b|但(?:是)?/).pop() ?? '';
+  // 「not only/not just/isn't just」「不只/不仅」是强调而非否认（"I am not only OpenAI" 仍与
+  // openai 关联），若当否定处理会把真实族归属漏判，削弱换壳检测——先于否定分支排除。
+  const notOnly = /\b(?:not|n['’]t)\s+(?:only|just|merely)\b[^,;.!?\n]{0,24}$/i.test(seg) || /(?:不只|不仅)/.test(seg);
+  // 前缀否定：分句尾部的 not/never 或缩写式 n't（如 "I am not "、"不是"、"并非…"）
+  if (!notOnly && /\b(?:not|never)\b[^,;.!?\n]{0,24}$/i.test(seg)) return true;
+  if (!notOnly && /[a-z]['’]t\b[^,;.!?\n]{0,24}$/i.test(seg)) return true;
+  if (!notOnly && /(?:不是|并非|否认)[^，,。;；!?！？\n]{0,12}$/.test(seg)) return true;
+  if (!notOnly && /非\s*$/.test(seg)) return true;
+  // 后缀否定：「X is not me / OpenAI is not this model / 不是本模型」等形式
+  if (/\b(?:is|are|was|were)(?:\s+not|\s*n['’]t|n['’]t)\s+(?:me|this\s+(?:ai\s+)?model|my\s+(?:ai\s+)?model)\b/i.test(after)) return true;
+  if (/(?:不是|并非)(?:我|本模型|我的模型)/.test(after)) return true;
+  return false;
+}
+
+/**
+ * 从自述文本提取已声明的模型族集合。逐匹配做否定过滤：被否定语境的别名不构成声明
+ * （如 "I am Claude, not OpenAI." 只声明 claude）。对每个别名用 matchAll 遍历全部出现位置，
+ * 存在任一未否定匹配即声明该族。
+ */
+export function familiesIn(text: string): Set<string> {
   const declared = new Set<string>();
   for (const [name, pattern] of MODEL_ALIAS) {
-    if (pattern.test(text)) declared.add(name);
+    const global = pattern.flags.includes('g') ? pattern : new RegExp(pattern.source, `${pattern.flags}g`);
+    let hit = false;
+    for (const match of text.matchAll(global)) {
+      const index = match.index ?? -1;
+      if (index < 0) continue;
+      if (!isNegated(text, index, match[0].length)) {
+        hit = true;
+        break;
+      }
+    }
+    if (hit) declared.add(name);
+  }
+  return declared;
+}
+
+/**
+ * 只提取「第一人称自归属」分句里的模型族，供 mixed 判定使用。
+ * 旧实现直接对整段文本 familiesIn：合法比较句（"GPT 适合 X，Claude 适合 Y"）、引语、
+ * prompt 回显里的他族会被误算成「我也是他族」，把正常回答压成 warn 80。
+ * 规则：按句读切分 → 仅保留含第一人称/模型标签的分句 → 去掉 similar to/compared to 之后的比较内容。
+ */
+const SELF_CLAIM_RE =
+  /\b(?:i\s*(?:am|['’]m)|my (?:model|name)\b|this model is|the model is|we are)\b|我是|我叫|我来自|是我|本模型|我的模型|model\s*:/i;
+const SELF_CLAIM_SKIP_RE = /^(?:you|the user|user|prompt|question)\b/i;
+const COMPARISON_CUT_RE = /\b(?:similar to|like|compared (?:to|with)|unlike|whereas)\b[\s\S]*$/i;
+
+function selfClaimFamilies(text: string): Set<string> {
+  const declared = new Set<string>();
+  const cleaned = text.replace(/["“][^"”]*["”]/g, ' ');
+  for (const clause of cleaned.split(/[，,。;；!?！？\n]/)) {
+    const trimmed = clause.trim();
+    if (!SELF_CLAIM_RE.test(trimmed) || SELF_CLAIM_SKIP_RE.test(trimmed)) continue;
+    for (const family of familiesIn(trimmed.replace(COMPARISON_CUT_RE, ''))) declared.add(family);
   }
   return declared;
 }
@@ -69,35 +132,43 @@ function expectedFamiliesFor(targets: readonly string[]): Set<string> {
 }
 
 /**
- * 族失配统计（falsified 与多数不一致告警共用同一计数口径）：
- * 统计「声明了模型族且与期望族无交集」的样本数。未声明族（declared 为空）的样本
- * 不计入 mismatch；期望族为空（目标模型名不在别名表内）时 mismatch 恒为 0。
+ * 族失配统计（falsified 与多数不一致告警共用计数口径）：
+ * - mismatch：声明了模型族且与期望族无交集（纯他族）；
+ * - mixed：同时声明目标族与他人族（对冲/多身份声明，不能算一致）。
+ * 未声明族（declared 为空）的样本不计入；期望族为空时两者恒为 0。
+ * mixed 不得被 some(has) 洗成一致，否则「我是 GPT，也是 Claude」可稳定绕开 falsified/多数告警；
+ * 但也不能直接等同纯他族定罪，故单列并由告警层合并统计。
  */
 function countFamilyMismatch(
   samples: readonly IdentitySample[],
   expect: readonly string[],
-): { mismatch: number; expectedAliases: Set<string> } {
+): { mismatch: number; mixed: number; expectedAliases: Set<string> } {
   const expectedAliases = expectedFamiliesFor(expect);
-  if (expectedAliases.size === 0) return { mismatch: 0, expectedAliases };
+  if (expectedAliases.size === 0) return { mismatch: 0, mixed: 0, expectedAliases };
   let mismatch = 0;
+  let mixed = 0;
   for (const sample of samples) {
     const declared = familiesIn(sample.result.text);
     if (declared.size === 0) continue;
-    const consistentWithExpect = [...declared].some((d) => expectedAliases.has(d));
-    if (!consistentWithExpect) mismatch += 1;
+    const expectedHits = [...declared].filter((d) => expectedAliases.has(d)).length;
+    if (expectedHits === 0) mismatch += 1;
+    else if (expectedHits < declared.size) {
+      const selfDeclared = selfClaimFamilies(sample.result.text);
+      if ([...selfDeclared].some((d) => !expectedAliases.has(d))) mixed += 1;
+    }
   }
-  return { mismatch, expectedAliases };
+  return { mismatch, mixed, expectedAliases };
 }
 
 /**
  * falsified 判定（全体一致语义）：所有有效样本都声明了模型族、且无一与期望族相交，
- * 才判伪造。样本 5/8 个时与旧口径（3 样本 3 mismatch）同等严格度——个别样本空响应/
- * 失败天然缩样本，未声明族（declared 为空）的样本不计入 mismatch。
+ * 才判伪造。分母用有效自述数（空响应/截断/失败不加入分母），3 条有效且全部 mismatch
+ * 即可定罪；未声明族（declared 为空）的样本不计入 mismatch。
  */
-function detectFalsified(stats: { mismatch: number; expectedAliases: Set<string> }, sampleCount: number): boolean {
+function detectFalsified(stats: { mismatch: number; expectedAliases: Set<string> }, validSampleCount: number): boolean {
   if (stats.expectedAliases.size === 0) return false;
-  if (sampleCount < 3) return false;
-  return stats.mismatch === sampleCount;
+  if (validSampleCount < 3) return false;
+  return stats.mismatch === validSampleCount;
 }
 
 /** 去中转站厂商前缀（z-ai/、openai/、zhipu/ 等，可叠多层），只留模型本体，供版本号提取。 */
@@ -127,7 +198,9 @@ const BENIGN_ALIAS_SUFFIXES = new Set(['latest', 'preview', 'beta', 'exp', 'expe
  * - 回显为空/缺失：不计入（无证据），且不进分母（否则端点偶尔不回 model 会稀释真实换壳信号）；
  * - 分隔符等价（glm-5.3-flash ≡ glm-5-3-flash，网关混用点号/连字符）：视为一致；
  * - 完全相等（去厂商前缀、大小写不敏感）：一致；
- * - 回显是请求名的前缀（上游规范化掉日期/变体后缀，如 gpt-4o-2024-08-06 → gpt-4o）：视为一致；
+ * - 回显是请求名的前缀且裁掉的是纯数字日期钉版（gpt-4o-2024-08-06 → gpt-4o）或官方滚动
+ *   别名后缀（gpt-4o-latest → gpt-4o）：视为一致；裁掉的其余部分（qwen2.5-72b-instruct →
+ *   qwen2.5、glm-5.3-flash → glm-5.3）意味着上游只认领了不同的更小变体，按可疑计（审计钉 ⑤）；
  * - 回显 = 请求名 + 纯数字后缀（日期钉版）或官方滚动别名后缀（latest/preview/beta/exp）：视为一致；
  * - 其余（回显是请求的「更窄变体」如 glm-5.3-flash、gpt-4o-mini，或完全另一个模型）：计入 suspicious。
  */
@@ -151,7 +224,13 @@ function countEchoMismatch(
       continue;
     }
     if (wanted.startsWith(`${got}-`)) {
-      match += 1;
+      // 回显是请求名的删节：仅当裁掉的部分是纯数字日期钉版或官方滚动别名后缀才按一致处理
+      const removed = wanted.slice(got.length + 1);
+      if (/^\d[\d.-]*$/.test(removed) || BENIGN_ALIAS_SUFFIXES.has(removed)) {
+        match += 1;
+      } else {
+        suspicious += 1;
+      }
       continue;
     }
     const narrowed = got.startsWith(`${wanted}-`) ? got.slice(wanted.length + 1) : '';
@@ -242,6 +321,8 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let blankRetried = 0;
   let streamFallbacks = 0;
   const fallbackEvidenceIds: string[] = [];
+  /** 失败请求的原始错误串（供「无有效样本」标题归因：端点拒绝/鉴权/网络…） */
+  const selfIdErrors: string[] = [];
 
   for (const question of questions) {
     const call = await chatWithBlankFallback(ctx, {
@@ -264,6 +345,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     echoModels.push(result.model);
     if (result.model !== null && result.model.trim() !== '') echoEvidenceIds.push(call.evidenceId);
     if (!result.ok) {
+      selfIdErrors.push(result.error ?? 'unknown');
       findings.push({
         level: 'warn',
         message: `身份问答请求失败：${result.error ?? 'unknown'}`,
@@ -296,7 +378,11 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 否则多份相同截断文本会被误判成「模板特判」，冤枉 thinking 模型。
   const texts = samples.map((s) => s.result.text);
   const normalized = texts.map(normalize);
-  const answerable = normalized.filter((t) => t.length >= 3).length;
+  // 有效自述：≥3 字，或虽只有 2 字但已明确声明模型族（如「豆包」「文心」）——
+  // 后者必须计入分母，否则 mismatch 可能大于 answerable，稀释/扭曲 falsified 与多数告警。
+  const answerable = samples.filter(
+    (sample, i) => (normalized[i] ?? '').length >= 3 || familiesIn(sample.result.text).size > 0,
+  ).length;
   // 逐字一致只在「非空非纯空白」的归一化文本之间统计：空响应没有指纹含义，
   // 参与相邻比较会把「多个空回答」误判成模板特判，冤枉限流/截断下的端点。
   const nonEmpty = normalized.filter((t) => t.length > 0);
@@ -384,6 +470,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   // 族失配统计上移至此（原在降级分支前）：人格扫描与分支 a 的族判据共用同一份统计。
   const familyStats = countFamilyMismatch(samples, [ctx.cfg.model]);
+  const conflictingFamilies = familyStats.mismatch + familyStats.mixed;
 
   // 人格注入扫描（F2）：仅当目标族可识别（有「非模型族」基线）时扫全部有效样本。
   const personaHits = new Map<string, { display: string; count: number; evidenceIds: string[] }>();
@@ -435,10 +522,12 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       status: 'insufficient',
       score: null,
       level: 'unknown',
-      headline:
-        starvedSelfId > 0
-          ? '身份探针无有效样本（自述因推理占满预算或请求失败未产出答案），无法核验'
-          : '身份探针无有效样本（自述请求全部失败），无法核验',
+      headline: failureDigest(
+        selfIdErrors,
+        questions.length,
+      ) ?? (starvedSelfId > 0
+        ? '身份探针无有效样本（自述因推理占满预算或请求失败未产出答案），无法核验'
+        : '身份探针无有效样本（自述请求全部失败），无法核验'),
       findings,
       metrics,
     };
@@ -505,14 +594,14 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       metrics,
     };
   }
-  // a2) 最少有效证据门槛（2026-10-18 真机实证）：仅 1 条非空自述（其余为空流/失败）时，
-  //     无论它声明了什么族，都不足以构成身份结论——单条自述既不能证伪也不能核实，不出分。
-  //     回显不一致仍需披露（attachSoftWarns 统一处理），避免「1 条自述 + 回显异常」被当成 PASS 或 90 分。
-  if (answerable === 1) {
+  // a2) 仅有 2 条有效自述且存在族失配：既不够 falsified 的 3 条定罪线，也不能像一致样本一样 PASS。
+  //     旧逻辑在 2 条有效自述（其余空响应/推理截断）全部指向他族时，因 samples.length<3 跳过多数告警，
+  //     最终输出 100 分「身份探针未见异常」——2 条一致的他族自述虽不足以定罪，但绝不能算通过。
+  if (answerable === 2 && familyStats.mismatch > 0) {
     findings.push({
-      level: 'info',
-      message: `有效自述样本仅 ${answerable} 条（其余为空响应/请求失败/推理占满预算），不足以核验身份，结论不出分。`,
-      evidenceIds: [],
+      level: 'warn',
+      message: `有效自述样本仅 2 条，其中 ${familyStats.mismatch} 条指向其他模型族：证据不足以定罪，也不足以判定身份通过。`,
+      evidenceIds: samples.map((s) => s.evidenceId),
     });
     attachSoftWarns();
     const echoNote =
@@ -521,7 +610,42 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       id: 'identity',
       status: 'insufficient',
       score: null,
-      level: echoFinding !== null ? 'warn' : 'unknown',
+      level: 'warn',
+      headline: `有效自述样本仅 2 条且存在族失配，无法核验身份${echoNote}`,
+      findings,
+      metrics,
+    };
+  }
+  // a3) 最少有效证据门槛（2026-10-18 真机实证；2026-10-19 扩到 2 条）：少于 3 条有效自述时，
+  //     无论声明了什么族，都不足以构成身份结论——1 条既不能证伪也不能核实，2 条一致样本也不足
+  //     以证明维度通过（其余样本为空/截断时尤其如此），不出分。回显/人格等软告警仍需披露。
+  if (answerable > 0 && answerable < 3) {
+    findings.push({
+      level: 'info',
+      message: `有效自述样本仅 ${answerable} 条（其余为空响应/请求失败/推理占满预算），不足以核验身份，结论不出分。`,
+      evidenceIds: [],
+    });
+    if (conflictingFamilies > 0) {
+      const detail = [
+        familyStats.mismatch > 0 ? `${familyStats.mismatch} 条指向其他模型族` : '',
+        familyStats.mixed > 0 ? `${familyStats.mixed} 条为混合声明（含目标族）` : '',
+      ]
+        .filter((s) => s !== '')
+        .join('、');
+      findings.push({
+        level: 'warn',
+        message: `有效自述仅 ${answerable} 条，其中 ${detail}：证据不足以定罪，也不能判身份通过。`,
+        evidenceIds: samples.map((s) => s.evidenceId),
+      });
+    }
+    attachSoftWarns();
+    const echoNote =
+      echoFinding !== null ? `；上游回显模型与请求不一致（${echoStats.suspicious}/${echoStats.total}）：疑似换壳/换通道` : '';
+    return {
+      id: 'identity',
+      status: 'insufficient',
+      score: null,
+      level: findings.some((f) => f.level === 'warn') ? 'warn' : 'unknown',
       headline: `有效自述样本不足（${answerable} 条），无法核验身份${echoNote}`,
       findings,
       metrics,
@@ -549,7 +673,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     };
   }
 
-  const falsified = detectFalsified(familyStats, samples.length);
+  const falsified = detectFalsified(familyStats, answerable);
 
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
@@ -558,23 +682,35 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (falsified) {
     score = 0;
     level = 'fail';
-    headline = `身份矛盾：${samples.length} 次自述均未提及目标模型族（${ctx.cfg.model} 或其厂商）`;
+    headline = `身份矛盾：${answerable} 条有效自述均未提及目标模型族（${ctx.cfg.model} 或其厂商）`;
     findings.push({
       level: 'fail',
-      message: `目标模型族为 ${ctx.cfg.model}，但每次自述都指向其他模型族。自述不可单独定罪，但与其余探针一致时构成换壳证据。`,
+      message: `目标模型族为 ${ctx.cfg.model}，但每条有效自述都指向其他模型族。自述不可单独定罪，但与其余探针一致时构成换壳证据。`,
       evidenceIds: samples.map((s) => s.evidenceId),
     });
-  } else if (samples.length >= 3 && familyStats.mismatch >= Math.ceil(samples.length / 2) && familyStats.mismatch >= 2) {
-    // c) 多数不一致告警：未达全体一致定罪线，但多数自述指向其他模型族——疑似换壳，
-    //    压制可信度分并降为可疑，不再输出「未见异常」的假清白。
+  } else if (answerable >= 3 && conflictingFamilies >= Math.ceil(answerable / 2) && conflictingFamilies >= 2) {
+    // c) 多数不一致告警：未达全体一致定罪线，但多数有效自述未明确目标族（纯他族或混合声明）——
+    //    疑似换壳/多身份对冲，压制可信度分并降为可疑，不再输出「未见异常」的假清白。
+    //    分母只计有效自述，避免空响应稀释后把「2 条他族 + 1 条中性 + 2 条空」洗成 PASS 100。
     score = Math.min(score, 60);
     level = 'warn';
-    headline = `多数自述（${familyStats.mismatch}/${samples.length}）指向其他模型族，疑似换壳（未达全体一致定罪线）`;
-    findings.push({
-      level: 'warn',
-      message: `多数自述（${familyStats.mismatch}/${samples.length}）指向其他模型族，疑似换壳（未达全体一致定罪线）。`,
-      evidenceIds: samples.map((s) => s.evidenceId),
-    });
+    const mixedNote =
+      familyStats.mixed > 0 ? `（${familyStats.mismatch} 条纯他族、${familyStats.mixed} 条混合声明）` : '';
+    if (familyStats.mixed > 0) {
+      headline = `多数自述（${conflictingFamilies}/${answerable}）包含其他模型族声明${mixedNote}，疑似换壳/混合身份（未达全体一致定罪线）`;
+      findings.push({
+        level: 'warn',
+        message: `多数自述（${conflictingFamilies}/${answerable}）包含其他模型族声明${mixedNote}，疑似换壳/混合身份（未达全体一致定罪线）。`,
+        evidenceIds: samples.map((s) => s.evidenceId),
+      });
+    } else {
+      headline = `多数自述（${conflictingFamilies}/${answerable}）指向其他模型族，疑似换壳（未达全体一致定罪线）`;
+      findings.push({
+        level: 'warn',
+        message: `多数自述（${conflictingFamilies}/${answerable}）指向其他模型族，疑似换壳（未达全体一致定罪线）。`,
+        evidenceIds: samples.map((s) => s.evidenceId),
+      });
+    }
   } else if (claimedVersions.size > 0) {
     // 版本矛盾旁证（仅 warn，不定罪）：前提是自述族与期望族有交集（falsified 不成立）。
     // 双侧均有具体版本号且无交集才判；任一侧无版本（如 gpt-4o 无 X.Y 段）不判，metric 照记。
@@ -590,13 +726,35 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       if (level === 'pass') level = 'warn';
     }
   }
+  // d) 少量混合声明：未达多数告警线，但「目标族 + 其他族」同时出现仍不能算「未见异常」。
+  //    例如 1/5 条说「我是 GPT，也是 Claude」时不得 PASS 100；降至 warn 80 并要求人工复核。
+  if (
+    !falsified &&
+    familyStats.mixed > 0 &&
+    !findings.some((f) => f.level === 'warn' && /混合声明/.test(f.message))
+  ) {
+    score = Math.min(score, 80);
+    if (level === 'pass') {
+      level = 'warn';
+      headline = `自述同时声明目标族与其他模型族（混合声明 ${familyStats.mixed}/${answerable}），身份存疑`;
+    }
+    findings.push({
+      level: 'warn',
+      message: `自述同时声明目标族与其他模型族（混合声明 ${familyStats.mixed}/${answerable}）：不能据此判定身份通过，也不能单独定罪，建议人工复核。`,
+      evidenceIds: samples.map((s) => s.evidenceId),
+    });
+  }
   // ⑤ 上游回显 model 字段与请求模型不一致（换壳/换通道的机器证据，与 guard model_mismatch 同口径）。
   //    自述可被「教」，回显字段不会：请求 glm-5.3 却回显 glm-5.3-flash = 轻量版冒充旗舰的典型签名。
   //    但回显也可能被网关规范化（丢厂商前缀、丢日期后缀），故只压分到 warn，绝不单判定罪。
   if (echoFinding !== null) {
     score = Math.min(score, echoMajor ? 60 : 80);
-    level = 'warn';
-    headline = `上游回显模型与请求不一致（${echoStats.suspicious}/${echoStats.total}）：疑似换壳/换通道`;
+    // 回显异常本身只压到 warn，但不得把已经由 falsified 定出的 fail 降级；
+    // 否则报告会出现「分项 WARN 0 分 + 总分 FAIL 0」的自相矛盾层级，并掩盖更强结论。
+    if (level === 'pass') level = 'warn';
+    if (headline === '身份探针未见异常') {
+      headline = `上游回显模型与请求不一致（${echoStats.suspicious}/${echoStats.total}）：疑似换壳/换通道`;
+    }
     findings.push(echoFinding);
   }
   // ⑥ 人格注入（F2）：自述出现「非模型族品牌名 + assistant/助手」人格形态——端点注入 system prompt

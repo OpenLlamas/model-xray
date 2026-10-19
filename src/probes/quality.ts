@@ -1,5 +1,6 @@
 import type { ChatMessage, ChatRequest, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
 import { recordCall } from '../evidence.js';
+import { wilsonLowerBound, wilsonUpperBound } from '../stats.js';
 import { PROBE_BUDGETS, chatWithStarveRetry, isStarved, isBlankAnswer } from './starve.js';
 
 export interface Question {
@@ -162,7 +163,8 @@ export function generateQuestions(rng: Rng): Question[] {
 export function checkAnswer(text: string, question: Question): boolean {
   // 千分位逗号归一：模型常答 "7,718"，按 -?\d+ 切分会拆成 7 与 718 两个数，漏判正确答案。
   const normalized = text.replace(/\d{1,3}(?:,\d{3})+/g, (m) => m.replace(/,/g, ''));
-  const numbers = [...normalized.matchAll(/-?\d+/g)].map((m) => Number(m[0]));
+  // 小数必须整体解析：整数题答 "42.5" 不能因包含 42 而被判对（旧 -?\d+ 只是截断整数部分）。
+  const numbers = [...normalized.matchAll(/-?\d+(?:\.\d+)?/g)].map((m) => Number(m[0]));
   if (question.exclusive && question.exclusive.length > 0) {
     const hasAnswer = numbers.includes(question.answer);
     const hasDistractor = question.exclusive.some((d) => numbers.includes(d));
@@ -403,6 +405,19 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (accuracy >= 0.9) level = 'pass';
   else if (accuracy >= 0.6) level = 'warn';
   else level = 'fail';
+
+  // 准确率 95% 双侧 Wilson 置信区间（z=1.96）：小样本下点估计不可靠，区间只披露、不参与判定
+  //（0.9/0.6 阈值口径不变），供报告读者自行评估「10/10」与「40/40」的证据强度差异。
+  const ciLow = wilsonLowerBound(mainCorrect, usable, 1.96);
+  const ciHigh = wilsonUpperBound(mainCorrect, usable, 1.96);
+  metrics['accuracy_ci95_low'] = Math.round(ciLow * 1000) / 1000;
+  metrics['accuracy_ci95_high'] = Math.round(ciHigh * 1000) / 1000;
+  findings.push({
+    level: 'info',
+    message: `主样本 ${usable} 题的准确率 95% 置信区间为 [${(ciLow * 100).toFixed(1)}%, ${(ciHigh * 100).toFixed(1)}%]` +
+      (ciHigh - ciLow > 0.15 ? '：样本量偏小、区间较宽，结论置信度有限，建议复测或扩样后再定性。' : '。'),
+    evidenceIds: [],
+  });
 
   const excludedNote = excluded > 0 ? `，另有 ${excluded} 题因推理占满预算剔除分母` : '';
   let headline =

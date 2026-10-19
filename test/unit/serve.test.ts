@@ -360,7 +360,7 @@ test('serve：/api/test 携带 key 字段（dry-run）→ 注入子进程且日�
 });
 test('serve：非 dry-run 真实审计（mock 上游）→ reportPaths 为绝对路径且可经 /api/reports/file 读取', { timeout: 180000 }, async () => {
   const server = await startServer();
-  const mock: MockServer = await createMockServer({ mode: 'honest' });
+  const mock: MockServer = await createMockServer({ mode: 'honest', balanceRate: 1 });
   const outDir = join(REPO_ROOT, 'reports', 'tmp-serve-e2e');
   try {
     // 页面录入 key（mock 不校验具体值，但 CLI 非 dry-run 要求 key 存在）
@@ -369,7 +369,15 @@ test('serve：非 dry-run 真实审计（mock 上游）→ reportPaths 为绝对
     const res = await postJson(
       server.port,
       '/api/test',
-      { baseUrl: mock.baseUrl, model: 'gpt-4o', seed: '1234', out: 'reports/tmp-serve-e2e' },
+      // 宣称价格 + 余额端点（mock 1.0 倍扣费）= 绝对对账，billing 100（仅形状证据时为 85）。
+      {
+        baseUrl: mock.baseUrl,
+        model: 'gpt-4o',
+        seed: '1234',
+        out: 'reports/tmp-serve-e2e',
+        priceInput: '2',
+        priceOutput: '8',
+      },
       server.token,
     );
     assert.equal(res.status, 200, `POST /api/test 应 200：${res.body}`);

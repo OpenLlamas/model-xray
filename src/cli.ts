@@ -34,7 +34,8 @@ test Options:
   --price-input2 <n>        Claimed input price per 1M tokens above the tier threshold, must be > 0
   --price-output2 <n>       Claimed output price per 1M tokens above the tier threshold, must be > 0
   --price-cached-read2 <n>  Claimed cache-read price above the tier threshold, must be >= 0 (default: input2 price)
-  --retries <n>             Retries per request on 408/409/429/5xx and 200 empty bodies, integer in [0, 3] (default: 1)
+  --retries <n>             Retries per request on 200 empty bodies, integer in [0, 3] (default: 1)
+  --http-retries <n>        Retries per request on 408/409/429/5xx gateway rejections (not billed, safe to retry), integer in [0, 6] (default: 2)
                             注意：每次重试都会真实计费；默认重试 1 次以应对瞬时 5xx/空流，重试会令实测倍率判定作废（防重复计费污染）
   --baseline <path>         Compare fingerprints against a baseline file (seed is reused unless --seed)
   --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json)
@@ -92,6 +93,7 @@ async function main(argv: string[]): Promise<number> {
         seed: { type: 'string' },
         timeout: { type: 'string' },
         retries: { type: 'string' },
+        'http-retries': { type: 'string' },
         out: { type: 'string', default: 'reports' },
         yes: { type: 'boolean', default: false },
         'dry-run': { type: 'boolean', default: false },
@@ -247,6 +249,8 @@ async function main(argv: string[]): Promise<number> {
   if (timeoutSeconds === null) return 2;
   const retries = values.retries !== undefined ? strictInt(values.retries, 0, 3, 'retries', '1') : 1;
   if (retries === null) return 2;
+  const httpRetries = values['http-retries'] !== undefined ? strictInt(values['http-retries'], 0, 6, 'http-retries', '2') : 2;
+  if (httpRetries === null) return 2;
 
   const cfg: RunConfig = {
     baseUrl,
@@ -259,6 +263,7 @@ async function main(argv: string[]): Promise<number> {
     seed,
     timeoutMs: timeoutSeconds * 1000,
     retries,
+    httpRetries,
     outDir: values.out ?? 'reports',
     html: true,
     yes: values.yes === true,
@@ -361,6 +366,8 @@ async function main(argv: string[]): Promise<number> {
   if (report.overall === 'fail') return 1;
   // total=null 表示没有任何足够的可评分证据（哪怕个别维度给出 warn 线索）——按契约属于「未得出结论」，
   // 退出码必须是 2，避免配额耗尽/端点全挂的一轮被脚本误当成「可疑但已完成」。
+  // billing 仅有形状证据时不再悬置为 insufficient（本维度核验对象是 usage，形状全过给判定 85），
+  // 因此 total null 只会来自真实样本不足。
   if (report.total === null || report.overall === 'unknown') {
     console.error('审计未能得出结论（可评分项不足）。请核对 API key、端点可达性与模型名后重试；详见报告 notes。');
     return 2;

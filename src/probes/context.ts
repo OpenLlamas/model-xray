@@ -1,6 +1,7 @@
-import type { ChatMessage, ChatResult, Finding, ProbeCtx, ProbeOutcome } from '../types.js';
+import type { ChatMessage, ChatResult, Finding, ProbeCtx, ProbeOutcome, Rng } from '../types.js';
 import { buildEchoQuestion, buildFiller, buildNeedle, buildNeedleQuestion } from '../assets.js';
 import { isStarved, isBlankAnswer, chatWithStarveRetry, PROBE_BUDGETS } from './starve.js';
+import { estimateMessageTokens } from '../tokens.js';
 
 const DEPTHS = [0.25, 0.5, 0.75, 0.9];
 
@@ -17,6 +18,39 @@ const NON_SIZE_REJECT =
 /** 仅「400 且响应体未指向其他归因」才构成「输入过大被显式拒绝」的证据。 */
 function isSizeRejection(result: ChatResult): boolean {
   return !result.ok && result.status === 400 && !NON_SIZE_REJECT.test(result.error ?? '');
+}
+
+/**
+ * 记录编号与校验口令分开生成（2026-10-18 审计缺陷 ①）：两者必须互不相同——
+ * 旧实现复用同一随机串，模型只要把问题里的编号原样复述就能冒充「读到文档」。
+ * 命中判定只认只在文档正文里出现过的口令；问题中只有编号。
+ */
+function freshNeedleIds(rng: Rng): { recordId: string; passphrase: string } {
+  const recordId = rng.nonce(6);
+  let passphrase = rng.nonce(6);
+  while (passphrase === recordId) passphrase = rng.nonce(6);
+  return { recordId, passphrase };
+}
+
+/**
+ * usage 校准采信带宽（2026-10-18 审计缺陷 ③）：深度样本只按字符估算构造，
+ * 真机实测标称 50% 实际约 35%、标称 75% 实际约 50%（估算高估 CJK 输入），
+ * 「窗口属实」的通过结论必须核对端点自报的实际输入量级。
+ * 带宽 [0.25, 4]：超出即视为 usage 不可信（缺失/乱报），不据其校准也不据此指控。
+ */
+const MIN_PLAUSIBLE_USAGE_RATIO = 0.25;
+const MAX_PLAUSIBLE_USAGE_RATIO = 4;
+
+/** 端点自报 prompt_tokens 与本地估算同量级（比值落在采信带宽内）才返回该值，否则返回 null。 */
+function plausiblePromptTokens(result: ChatResult, estimated: number): number | null {
+  const usage = result.usage;
+  if (usage === null) return null;
+  const raw = usage.prompt_tokens;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null;
+  if (!Number.isFinite(estimated) || estimated <= 0) return null;
+  const ratio = raw / estimated;
+  if (ratio < MIN_PLAUSIBLE_USAGE_RATIO || ratio > MAX_PLAUSIBLE_USAGE_RATIO) return null;
+  return raw;
 }
 
 interface DepthStat {
@@ -47,6 +81,8 @@ interface DepthConfirmation {
   starved: number;
   errored: number;
   empty: number;
+  /** 该档采信的 usage.prompt_tokens 最大值（全部不可信时为 null） */
+  maxActualPromptTokens: number | null;
   evidenceIds: string[];
   emptyEvidenceIds: string[];
 }
@@ -197,19 +233,20 @@ async function confirmDepth(
   let starved = 0;
   let errored = 0;
   let empty = 0;
+  let maxActualPromptTokens: number | null = null;
   for (let i = 0; i < confirmSamples; i += 1) {
-    const nonce = ctx.rng.nonce(6);
+    const { recordId, passphrase } = freshNeedleIds(ctx.rng);
     const filler = buildFiller(ctx.rng, targetTokens);
     const position = Math.floor(filler.length * ((i + 0.5) / confirmSamples));
-    const needle = buildNeedle(ctx.rng, nonce);
+    const needle = buildNeedle(ctx.rng, recordId, passphrase);
     const document = `${filler.slice(0, position)}\n\n${needle}\n\n${filler.slice(position)}`;
     const messages: ChatMessage[] = [
       { role: 'system', content: '你将收到一份长文档和一个问题。请只依据文档内容回答，不要编造。' },
-      { role: 'user', content: `${document}\n\n${buildNeedleQuestion(nonce, 'zh')}` },
+      { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
     ];
     const call = await chatWithStarveRetry(ctx, {
       probe: 'context',
-      label: `confirm depth=${depth} nonce=${nonce}`,
+      label: `confirm depth=${depth} nonce=${passphrase}`,
       buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages, temperature: 0, max_tokens: maxTokens }),
       budget: PROBE_BUDGETS.context,
       retryBudget: PROBE_BUDGETS.contextRetry,
@@ -229,9 +266,11 @@ async function confirmDepth(
       continue;
     }
     attempted += 1;
-    if (containsNonce(call.result.text, nonce)) hits += 1;
+    const actualPromptTokens = plausiblePromptTokens(call.result, estimateMessageTokens(messages));
+    if (actualPromptTokens !== null) maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, actualPromptTokens);
+    if (containsNonce(call.result.text, passphrase)) hits += 1;
   }
-  return { depth, hits, attempted, starved, errored, empty, evidenceIds, emptyEvidenceIds };
+  return { depth, hits, attempted, starved, errored, empty, maxActualPromptTokens, evidenceIds, emptyEvidenceIds };
 }
 
 export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
@@ -266,6 +305,12 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let erroredSamples = 0;
   let validNeedleSamples = 0;
   let echoStarved = false;
+  /** 采信的最大实际输入 tokens（端点自报 usage.prompt_tokens，须与本地估算同量级） */
+  let maxActualPromptTokens: number | null = null;
+  /** 实际发送的输入 tokens 本地估算最大值（校准基准：自报应与发送量级一致，而非与标称值比） */
+  let maxSentPromptTokens = 0;
+  /** 逐深度采信的实际输入 tokens 最大值（用于报告披露每个深度的真实达成度） */
+  const depthActual: Record<string, number> = {};
 
   const depthResults: Record<string, string> = {};
   const depthMiss: Record<string, boolean> = {};
@@ -281,21 +326,21 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     let successAtDepth = 0;
     let attempted = 0;
     for (let i = 0; i < samplesPerDepth; i += 1) {
-      const nonce = ctx.rng.nonce(6);
+      const { recordId, passphrase } = freshNeedleIds(ctx.rng);
       const filler = buildFiller(ctx.rng, targetTokens);
       const fraction = (i + 0.5) / samplesPerDepth;
       const position = Math.floor(filler.length * fraction);
-      const needle = buildNeedle(ctx.rng, nonce);
+      const needle = buildNeedle(ctx.rng, recordId, passphrase);
       const document = `${filler.slice(0, position)}\n\n${needle}\n\n${filler.slice(position)}`;
       const lang = ctx.rng.bool(0.5) ? 'zh' : 'en';
-      const question = buildNeedleQuestion(nonce, lang);
+      const question = buildNeedleQuestion(recordId, lang);
       const messages: ChatMessage[] = [
         { role: 'system', content: '你将收到一份长文档和一个问题。请只依据文档内容回答，不要编造。' },
         { role: 'user', content: `${document}\n\n${question}` },
       ];
       const call = await chatWithStarveRetry(ctx, {
         probe: 'context',
-        label: `needle depth=${depth} nonce=${nonce}`,
+        label: `needle depth=${depth} nonce=${passphrase}`,
         buildRequest: (maxTokens) => ({ model: ctx.cfg.model, messages, temperature: 0, max_tokens: maxTokens }),
         budget: PROBE_BUDGETS.context,
         retryBudget: PROBE_BUDGETS.contextRetry,
@@ -310,7 +355,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       if (call.retried) {
         findings.push({
           level: 'info',
-          message: `深度 ${(depth * 100).toFixed(0)}% needle ${nonce}：首查推理占满预算，已升预算重试。`,
+          message: `深度 ${(depth * 100).toFixed(0)}% needle ${passphrase}：首查推理占满预算，已升预算重试。`,
           evidenceIds,
         });
       }
@@ -320,7 +365,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
           level: 'info',
-          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${nonce}：响应为空/截断（推理占满预算），该样本不计入截断判定。`,
+          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${passphrase}：响应为空/截断（推理占满预算），该样本不计入截断判定。`,
           evidenceIds,
         });
         continue;
@@ -334,7 +379,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
           level: 'info',
-          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${nonce}：HTTP 400 拒绝（暂不计未命中，待差分验证是否与输入长度相关）。`,
+          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${passphrase}：HTTP 400 拒绝（暂不计未命中，待差分验证是否与输入长度相关）。`,
           evidenceIds,
         });
         continue;
@@ -350,7 +395,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         coverageGapEvidenceIds.push(...evidenceIds);
         findings.push({
           level: 'warn',
-          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${nonce}：请求失败 ${result.error ?? 'unknown'}（传输/协议或非尺寸类拒绝，不计入截断判定：既非命中也非未命中）。`,
+          message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${passphrase}：请求失败 ${result.error ?? 'unknown'}（传输/协议或非尺寸类拒绝，不计入截断判定：既非命中也非未命中）。`,
           evidenceIds,
         });
         continue;
@@ -365,7 +410,16 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         continue;
       }
       attempted += 1;
-      const hit = containsNonce(result.text, nonce);
+      // usage 校准（审计缺陷 ③）：成功样本的端点自报 prompt_tokens 与本地估算同量级时采信，
+      // 供最终 pass 门槛核对「自报与实际发送量级一致」。
+      const sentPromptTokens = estimateMessageTokens(messages);
+      maxSentPromptTokens = Math.max(maxSentPromptTokens, sentPromptTokens);
+      const actualPromptTokens = plausiblePromptTokens(result, sentPromptTokens);
+      if (actualPromptTokens !== null) {
+        maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, actualPromptTokens);
+        depthActual[String(depth)] = Math.max(depthActual[String(depth)] ?? 0, actualPromptTokens);
+      }
+      const hit = containsNonce(result.text, passphrase);
       if (hit) {
         successAtDepth += 1;
         anySuccess = true;
@@ -373,7 +427,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       records.push({ depth, hits: successAtDepth, attempted, sizeRejects: 0, requested: 1 });
       findings.push({
         level: hit ? 'info' : 'warn',
-        message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${nonce}：${
+        message: `深度 ${(depth * 100).toFixed(0)}%（约 ${targetTokens} tokens）needle ${passphrase}：${
           hit ? '命中' : `未命中（响应：${preview(result.text)}）`
         }`,
         evidenceIds,
@@ -412,17 +466,27 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   // 差分验证：出现 400 时，用一个短输入对照样本确认「拒绝是否与输入长度相关」。
   // 确认失败（短输入同样 400/失败）→ 400 一律降为不可判定样本，绝不据此指控窗口不实。
+  // 某档「整档全部为尺寸类 400」：该档所有样本 requested 均为拒绝，且没有任何有效样本文本。
+  // 复验与最终定罪都以「首个整档被拒的高深度档」为前沿；不能用该档内一次偶发 400
+  // （同档后续样本成功）作为复验长度，否则会把真实前沿 75% 的复验错发到 50% 并因此漏判。
+  const fullyRejectedDepth = (depth: number): boolean => {
+    const tierRecords = records.filter((r) => r.depth === depth);
+    const requested = tierRecords.reduce((sum, r) => sum + r.requested, 0);
+    const sizeRejects = tierRecords.reduce((sum, r) => sum + r.sizeRejects, 0);
+    return tierRecords.length > 0 && requested > 0 && sizeRejects === requested;
+  };
   let sizeRejectionConfirmed = false;
   const pendingSizeRejects = records.reduce((sum, r) => sum + r.sizeRejects, 0);
   if (pendingSizeRejects > 0) {
     // 多长度 + 配对长样本复验（层 3 反向审查：单发短样本成功可能是偶发/故障恢复后的巧合）：
     // ① 两发不同长度的短输入都要成功 → 端点确实接受短输入；
-    // ② 在「最小被拒深度」补发一发长样本，仍须被拒 → 400 可复现，不是瞬时抖动。
-    const rejectedDepths = [...new Set(records.filter((r) => r.sizeRejects > 0).map((r) => r.depth))].sort((a, b) => a - b);
-    const smallestRejected = rejectedDepths[0];
+    // ② 在「首个整档被拒的高深度档」补发一发长样本，仍须被拒 → 400 可复现，不是瞬时抖动。
+    const fullyRejectedHighDepths = DEPTHS.filter((d) => d >= 0.5 && fullyRejectedDepth(d));
+    const anyRejectedDepths = [...new Set(records.filter((r) => r.sizeRejects > 0).map((r) => r.depth))].sort((a, b) => a - b);
+    const smallestRejected = fullyRejectedHighDepths[0] ?? anyRejectedDepths[0];
     const controls: SizeControl[] = [];
     for (const tokens of [512, 1024]) controls.push(await differentialSizeProbe(ctx, claimed, tokens));
-    // 长样本复验必须在「最小被拒深度」的真实长度上发（传深度比例会退化成极短输入，必然被接受）
+    // 长样本复验必须在「首个整档被拒的高深度档」的真实长度上发（传深度比例会退化成极短输入，必然被接受）
     const longRetest = smallestRejected !== undefined
       ? await differentialSizeProbe(ctx, claimed, Math.floor(claimed * smallestRejected), true)
       : null;
@@ -455,27 +519,21 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (record.attempted === 0) continue;
     depthStats[String(record.depth)] = { hits: record.hits, attempted: record.attempted };
   }
-  // 显式拒绝需「差分验证通过 + 某深度（≥50%）整档全部为 400 且零有效样本」
+  // 显式拒绝需「差分验证通过 + 某深度（≥50%）整档全部为 400 且零有效样本」。
+  // 拒绝前沿从「首个整档被拒的高深度档」开始：50% 档可读、75%/90% 整档 400 同样是
+  // 窗口小于标称值的直接证据，不能要求所有高深度档都被拒（否则 75% 前沿永远漏判）。
+  // 前沿以下（更深）允许 400/空响应/故障等非有效样本，但一旦出现任何有效应答
+  // （attempted>0，含命中与未命中），拒绝就不再随深度单调，说明可能是请求特异性拒绝。
   if (sizeRejectionConfirmed) {
-    // 「整档全部被拒」必须构成单调拒绝前沿：所有深度 ≥50% 的档位请求全部为尺寸类 400（层 3 审查）——
-    // 中间档偶发成功说明是请求特异性拒绝（如内容策略），不能整体归因为长度。
-    // 必须按档聚合该档所有记录：records 为逐样本追加，find 只取首条会把
-    // 「首样本 400、后续样本成功」误判成整档拒绝（假阳性定罪）。
-    const highDepthsRe = DEPTHS.filter((d) => d >= 0.5);
-    const frontierOk = highDepthsRe.every((d) => {
-      const tierRecords = records.filter((r) => r.depth === d);
-      const requested = tierRecords.reduce((sum, r) => sum + r.requested, 0);
-      const sizeRejects = tierRecords.reduce((sum, r) => sum + r.sizeRejects, 0);
-      const finalStat = depthStats[String(d)];
-      return (
-        tierRecords.length > 0 &&
-        requested > 0 &&
-        sizeRejects === requested &&
-        (finalStat?.attempted ?? 0) === 0 &&
-        (finalStat?.hits ?? 0) === 0
-      );
-    });
-    explicitReject = frontierOk;
+    const highTiers = DEPTHS.filter((d) => d >= 0.5).map((d) => ({
+      depth: d,
+      allRejected: fullyRejectedDepth(d),
+      attempted: depthStats[String(d)]?.attempted ?? 0,
+    }));
+    const firstRejected = highTiers.findIndex((t) => t.allRejected);
+    explicitReject =
+      firstRejected >= 0 &&
+      highTiers.slice(firstRejected).every((t) => t.allRejected || t.attempted === 0);
   }
 
   metrics['depth_hits'] = Object.entries(depthResults).map(([d, v]) => `${d}:${v}`).join(' ');
@@ -525,6 +583,10 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
       depthStats[key] = { hits: base.hits + c.hits, attempted: base.attempted + c.attempted };
       depthResults[key] = `${depthStats[key]!.hits}/${depthStats[key]!.attempted}`;
       depthMiss[key] = depthStats[key]!.hits < depthStats[key]!.attempted;
+      if (c.maxActualPromptTokens !== null) {
+        maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, c.maxActualPromptTokens);
+        depthActual[key] = Math.max(depthActual[key] ?? 0, c.maxActualPromptTokens);
+      }
       findings.push({
         level: 'info',
         message: `确认性复采：深度 ${(c.depth * 100).toFixed(0)}% 补 ${confirmSamples} 个新样本，命中 ${c.hits}/${c.attempted}${c.starved > 0 ? `（${c.starved} 个推理占满预算）` : ''}${c.errored > 0 ? `（${c.errored} 个请求失败）` : ''}${c.empty > 0 ? `（${c.empty} 个空响应）` : ''}；合并后该档 ${depthStats[key]!.hits}/${depthStats[key]!.attempted}。`,
@@ -642,6 +704,14 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const echoEmpty = !echoStarved && !echoTransportError && isBlankAnswer(echoResult);
   const echoInconclusive = echoStarved || echoTransportError || echoEmpty;
   const echoHit = !echoInconclusive && echoResult.ok && containsNonce(echoResult.text, echoNonce);
+  // 回显样本（标称 90% 长度）给出的是最大实际输入量级：同样纳入 usage 校准采集。
+  if (!echoInconclusive && echoResult.ok) {
+    maxSentPromptTokens = Math.max(maxSentPromptTokens, estimateMessageTokens(echoMessages));
+    const echoActualPromptTokens = plausiblePromptTokens(echoResult, estimateMessageTokens(echoMessages));
+    if (echoActualPromptTokens !== null) {
+      maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, echoActualPromptTokens);
+    }
+  }
   metrics['tail_echo'] = echoStarved
     ? 'starved'
     : echoTransportError
@@ -674,6 +744,7 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   let boundaryScanned = false;
   let boundaryTruncated = false;
+  let boundaryConclusive = false;
   if (!explicitReject && anySuccess && ctx.cfg.deep) {
     boundaryScanned = true;
     const scan = await scanBoundary(ctx, claimed);
@@ -715,9 +786,40 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
         evidenceIds: scan.evidenceIds,
       });
     }
+    if (scan.blankSeen) {
+      // 空响应（HTTP 200 空文本）不提供任何可读性证据：既不能计命中也不能计未命中（审计缺陷 ② 同口径）。
+      findings.push({
+        level: 'info',
+        message: '边界扫描存在空响应样本（HTTP 200 空文本）：扫描提前终止，不据此判定截断（空响应 ≠ 不可读）。',
+        evidenceIds: scan.evidenceIds,
+      });
+      metrics['boundary_blank'] = 1;
+    }
+    if (scan.actualPromptMax !== null) {
+      maxActualPromptTokens = Math.max(maxActualPromptTokens ?? 0, scan.actualPromptMax);
+    }
+    // 边界扫描完整走完且未定界/未中断：这是「标称深度可读」的确定性证据（实际发送到 claim 量级），
+    // usage 自报口径差异不应推翻它（usage 校准门对其豁免，见下方 pass 门槛）。
+    boundaryConclusive = !scan.found && !scan.starvedSeen && !scan.blankSeen && !scan.erroredSeen && !scan.explicitReject;
   }
   metrics['boundary_scanned'] = boundaryScanned ? 1 : 0;
+  metrics['boundary_conclusive'] = boundaryConclusive ? 1 : 0;
   if (starvedCount > 0 || echoStarved) metrics['starved_samples'] = starvedCount + (echoStarved ? 1 : 0);
+
+  // —— usage 校准披露（审计缺陷 ③）：端点自报与实际发送量级一致时，披露标称深度的真实达成度 ——
+  if (maxActualPromptTokens !== null) {
+    metrics['actual_prompt_tokens_max'] = maxActualPromptTokens;
+    findings.push({
+      level: 'info',
+      message: `实测输入 token：上游 usage.prompt_tokens 最大值 ${maxActualPromptTokens}，标称 ${claimed}（${Math.round((maxActualPromptTokens / claimed) * 100)}%）。`,
+      evidenceIds: [],
+    });
+  } else {
+    metrics['actual_prompt_tokens_max'] = 'N/A';
+  }
+  if (Object.keys(depthActual).length > 0) {
+    metrics['depth_actual_tokens'] = DEPTHS.map((d) => `${(d * 100).toFixed(0)}%:${depthActual[String(d)] ?? 'N/A'}`).join(' ');
+  }
 
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
@@ -917,6 +1019,51 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     };
   }
 
+  // —— 「窗口属实」的 pass 门槛（审计缺陷 ③）——
+  // 2026-10-18 真机实证：标称 0.5 深度端点自报约 0.35、0.75 约 0.5，不能拿自报值与标称值直接比。
+  // pass 结论改为核对端点自报与实际发送估算的量级（同一基准才可比）：最大采信值不足实际发送估算
+  // 90% 时无法确认标称窗口属实，降为无法判定；usage 完全不可信时保留通过结论但明确披露未校准。
+  // 注意：本地估算为启发式（CJK 按 1 字/token），与端点分词口径可能相差 ±30%，故该门只作「无法
+  // 确认」的保守降级、绝不据此指控虚报（finding 文案如实注明两种可能）。
+  // 确定性证据（显式 400 拒绝属非 pass 分支；完整边界扫描 boundaryConclusive 直接豁免）与
+  // warn/fail 分支不受本门槛影响。
+  if (level === 'pass' && missingDepths.length > 0) {
+    // pass 只能说明其余深度与（--deep 时）边界扫描/高深度回显未发现截断，不等于缺失深度被实测命中；
+    // 标题不得再宣称「needle 全部命中」，否则与 depth_hits 计数自相矛盾。
+    findings.push({
+      level: 'info',
+      message: `${missingDepths.map((d) => `${(d * 100).toFixed(0)}%`).join('、')} 深度没有有效 needle 样本（空响应/请求失败/推理占满预算）：本次通过结论由其余深度${boundaryConclusive ? '与完整边界扫描' : '与结尾回显'}支撑，不表示这些深度已实测命中。`,
+      evidenceIds: coverageGapEvidenceIds,
+    });
+    headline = `上下文实测通过：标称 ${claimed} tokens 的其余深度${boundaryConclusive ? '与边界扫描' : '与结尾回显'}未发现截断（缺失 ${missingDepths.map((d) => `${(d * 100).toFixed(0)}%`).join('、')} 有效样本）`;
+  }
+
+  if (level === 'pass' && !boundaryConclusive) {
+    if (maxActualPromptTokens === null) {
+      findings.push({
+        level: 'warn',
+        message: '未取得可信的 usage.prompt_tokens（缺失或与实际输入量级不符）：本次通过结论未经端点自报用量校准，实际发送深度未知。',
+        evidenceIds: [],
+      });
+    } else if (maxActualPromptTokens < maxSentPromptTokens * 0.9) {
+      const sentPct = Math.round((maxActualPromptTokens / maxSentPromptTokens) * 100);
+      findings.push({
+        level: 'warn',
+        message: `实测最大输入仅 ${maxActualPromptTokens} tokens，而本地估算实际发送约 ${maxSentPromptTokens} tokens（自报仅为发送量的 ${sentPct}%）：可能是端点自报用量缩水，也可能是与本地启发式估算的分词口径差异（CJK 估算偏高），无法确认标称窗口的验证深度。`,
+        evidenceIds: [],
+      });
+      return {
+        id: 'context',
+        status: 'insufficient',
+        score: null,
+        level: 'unknown',
+        headline: `实测输入深度不足：自报最大 ${maxActualPromptTokens} tokens 仅为实际发送（约 ${maxSentPromptTokens}）的 ${sentPct}%，用量校准不通过，无法确认标称窗口`,
+        findings,
+        metrics,
+      };
+    }
+  }
+
   return { id: 'context', status: 'ok', score, level, headline, findings, metrics };
 }
 
@@ -934,12 +1081,12 @@ async function differentialSizeProbe(
   asLongSample = false,
 ): Promise<{ ok: boolean; tokens: number; error: string | null; hit: boolean; sizeRejected: boolean; evidenceIds: string[] }> {
   const tokens = overrideTokens ?? Math.min(1024, Math.max(256, Math.floor(claimed * 0.02)));
-  const nonce = ctx.rng.nonce(6);
+  const { recordId, passphrase } = freshNeedleIds(ctx.rng);
   const filler = buildFiller(ctx.rng, tokens);
-  const document = `${filler}\n\n${buildNeedle(ctx.rng, nonce)}`;
+  const document = `${filler}\n\n${buildNeedle(ctx.rng, recordId, passphrase)}`;
   const messages: ChatMessage[] = [
     { role: 'system', content: '你将收到一份文档和问题，只依据文档回答。' },
-    { role: 'user', content: `${document}\n\n${buildNeedleQuestion(nonce, 'zh')}` },
+    { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
   ];
   const call = await chatWithStarveRetry(ctx, {
     probe: 'context',
@@ -955,7 +1102,7 @@ async function differentialSizeProbe(
     ok,
     tokens,
     error: ok ? null : starved ? '推理占满预算未作答' : (result.error ?? 'unknown'),
-    hit: ok && containsNonce(result.text, nonce),
+    hit: ok && containsNonce(result.text, passphrase),
     sizeRejected: !result.ok && isSizeRejection(result),
     evidenceIds: call.evidenceIds,
   };
@@ -976,14 +1123,14 @@ async function boundaryShot(
   mid: number,
   label: string,
   pos: 'head' | 'tail',
-): Promise<{ result: ChatResult; nonce: string; evidenceIds: string[] }> {
-  const nonce = ctx.rng.nonce(6);
+): Promise<{ result: ChatResult; nonce: string; estimatedPrompt: number; evidenceIds: string[] }> {
+  const { recordId, passphrase } = freshNeedleIds(ctx.rng);
   const filler = buildFiller(ctx.rng, mid);
-  const needle = buildNeedle(ctx.rng, nonce);
+  const needle = buildNeedle(ctx.rng, recordId, passphrase);
   const document = pos === 'head' ? `${needle}\n\n${filler}` : `${filler}\n\n${needle}`;
   const messages: ChatMessage[] = [
     { role: 'system', content: '你将收到一份文档和问题，只依据文档回答。' },
-    { role: 'user', content: `${document}\n\n${buildNeedleQuestion(nonce, 'zh')}` },
+    { role: 'user', content: `${document}\n\n${buildNeedleQuestion(recordId, 'zh')}` },
   ];
   const call = await chatWithStarveRetry(ctx, {
     probe: 'context',
@@ -992,21 +1139,30 @@ async function boundaryShot(
     budget: PROBE_BUDGETS.context,
     retryBudget: PROBE_BUDGETS.contextRetry,
   });
-  return { result: call.result, nonce, evidenceIds: call.evidenceIds };
+  return { result: call.result, nonce: passphrase, estimatedPrompt: estimateMessageTokens(messages), evidenceIds: call.evidenceIds };
 }
 
-/** 边界采样的可读性结果：'read'=needle 可找回 / 'miss'=正文可用但找不回 needle / 'reject'=尺寸类 400。 */
+/** 边界采样的可读性结果：'read'=needle 可找回 / 'miss'=正文可用但找不回 needle / 'blank'=HTTP 200 空文本 / 'reject'=尺寸类 400。 */
 async function readBoundaryShot(
   ctx: ProbeCtx,
   mid: number,
   label: string,
   pos: 'head' | 'tail',
-): Promise<{ verdict: 'read' | 'miss' | 'reject' | 'errored' | 'starved'; evidenceIds: string[] }> {
+): Promise<{ verdict: 'read' | 'miss' | 'blank' | 'reject' | 'errored' | 'starved'; actualPromptTokens: number | null; evidenceIds: string[] }> {
   const shot = await boundaryShot(ctx, mid, label, pos);
-  if (isStarved(shot.result)) return { verdict: 'starved', evidenceIds: shot.evidenceIds };
-  if (isSizeRejection(shot.result)) return { verdict: 'reject', evidenceIds: shot.evidenceIds };
-  if (!shot.result.ok) return { verdict: 'errored', evidenceIds: shot.evidenceIds };
-  return { verdict: containsNonce(shot.result.text, shot.nonce) ? 'read' : 'miss', evidenceIds: shot.evidenceIds };
+  if (isStarved(shot.result)) return { verdict: 'starved', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
+  if (isSizeRejection(shot.result)) return { verdict: 'reject', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
+  if (!shot.result.ok) return { verdict: 'errored', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
+  if (isBlankAnswer(shot.result)) {
+    // 空响应（HTTP 200 空文本）：没有答案可判——既不能算命中也不能算未命中，
+    // 更不能在二分扫描里充当「不可读」证据（2026-10-18 审计缺陷 ② 同口径）。
+    return { verdict: 'blank', actualPromptTokens: null, evidenceIds: shot.evidenceIds };
+  }
+  return {
+    verdict: containsNonce(shot.result.text, shot.nonce) ? 'read' : 'miss',
+    actualPromptTokens: plausiblePromptTokens(shot.result, shot.estimatedPrompt),
+    evidenceIds: shot.evidenceIds,
+  };
 }
 
 /**
@@ -1024,9 +1180,11 @@ async function scanBoundary(
   foundAtTokens: number | null;
   explicitReject: boolean;
   starvedSeen: boolean;
+  blankSeen: boolean;
   erroredSeen: boolean;
   erroredCount: number;
   sizeRejectCount: number;
+  actualPromptMax: number | null;
   detail: string;
   evidenceIds: string[];
 }> {
@@ -1036,18 +1194,21 @@ async function scanBoundary(
   let foundAtTokens: number | null = null;
   let explicitReject = false;
   let starvedSeen = false;
+  let blankSeen = false;
   let erroredCount = 0;
   let sizeRejectCount = 0;
+  let actualPromptMax: number | null = null;
   for (let step = 0; step < 3; step += 1) {
     const mid = Math.floor((lo + hi) / 2);
     if (mid <= 0) break;
     // —— head/tail 并行探测；任一 shot 星级事件直接终止扫描 ——
-    const shots: Array<{ pos: 'head' | 'tail'; verdict: 'read' | 'miss' | 'reject' | 'errored' | 'starved' }> = [];
-    let abort: 'errored' | 'starved' | 'reject' | null = null;
+    const shots: Array<{ pos: 'head' | 'tail'; verdict: 'read' | 'miss' }> = [];
+    let abort: 'errored' | 'starved' | 'reject' | 'blank' | null = null;
     for (const pos of ['head', 'tail'] as const) {
       const shot = await readBoundaryShot(ctx, mid, `boundary ${pos} mid=${mid}`, pos);
       evidenceIds.push(...shot.evidenceIds);
-      if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject') {
+      if (shot.actualPromptTokens !== null) actualPromptMax = Math.max(actualPromptMax ?? 0, shot.actualPromptTokens);
+      if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject' || shot.verdict === 'blank') {
         abort = shot.verdict;
         break;
       }
@@ -1057,6 +1218,12 @@ async function scanBoundary(
       // 推理占满预算：该点无正文可判，二分单调性已中断；已得边界也必须作废，
       // 否则「前一步定界 + 后一步 starved」会输出未经完整二分确认的截断定论。
       starvedSeen = true;
+      foundAtTokens = null;
+      break;
+    }
+    if (abort === 'blank') {
+      // 空响应：无正文可判，与 starved 同口径——扫描提前终止、已得边界作废、不记故障不记拒绝。
+      blankSeen = true;
       foundAtTokens = null;
       break;
     }
@@ -1095,9 +1262,11 @@ async function scanBoundary(
           side.pos,
         );
         evidenceIds.push(...shot.evidenceIds);
-        if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject') {
+        if (shot.actualPromptTokens !== null) actualPromptMax = Math.max(actualPromptMax ?? 0, shot.actualPromptTokens);
+        if (shot.verdict === 'starved' || shot.verdict === 'errored' || shot.verdict === 'reject' || shot.verdict === 'blank') {
           if (shot.verdict === 'starved') starvedSeen = true;
           else if (shot.verdict === 'reject') rejectSeen = true;
+          else if (shot.verdict === 'blank') blankSeen = true;
           else erroredCount += 1;
           aborted = true;
           break;
@@ -1121,6 +1290,11 @@ async function scanBoundary(
       }
       if (starvedSeen) {
         // 确认链遇推理占满预算：同样无完整二分证据，已得边界作废。
+        foundAtTokens = null;
+        break;
+      }
+      if (blankSeen) {
+        // 确认链遇空响应：无正文可判且不构成「不可读」证据——已得边界作废、终止扫描。
         foundAtTokens = null;
         break;
       }
@@ -1148,10 +1322,12 @@ async function scanBoundary(
     foundAtTokens,
     explicitReject,
     starvedSeen,
+    blankSeen,
     erroredSeen: erroredCount > 0,
     erroredCount,
     sizeRejectCount,
-    detail: `lo=${lo} hi=${hi} found=${foundAtTokens ?? 'n/a'} explicitReject=${explicitReject} starved=${starvedSeen} errored=${erroredCount} sizeReject=${sizeRejectCount}`,
+    actualPromptMax,
+    detail: `lo=${lo} hi=${hi} found=${foundAtTokens ?? 'n/a'} explicitReject=${explicitReject} starved=${starvedSeen} blank=${blankSeen} errored=${erroredCount} sizeReject=${sizeRejectCount}`,
     evidenceIds,
   };
 }

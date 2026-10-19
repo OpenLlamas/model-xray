@@ -2,6 +2,8 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHash } from 'node:crypto';
 import { inflateSync } from 'node:zlib';
 import { IDENTITY_QUESTIONS } from '../src/assets.js';
+import { estimateMessageTokens } from '../src/tokens.js';
+import type { ChatMessage } from '../src/types.js';
 
 export type MockMode =
   | 'honest'
@@ -122,7 +124,7 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     identityName: options.identityName ?? 'GLM-4',
     inflateFactor: options.inflateFactor ?? 4,
     failEvery: options.failEvery ?? 0,
-    balanceSeries: options.balanceSeries ?? [100.0, 99.5],
+    balanceSeries: options.balanceSeries ?? [100, 99],
     badUsageSeq: 0,
     seen500: new Set<string>(),
     balanceBase: options.balanceBase ?? 100,
@@ -151,8 +153,8 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
       if (behavior.balanceRate !== null) {
         // 可编程倍率模式：余额跟随已消耗成本（guard 对账 e2e 的确定性数据源）。
         // 注意单位：/dashboard/billing/usage 的 total_usage 按 one-api 语义为「分」（probeBalance 会 ÷100 折算），
-        // 故这里乘 100——保证 guard 读到的 USD 值恰为 base + rate×cost。
-        value = (behavior.balanceBase + behavior.balanceRate * behavior.costAccumulated) * 100;
+        // 故这里乘 100 并按整数美分圆整——保证 guard 读到的 USD 值在美分精度内等于 base + rate×cost。
+        value = Math.round((behavior.balanceBase + behavior.balanceRate * behavior.costAccumulated) * 100);
       } else {
         const series = behavior.balanceSeries;
         const index = Math.min(state.balanceQueries, series.length - 1);
@@ -215,6 +217,12 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
   const stream = body['stream'] === true;
   const imageUrl = findImageUrl(last);
   const modelName = typeof body['model'] === 'string' ? body['model'] : 'mock-model';
+  const maxTokens = typeof body['max_tokens'] === 'number' ? body['max_tokens'] : null;
+  // usage 基准与探针侧 estimateMessageTokens 同源（同一函数、同一 messages 数组）：
+  // honest 模式下 prompt_tokens 与工具侧估算精确对齐（回归斜率恒 1.0），context 探针的
+  // usage 校准门槛（标称 90% 深度核对）也依赖此口径。旧 mock 的 len/3.2 粗估 + 0.8 人为
+  // 校准会掩盖「标称深度实际只发送了 ~50-75%」的真机缺陷（2026-10-18 审计缺陷 ③）。
+  const usageBase = Math.max(10, estimateMessageTokens(messages as unknown as ChatMessage[]));
 
   // slow-stream：先发一个内容 chunk 然后挂住连接不结束（guard 客户端断连 e2e 用）
   if (behavior.mode === 'slow-stream') {
@@ -237,7 +245,7 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
 
   // empty：所有 chat 请求一律返回 200 + 空 content（模拟限流/截断下端点「成功但无内容」）
   if (behavior.mode === 'empty') {
-    sendReply(res, behavior, '', estimate(allText), stream, modelName);
+    sendReply(res, behavior, '', usageBase, stream, modelName, maxTokens);
     return;
   }
 
@@ -275,7 +283,7 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
 
   const toolResultNonce = findToolResultNonce(messages);
   if (toolResultNonce !== null) {
-    sendReply(res, behavior, `已收到工具结果，nonce ${toolResultNonce} 确认。`, estimate(allText), stream, modelName);
+    sendReply(res, behavior, `已收到工具结果，nonce ${toolResultNonce} 确认。`, usageBase, stream, modelName, maxTokens);
     return;
   }
 
@@ -286,7 +294,7 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
     const maxTokens = typeof body['max_tokens'] === 'number' ? body['max_tokens'] : 0;
     const exempt = behavior.starveExempt !== null && behavior.starveExempt.test(userText);
     if (maxTokens > 0 && maxTokens < behavior.starveBelow && !exempt) {
-      sendStarvedReply(res, behavior, behavior.starveTruncated ?? '', estimate(allText), stream, modelName, maxTokens);
+      sendStarvedReply(res, behavior, behavior.starveTruncated ?? '', usageBase, stream, modelName, maxTokens);
       return;
     }
   }
@@ -297,6 +305,8 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
   }
 
   if (behavior.mode === 'truncate' || behavior.mode === 'oversize-reject') {
+    // 截断/拒绝的判定阈值仍用 len/3.2 粗估（保持既有触发行为），
+    // usage 上报则改用与工具同源的 usageBase。
     const estimatedTokens = Math.ceil(allText.length / 3.2);
     if (estimatedTokens > behavior.truncateTokens) {
       if (behavior.mode === 'oversize-reject') {
@@ -309,18 +319,18 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
       const clipped = allText.slice(-keepChars);
       const clippedUser = userText.length > keepChars ? userText.slice(-keepChars) : userText;
       const reply = applyRetryFix(behavior, clippedUser, solve(clipped, behavior, clippedUser, imageUrl, modelName, state.served));
-      sendReply(res, behavior, reply, estimatedTokens, stream, modelName);
+      sendReply(res, behavior, reply, usageBase, stream, modelName, maxTokens);
       return;
     }
   }
 
   if (behavior.mode === 'tool-fail' && tools.length > 0) {
-    sendReply(res, behavior, '这个请求看起来需要工具，但我不太确定怎么做。', estimate(allText), stream, modelName);
+    sendReply(res, behavior, '这个请求看起来需要工具，但我不太确定怎么做。', usageBase, stream, modelName, maxTokens);
     return;
   }
 
   const reply = applyRetryFix(behavior, userText, solve(allText, behavior, userText, imageUrl, modelName, state.served));
-  sendReply(res, behavior, reply, estimate(allText), stream, modelName);
+  sendReply(res, behavior, reply, usageBase, stream, modelName, maxTokens);
 }
 
 /**
@@ -388,8 +398,14 @@ function solve(
   }
 
   if (/口令|passphrase|校验|archive/i.test(question)) {
-    const record = allText.match(/(?:档案记录|勘误条目|ARCHIVE RECORD)\s*([A-Z0-9]{6})/);
-    if (record && record[1]) return record[1];
+    // 命中判定对象是「校验口令」（只在文档正文出现），不是问题里的记录编号：
+    // 分开解析，绝不回退到编号——否则「复述问题里的编号」就能冒充读到文档（审计缺陷 ①）。
+    const passphrase =
+      allText.match(/校验口令是\s*([A-Z0-9]{6})/)?.[1] ??
+      allText.match(/passphrase for this section is\s*([A-Z0-9]{6})/i)?.[1] ??
+      allText.match(/唯一有效校验码：\s*([A-Z0-9]{6})/)?.[1];
+    if (passphrase !== undefined) return passphrase;
+    return 'NO_PASSPHRASE';
   }
 
   if (/echo_nonce/.test(question) && /工具|调用|tool/i.test(question)) {
@@ -522,10 +538,6 @@ function findToolResultNonce(messages: Array<Record<string, unknown>>): string |
   return null;
 }
 
-function estimate(text: string): number {
-  return Math.max(1, Math.ceil(text.length / 3.2));
-}
-
 /** honest 端点回显请求模型；swap-model 返回 identityName（≠请求模型，guard 换模型告警用）。 */
 function responseModelOf(behavior: MockBehavior, modelName: string): string {
   return behavior.mode === 'swap-model' ? behavior.identityName : modelName;
@@ -538,8 +550,9 @@ function sendReply(
   estimatedTokens: number,
   stream: boolean,
   modelName: string,
+  maxTokens: number | null,
 ): void {
-  const usage = computeUsage(behavior, estimatedTokens, reply);
+  const usage = computeUsage(behavior, estimatedTokens, reply, maxTokens);
   const model = responseModelOf(behavior, modelName);
   if (reply.startsWith('__tool__')) {
     sendToolCall(res, reply.slice('__tool__'.length), usage, stream, model);
@@ -673,7 +686,7 @@ interface MockUsage {
   completion_tokens_details: { reasoning_tokens: number };
 }
 
-function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string): MockUsage {
+function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: string, maxTokens: number | null): MockUsage {
   let prompt: number;
   let completion: number;
   let total: number;
@@ -694,10 +707,10 @@ function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: st
     }
   } else {
     completion = Math.max(1, Math.ceil(reply.length / 3.2));
-    // 0.8 校准：本 mock 的 len/3.2 估算 vs 工具 estimateTokens（英文 ≈len/4）存在 1.25× 系统差，
-    // 不校准则回归斜率虚高 1.25×——usage-scale 1.3 会被 [0.05,1.6] 带宽误伤，而非「对回归不可见」。
-    // 校准后 honest 斜率≈1.0，usage-scale 的纯倍率才是回归的盲区（F3 参照对比的存在前提）。
-    prompt = Math.max(10, Math.round(estimatedTokens * 0.8));
+    // prompt 直接采用与探针侧同源的 estimateMessageTokens 基准（handle 计算并传入）：
+    // 旧实现用 len/3.2 粗估再乘 0.8 人工校准，只为把 honest 斜率凑成 ≈1.0；
+    // 现基准同源（同一函数、同一 messages），honest 斜率恒为 1.0，无系统差需要补偿。
+    prompt = Math.max(10, estimatedTokens);
     if (behavior.mode === 'inflated') prompt = Math.round(prompt * behavior.inflateFactor);
     total = prompt + completion;
   }
@@ -707,6 +720,13 @@ function computeUsage(behavior: MockBehavior, estimatedTokens: number, reply: st
     prompt = Math.round(prompt * behavior.usageScale);
     completion = Math.round(completion * behavior.usageScale);
     total = prompt + completion;
+  }
+  // 模拟上游遵守 max_tokens：completion 不得超过请求上限。
+  // 否则 mock 会把整段复述文本计入 completion，billing 的「completion > max_tokens」硬矛盾检查
+  // 会命中夹具自身（真机端点应受 max_tokens 约束；badusage 保留其刻意注入的不一致 total）。
+  if (maxTokens !== null && Number.isFinite(maxTokens) && maxTokens > 0 && completion > maxTokens) {
+    completion = Math.floor(maxTokens);
+    if (behavior.mode !== 'badusage') total = prompt + completion;
   }
   // 可编程余额模式：按本笔 usage 累加成本（$/M 价格核算，与 guard 侧 --price-* 同式）
   behavior.costAccumulated += (prompt * behavior.priceInput + completion * behavior.priceOutput) / 1e6;

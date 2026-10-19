@@ -166,6 +166,10 @@ export function buildCommand(input) {
   if (timeoutRaw !== '' && !isPositiveIntStr(timeoutRaw)) {
     return fail(`--timeout 必须是正整数（秒）。收到：${JSON.stringify(timeoutRaw)}。示例：--timeout 60`);
   }
+  const httpRetriesRaw = String(input?.httpRetries ?? '').trim();
+  if (httpRetriesRaw !== '' && (!/^\d+$/.test(httpRetriesRaw) || Number(httpRetriesRaw) > 6)) {
+    return fail(`--http-retries 必须是 0-6 的整数（429/5xx 网关拒绝的重试预算）。收到：${JSON.stringify(httpRetriesRaw)}。示例：--http-retries 2`);
+  }
 
   // expect：过滤到合法集合；全不选 → 显式 --expect none（不宣称任何能力）
   const expectSelected = Array.isArray(input?.expect)
@@ -214,6 +218,7 @@ export function buildCommand(input) {
   }
   if (seedRaw !== '') parts.push(`--seed ${seedRaw}`);
   if (timeoutRaw !== '') parts.push(`--timeout ${timeoutRaw}`);
+  if (httpRetriesRaw !== '') parts.push(`--http-retries ${httpRetriesRaw}`);
   if (outRaw !== '') parts.push(`--out ${quote(outRaw)}`);
   if (baselineRaw !== '') parts.push(`--baseline ${quote(baselineRaw)}`);
   if (input?.deep === true) parts.push('--deep');
@@ -582,6 +587,7 @@ if (typeof document !== 'undefined') {
       priceCachedRead2: inputValue('f-price-cached-read2'),
       seed: inputValue('f-seed'),
       timeout: inputValue('f-timeout'),
+      httpRetries: inputValue('f-http-retries'),
       out: inputValue('f-out'),
       baseline: inputValue('f-baseline'),
       deep: checkedValue('f-deep'),
@@ -601,7 +607,7 @@ if (typeof document !== 'undefined') {
   for (const id of [
     'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
     'f-price-cached-read', 'f-price-threshold', 'f-price-input2', 'f-price-output2', 'f-price-cached-read2',
-    'f-seed', 'f-timeout', 'f-out', 'f-baseline',
+    'f-seed', 'f-timeout', 'f-http-retries', 'f-out', 'f-baseline',
   ]) {
     byId(id)?.addEventListener('input', updateCommandPreview);
   }
