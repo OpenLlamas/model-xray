@@ -29,7 +29,7 @@ export interface ConsoleServer {
   close(): Promise<void>;
 }
 const serveModule = (await import(SERVE_URL)) as {
-  createConsoleServer(options: { port: number; repoRoot: string }): Promise<ConsoleServer>;
+  createConsoleServer(options: { port: number; repoRoot: string; gatewayEnabled?: boolean }): Promise<ConsoleServer>;
 };
 
 interface HttpResponse {
@@ -76,7 +76,8 @@ function postJson(port: number, path: string, body: unknown, token?: string): Pr
 // 当前测试实例：afterEach 统一关闭（port 0 随机端口，各测试互不冲突）
 let current: ConsoleServer | null = null;
 async function startServer(): Promise<ConsoleServer> {
-  const instance = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  // API 聚合默认停用（后需迭代上线）：本文件的存量网关契约用例显式开启后覆盖原契约。
+  const instance = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
   current = instance;
   return instance;
 }

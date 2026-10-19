@@ -180,24 +180,37 @@ Optional: `--fingerprint-minutes 60` re-runs the identity-family probe periodica
 
 Boundaries: only `chat/completions`, `completions`, and `embeddings` get deep inspection; other paths are forwarded untouched with a basic log line. HTTP/1.1 only; upstream responses are requested with `Accept-Encoding: identity` on deep-inspected endpoints (the only byte-level rewrite besides credential replacement). The balance probe polls the one-api style usage endpoint (its `total_usage` must be an integer number of cents and is read as ÷100); non-integer/unknown schemas are rejected, non-USD readings (e.g. `quota`) skip rather than being converted, and stations without a usable endpoint degrade reconciliation to token-only stats with a `skipped` note. Local auth uses a constant-time comparison; `Ctrl+C` (or closing stdin) stops guard and settles the final window before flush.
 
+### Common relay tricks: faking & hidden rate markups (audit via the web console)
+
+Two problems dominate the relay market, and both are designed to be invisible:
+
+- **Faking (model swap / lighter variant)** — the relay serves a lighter sibling from the same family in place of the flagship: e.g. `glm-5.3-flash` standing in for `glm-5.3`. The docs, the self-reported model name, and everyday answers all look right, so it is nearly impossible to notice in normal use; only probes that compare the requested model against the endpoint's self-described identity / answer fingerprints catch it.
+- **Hidden rate markup** — sticker prices look normal while the billing backend quietly applies a modest multiplier (e.g. 1.5×): no single bill looks alarming, so eyeballing statements never catches it; only an absolute check — measured spend ÷ (claimed price × self-reported usage) — produces a verdict.
+
+Prefer the local web console (`npm run ui`) over a bare CLI run: the page lets you tick the claimed capabilities (vision / tool calls / reasoning), enter the claimed context window and claimed prices (input/output per 1M tokens, optional cached-read rate and long-context second tier), pin a seed for reproducible re-tests, and add enhanced samples — **the more you declare, the deeper the probes run**. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
+
+Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): a relay served `glm-5.3-flash` in place of `glm-5.3` and set the rate to 1.5×. One "Start test" run caught it: all 6 identity probes echoed back a different model (requested `glm-5.3`, upstream echoed `glm-5.3-flash` — suspected swap/channel change), the measured rate came out 1.5 > 1.5 claimed (fail, capped at 30), plus 32/62 empty non-streaming bodies as further evidence — final score 45 · fail (billing hard red line caps the total). The sticker prices on the page looked perfectly normal; without entering them and actually measuring, nothing would have surfaced.
+
+![Case: `glm-5.3-flash` standing in for `glm-5.3` with a 1.5× markup — score 45/100, fail](docs/audit-case-glm-5.3.png)
+
 ### Web console (local, executable)
 
-`npm run ui` starts a local server on <http://127.0.0.1:8620> (loopback only; auto-opens the browser) and turns the page into a real detection entry point with three tabs:
+`npm run ui` starts a local server on <http://127.0.0.1:8620> (loopback only; auto-opens the browser) and turns the page into a real detection entry point with two tabs (the API aggregation tab is temporarily hidden — pending a later iteration; see below):
 
 1. **One-shot test** — set every parameter in the page (endpoint / model / claimed context / expected capabilities / seed / baseline …), enter your API key in the key bar inside this tab (kept in the server's memory only, never echoed; typing it and hitting start is enough), then click start: the CLI runs locally and its log streams into the page; when it finishes the scorecard renders in place with links to the md/html/json artifacts. Model detection is on by default (identity / quality / capability / context / TTFT); cost reconciliation is optional and only enabled when you enter the station's claimed prices.
-2. **API aggregation & live monitoring** — start a local multi-channel gateway in four steps: ① configure channels (name / protocol — Unified relay, OpenAI-compatible, or Anthropic Messages — / base URL / API key) and build each channel's model list by one-click probing the upstream `/models` endpoint (the request is made by the local server; the key never leaves your machine) or adding model rows manually (upstream model + optional public alias); optionally attach per-model prices (input/output per million tokens, optional cached-read rate, optional >threshold second tier) to track per-model cost; ② click **Start local API** to get the access address and the page-issued virtual client key; ③ watch every channel's live usage (requests, prompt/completion/cached tokens, cost) and anomaly alerts; ④ point your client at the address with the virtual key. Channel configuration lives in the console process, so it survives gateway stops/starts and can be prepared before starting (still lost if the console process itself exits). Data plane: OpenAI-compatible channels serve `chat/completions` + `responses` + `models`; Anthropic-compatible channels serve `messages` + `messages/count_tokens` (auth via `x-api-key` or Bearer); Unified-relay channels accept all of the above and forward each request in the format the client used — ideal for relays that speak both OpenAI and Anthropic formats, no need to distinguish them. One alias routes to exactly one channel with no retry/fallback/failover; a 3xx upstream response is rejected, and channel keys never touch disk or logs. Every forwarded request is recorded in a local ledger (`reports/gateway-ledger.db`, metadata only) and the console shows live usage plus anomaly alerts (model self-ID mismatch / error rate / truncation / usage anomalies / high TTFT) — see "API gateway: observability & data guarantees" below.
+2. **API aggregation & live monitoring — temporarily disabled in this version (pending a later iteration)** — the tab is hidden and every console `/api/gateway/*` endpoint returns 503; the implementation stays in place behind a feature flag. Designed behavior for when it ships: start a local multi-channel gateway in four steps: ① configure channels (name / protocol — Unified relay, OpenAI-compatible, or Anthropic Messages — / base URL / API key) and build each channel's model list by one-click probing the upstream `/models` endpoint (the request is made by the local server; the key never leaves your machine) or adding model rows manually (upstream model + optional public alias); optionally attach per-model prices (input/output per million tokens, optional cached-read rate, optional >threshold second tier) to track per-model cost; ② click **Start local API** to get the access address and the page-issued virtual client key; ③ watch every channel's live usage (requests, prompt/completion/cached tokens, cost) and anomaly alerts; ④ point your client at the address with the virtual key. Channel configuration lives in the console process, so it survives gateway stops/starts and can be prepared before starting (still lost if the console process itself exits). Data plane: OpenAI-compatible channels serve `chat/completions` + `responses` + `models`; Anthropic-compatible channels serve `messages` + `messages/count_tokens` (auth via `x-api-key` or Bearer); Unified-relay channels accept all of the above and forward each request in the format the client used — ideal for relays that speak both OpenAI and Anthropic formats, no need to distinguish them. One alias routes to exactly one channel with no retry/fallback/failover; a 3xx upstream response is rejected, and channel keys never touch disk or logs. Every forwarded request is recorded in a local ledger (`reports/gateway-ledger.db`, metadata only) and the console shows live usage plus anomaly alerts (model self-ID mismatch / error rate / truncation / usage anomalies / high TTFT) — see "API gateway: observability & data guarantees" below.
 3. **Historical reports** — list everything under `reports/`, render any `report-*.json` scorecard in-page, open md/html in a new tab.
 
 Notes:
 
-- The `guard` transparent proxy is CLI-only (see "Guard" above): it requires the client key to equal `MODEL_XRAY_KEY` exactly and keeps running outside the console; the console no longer starts or stops it.
+- The `guard` transparent proxy is CLI-only (see "Guard" above): it requires the client key to equal `MODEL_XRAY_KEY` exactly and keeps running outside the console; the console no longer starts or stops it. It is also the only live-monitoring path for now: API aggregation (and the in-console live usage/alert panels) is temporarily disabled in this version.
 - The server binds to 127.0.0.1 only; every mutating API call requires a per-session token injected into the page. Report files are served from `reports/` with an extension whitelist and path-traversal protection.
 - The key lives in the local server process (or your env `MODEL_XRAY_KEY`); it is never written to logs (secrets are masked) and never appears in any command preview. The key bar lives in the one-shot-test tab only.
 - The old purely-static shell is gone; the page still degrades to a read-only notice (with a copyable command preview) if opened without the local server.
 
 ### API gateway: observability & data guarantees
 
-The local API gateway (Web console tab 2) records every forwarded request into a local SQLite ledger and watches channels for anomalies in real time:
+The local API gateway (Web console tab 2) records every forwarded request into a local SQLite ledger and watches channels for anomalies in real time. **It is temporarily disabled in this version** — the tab is hidden and all console `/api/gateway/*` endpoints return 503. The guarantees below describe the implemented behavior that ships when the feature is re-enabled; the verification scripts remain runnable because they exercise the gateway modules directly:
 
 - **Ledger** — `reports/gateway-ledger.db`: structure metadata only (origin / channel / alias / status / tokens / cost / TTFT — no message content; channel keys are never written). Runtime data, gitignored.
 - **Retention** — nothing is cleaned up automatically in this version: archive or delete the whole file when needed. Don't delete single rows — that breaks the hash chain by design; archiving means moving/renaming the whole database.
@@ -216,7 +229,7 @@ The local API gateway (Web console tab 2) records every forwarded request into a
 
 ### Status
 
-v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-repo you also get the executable web console (`npm run ui`) with three tabs: one-shot test, API aggregation with live usage/anomaly monitoring, and historical reports. The local API gateway (multi-channel model-alias routing, no retry/fallback yet; OpenAI-compatible + Anthropic Messages + Unified-relay protocols incl. the OpenAI Responses format; optional per-model prices with cost stats; the local ledger, live usage stats and anomaly alerts from S1–S3) is included. Not yet published to npm: run from source (see Quick start); after publishing, `npx model-xray` works out of the box. This repository hosts the CLI and the versioned test assets; audit reports are generated locally under `reports/` and stay out of git (runtime data, .gitignore).
+v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-repo you also get the executable web console (`npm run ui`) with two tabs: one-shot test and historical reports. The local API gateway (multi-channel model-alias routing, no retry/fallback yet; OpenAI-compatible + Anthropic Messages + Unified-relay protocols incl. the OpenAI Responses format; optional per-model prices with cost stats; the local ledger, live usage stats and anomaly alerts from S1–S3) is implemented but **temporarily disabled in this version** (console tab hidden, `/api/gateway/*` returns 503) — it will return in a later iteration. Not yet published to npm: run from source (see Quick start); after publishing, `npx model-xray` works out of the box. This repository hosts the CLI and the versioned test assets; audit reports are generated locally under `reports/` and stay out of git (runtime data, .gitignore).
 
 ## 中文
 
@@ -257,7 +270,7 @@ model-xray test \
 
 （跳过 `npm link` 的话，把命令里的 `model-xray` 换成 `node dist/src/cli.js` 即可。）
 
-不想记参数？运行 `npm run ask`（Windows）：交互式终端向导逐项询问端点/模型/key，可先 dry-run 预估，确认后执行并输出报告路径。或运行 `npm run ui`（本地 Web 控制台，仅回环）：参数与 key 全部在网页录入，实时查看日志，API 聚合页内置渠道用量与异常实时监控。`guard` 常驻代理仅命令行可用。详见下文「Web 控制台」。
+不想记参数？运行 `npm run ask`（Windows）：交互式终端向导逐项询问端点/模型/key，可先 dry-run 预估，确认后执行并输出报告路径。或运行 `npm run ui`（本地 Web 控制台，仅回环）：参数与 key 全部在网页录入，实时查看日志（「API 聚合实时监控」本版暂未上线，后需迭代，控制台入口已隐藏）。`guard` 常驻代理仅命令行可用。详见下文「Web 控制台」。
 
 报告落盘到 `reports/`，文件名主干为 `report-<模型名>-<YYYY-MM-DD_HH-mm-ss>`（本地时间）三份：`report-<模型名>-<…>.md`（看这份）、`report-<模型名>-<…>.html`（浏览器打开）、`report-<模型名>-<…>.json`（原始证据）。退出码：`0` 通过/可疑 · `1` 不通过 · `2` 用法错误或未得出结论。
 
@@ -392,24 +405,37 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 边界：只有 `chat/completions`、`completions`、`embeddings` 做深检，其余路径原样转发并记基础行；仅支持 HTTP/1.1；深检端点会强制 `Accept-Encoding: identity`（除凭证替换外唯一的字节级改写）。余额探针按 one-api 风格 usage 接口读取（`total_usage` 必须是整数美分，按 ÷100 折算）；非整数/未知 schema 一律拒绝，quota 等非美元读数直接跳过（不换算），站点没有可用接口时对账降级为纯 token 统计并出 `skipped` 提示。本地鉴权用常量时间比较；`Ctrl+C`（或关闭 stdin）停止时先结算最后一个对账窗口再落盘。
 
+### 中转站常见坑：掺假与偷调倍率（推荐用 Web 控制台实测）
+
+市面上的中转站，两类问题最常见，而且都刻意做得「看不出来」：
+
+- **掺假（换壳 / 轻量版冒充）**：用同家族的轻量版顶替旗舰模型——例如拿 `glm-5.3-flash` 冒充 `glm-5.3`。文档、模型自述、日常问答看起来都正常，常规使用极难察觉；只有对照「请求的模型名 vs 端点自述身份 / 应答指纹」的探针才抓得住。
+- **偷调倍率**：标价看着正常，后台却悄悄设一个不太夸张的倍率（如 1.5×）——单笔账单金额不大、倍率「不离谱」，靠肉眼对账单几乎发现不了；只有绝对对账——实测扣费 ÷（宣称价格 × 自报 usage）——才能定论。
+
+建议优先用 Web 控制台（`npm run ui`）而不是裸命令行：页面里可以勾选宣称能力（视觉 / 工具调用 / 推理）、填宣称上下文窗口、录入宣称价格（输入/输出单价，可选缓存读与长上下文二档阶梯价）、固定 seed 复测、加增强样本——**你声明得越全，探针跑得越彻底**。计费核价只在录入宣称价格后启用，想抓倍率就必须填价格。
+
+真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实测倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。
+
+![案例：`glm-5.3-flash` 冒充 `glm-5.3` 且倍率 1.5×——总分 45/100，不通过](docs/audit-case-glm-5.3.png)
+
 ### Web 控制台（本地、可执行）
 
-`npm run ui` 在 <http://127.0.0.1:8620>（默认端口，仅回环；自动打开浏览器）启动本地服务，把网页变成可执行的检测入口，三个标签页：
+`npm run ui` 在 <http://127.0.0.1:8620>（默认端口，仅回环；自动打开浏览器）启动本地服务，把网页变成可执行的检测入口，两个标签页（「API 聚合」标签本版临时隐藏 · 后需迭代上线，见下）：
 
 1. **一次性检测** —— 页面内设置全部参数（端点/模型/标称上下文/宣称能力/seed/基线…），在本页 key 栏录入 API key（仅存本地服务进程内存、绝不回显；录入后直接点开始检测即生效），点开始即在本机真实运行 CLI，日志实时流式滚动；结束后评分卡原位渲染，并附 md/html/json 报告链接。模型检测默认开启（身份/质量/能力/上下文/时延）；计费核价为可选，录入站点宣称价格后才启用（支持缓存读单价与超过阈值的二档阶梯价，二档可分别设置输入/输出/缓存读）。
-2. **API 聚合与实时监控** —— 页面内按四步启动本地多渠道网关：① 配置渠道（名称 / 协议 —— 统一中转站、OpenAI 兼容或 Anthropic Messages —— / Base URL / API Key）并建立模型清单（「一键获取」由本机服务端请求上游 `/models` 列表 —— Key 不出本机 —— 或手动逐行添加：上游模型名 + 可选对外别名），可选为每个模型配置价格（输入/输出单价，$/百万 tokens；可选缓存读单价；可选超过阈值的长上下文二档价）以统计各模型费用；② 点「启动本地 API」生成接入地址与页面下发的虚拟客户端 Key；③ 实时监控每个渠道的用量（请求数、prompt/completion/缓存 token、费用）与异常告警；④ 让客户端指向该地址并使用虚拟 Key。渠道配置挂在控制台进程上：跨网关启停保留、启动前即可配置（控制台进程退出仍会丢失）。数据面：OpenAI 兼容渠道提供 `chat/completions`、`responses` 与 `models`；Anthropic 兼容渠道提供 `messages` 与 `messages/count_tokens`（认证走 `x-api-key` 或 Bearer）；统一中转站渠道接受以上全部请求，按客户端实际使用的格式原样转发 —— 适合同时支持 OpenAI 与 Anthropic 两种格式的中转站，无需区分。一个别名固定路由到一个渠道，不重试/不回退/不熔断；上游 3xx 一律拒绝；渠道 key 绝不落盘、绝不进日志。每个已转发请求记入本地账本（`reports/gateway-ledger.db`，仅元数据），控制台实时展示用量与异常告警（模型自述不符/错误率/截断/usage 异常/TTFT 偏高）——详见下文「API 网关：观测与数据保证」。
+2. **API 聚合与实时监控 —— 本版暂未上线（后需迭代）** —— 该标签已隐藏，控制台 `/api/gateway/*` 端点一律回 503；实现保留在功能开关之后。以下为上线后的设计行为：页面内按四步启动本地多渠道网关：① 配置渠道（名称 / 协议 —— 统一中转站、OpenAI 兼容或 Anthropic Messages —— / Base URL / API Key）并建立模型清单（「一键获取」由本机服务端请求上游 `/models` 列表 —— Key 不出本机 —— 或手动逐行添加：上游模型名 + 可选对外别名），可选为每个模型配置价格（输入/输出单价，$/百万 tokens；可选缓存读单价；可选超过阈值的长上下文二档价）以统计各模型费用；② 点「启动本地 API」生成接入地址与页面下发的虚拟客户端 Key；③ 实时监控每个渠道的用量（请求数、prompt/completion/缓存 token、费用）与异常告警；④ 让客户端指向该地址并使用虚拟 Key。渠道配置挂在控制台进程上：跨网关启停保留、启动前即可配置（控制台进程退出仍会丢失）。数据面：OpenAI 兼容渠道提供 `chat/completions`、`responses` 与 `models`；Anthropic 兼容渠道提供 `messages` 与 `messages/count_tokens`（认证走 `x-api-key` 或 Bearer）；统一中转站渠道接受以上全部请求，按客户端实际使用的格式原样转发 —— 适合同时支持 OpenAI 与 Anthropic 两种格式的中转站，无需区分。一个别名固定路由到一个渠道，不重试/不回退/不熔断；上游 3xx 一律拒绝；渠道 key 绝不落盘、绝不进日志。每个已转发请求记入本地账本（`reports/gateway-ledger.db`，仅元数据），控制台实时展示用量与异常告警（模型自述不符/错误率/截断/usage 异常/TTFT 偏高）——详见下文「API 网关：观测与数据保证」。
 3. **历史报告** —— 列出 `reports/` 下全部报告，任意 `report-*.json` 页内渲染评分卡，md/html 新标签打开。
 
 注意：
 
-- `guard` 透明代理仅命令行可用（启动方式见「常用场景 3」）：它要求客户端 key 与 `MODEL_XRAY_KEY` 完全一致，适合长期盯真实流量；控制台内的实时监控由「API 聚合」页的用量/告警面板承担，控制台不再托管 guard 进程。
+- `guard` 透明代理仅命令行可用（启动方式见「常用场景 3」）：它要求客户端 key 与 `MODEL_XRAY_KEY` 完全一致，适合长期盯真实流量，也是当前唯一的长期监控路径（控制台内的实时用量/告警面板随「API 聚合」一并暂未上线，后需迭代）；控制台不托管 guard 进程。
 - 服务只绑定 127.0.0.1；所有写操作 API 都要求携带注入页面的会话 token。报告文件仅从 `reports/` 提供，带扩展名白名单与路径穿越防护。
 - key 只存于本地服务进程（或环境变量 `MODEL_XRAY_KEY`）；key 栏仅位于「模型检测」页；绝不写日志（敏感串脱敏）、绝不出现在命令预览里。
 - 旧的纯静态轻壳已移除；若页面脱离本地服务直接打开，会降级为只读提示（仍可预览可复制命令）。
 
 ### API 网关：观测与数据保证
 
-本地 API 网关（Web 控制台第 2 页）把每个已转发请求记入本地 SQLite 账本，并实时监控渠道异常：
+本地 API 网关（Web 控制台第 2 页）把每个已转发请求记入本地 SQLite 账本，并实时监控渠道异常。**本版暂未上线**——该标签已隐藏、控制台 `/api/gateway/*` 端点回 503；下文为该功能上线后的已实现行为（验收脚本直接跑网关模块，仍可执行）：
 
 - **账本** —— `reports/gateway-ledger.db`：只含结构元数据（origin/渠道/别名/状态/token/费用/TTFT，无任何正文；渠道 key 绝不写入）。属运行时数据、已 gitignore。
 - **保留策略** —— 本版不自动清理：需要时整库归档或删除——不要手删单行（会按设计触发断链报告）；归档即整体移动/改名数据库文件。
@@ -427,7 +453,7 @@ npm run ui     # 自动打开 http://127.0.0.1:8620（仅本机回环）
 
 ### 状态
 
-v0.2.0 —— `test` 与 `guard`（P2，仅命令行）均已可用；仓库内还提供可执行 Web 控制台（`npm run ui`，三个标签页：一次性检测 / API 聚合与实时监控 / 历史报告）与本地 API 聚合网关（多渠道模型别名路由，暂不重试/不回退；支持 OpenAI 兼容、Anthropic Messages 与统一中转站三种协议，含 OpenAI Responses 格式；已含本地账本、实时用量、可选模型价格与费用统计、异常告警）；尚未发布到 npm：请按「快速开始」从源码运行（发布后 `npx model-xray` 开箱即用）。本仓库承载 CLI 与版本化测试资产；检测报告生成在本机 `reports/`（已 gitignore，属运行数据，不入库）。
+v0.2.0 —— `test` 与 `guard`（P2，仅命令行）均已可用；仓库内还提供可执行 Web 控制台（`npm run ui`，两个标签页：一次性检测 / 历史报告）。本地 API 聚合网关（多渠道模型别名路由，暂不重试/不回退；支持 OpenAI 兼容、Anthropic Messages 与统一中转站三种协议，含 OpenAI Responses 格式；已含本地账本、实时用量、可选模型价格与费用统计、异常告警）**已实现但本版临时停用**（「API 聚合」标签隐藏、`/api/gateway/*` 端点回 503）——后需迭代上线。尚未发布到 npm：请按「快速开始」从源码运行（发布后 `npx model-xray` 开箱即用）。本仓库承载 CLI 与版本化测试资产；检测报告生成在本机 `reports/`（已 gitignore，属运行数据，不入库）。
 
 ## License
 

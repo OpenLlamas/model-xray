@@ -8,6 +8,7 @@
 //   ⑤ 别名网关管理面：/api/gateway/*（渠道 CRUD/状态/虚拟 key/用量/告警/模型列表探测；渠道配置存本进程内存、
 //      跨网关启停保留（网关启动前即可配置）；数据面由 dist/src/gateway 独立回环端口提供）；
 //      S1 账本（dist/src/ledger，reports/gateway-ledger.db）随网关启动做恢复、随停止关闭（正文零持久化）。
+//      ⚠ 当前版本 API 聚合暂未上线（后需迭代上线）：/api/gateway/* 默认回 503（测试用 gatewayEnabled:true 显式开启）。
 // 安全约定：
 //   - 只监听 127.0.0.1；token 每次启动随机生成；/api/gateway/* 与全部 POST 端点必须携带 x-model-xray-token；
 //   - key 只经环境变量 MODEL_XRAY_KEY 注入子进程，不出现在命令行参数 / 日志 / 响应里；
@@ -157,6 +158,8 @@ export async function createConsoleServer(options = {}) {
   const reportsRoot = join(repoRoot, 'reports');
   const cliPath = join(repoRoot, 'dist', 'src', 'cli.js');
   const token = randomBytes(24).toString('hex');
+  // API 聚合（网关）功能开关：默认停用（后需迭代上线）；测试用 gatewayEnabled:true 显式开启覆盖存量契约。
+  const gatewayEnabled = options.gatewayEnabled === true;
 
   const state = {
     sessionKey: null,
@@ -750,6 +753,10 @@ export async function createConsoleServer(options = {}) {
         // —— 别名网关管理面：全部端点要求控制台 token（含 GET；渠道视图绝不含上游 key） ——
         if (pathname.startsWith('/api/gateway/')) {
           if (!requireToken(req, res)) return;
+          if (!gatewayEnabled) {
+            sendError(res, 503, 'API 聚合实时监控暂未上线（后需迭代上线）：当前版本已停用该功能入口。');
+            return;
+          }
           const gateway = state.gateway;
           if (req.method === 'GET') {
             if (pathname === '/api/gateway/status') {
