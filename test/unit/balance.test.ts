@@ -1,32 +1,51 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
-import { BALANCE_ENDPOINTS, probeBalance, probeBalanceStable, spendBetween, type BalanceReading } from '../../src/balance.js';
+import { BALANCE_ENDPOINTS, isUsableQuotaPerUnit, probeBalance, probeBalanceDetailed, probeBalanceStable, spendBetween, type BalanceReading } from '../../src/balance.js';
 import { createMockServer } from '../mock-server.js';
 
 const usage = BALANCE_ENDPOINTS[0]!;
 const grants = BALANCE_ENDPOINTS[1]!;
 const self = BALANCE_ENDPOINTS[2]!;
 
-test('usage extractor normalizes cents to USD as spent_total', () => {
+test('usage extractor passes integer total_usage through as raw cents (integerCents metadata)', () => {
+  // 整数与非整数统一原样透传：单位校准统一由 decideRatio 以应缴额为锚完成，
+  // 整数读数只额外携带「OpenAI 整数美分 schema」元数据供 cents 候选作为可信依据。
   assert.deepEqual(usage.extract({ total_usage: 1234 }), {
-    value: 12.34,
+    value: 1234,
     kind: 'spent_total',
-    unit: 'USD',
+    unit: 'total_usage_raw',
     currency: null,
-    resolution: 0.01,
+    resolution: 1,
+    integerCents: true,
   });
   assert.equal(usage.extract({}), null);
   assert.equal(usage.extract({ total_usage: '1234' }), null);
   assert.equal(usage.extract({ total_usage: Number.NaN }), null);
 });
 
-test('usage extractor rejects non-integer cents (unknown unit/schema)', () => {
-  // 真机回归：某中转站返回 13058.6184，按 ÷100 读成 USD 后与 $0.019 应缴作比，产出 142.975× 假 fail。
-  // OpenAI 规范该字段为整数美分；非整数说明单位不是美分，必须拒绝而不是猜。
-  assert.equal(usage.extract({ total_usage: 13058.6184 }), null);
-  assert.equal(usage.extract({ total_usage: 99.5 }), null);
+test('usage extractor passes non-integer total_usage through without guessing units', () => {
+  // 提取层不猜单位：美分/美元/quota 皆有先例，盲猜即 2026-10-18 142.975× 假 fail 的根因；
+  // 一律拒读则丢掉 xianyu1 类站点的可用数据。校准与防假 fail 由 decideRatio 的单位假设校准负责。
+  assert.deepEqual(usage.extract({ total_usage: 13058.6184 }), {
+    value: 13058.6184,
+    kind: 'spent_total',
+    unit: 'total_usage_raw',
+    currency: null,
+    resolution: 0.001,
+    integerCents: false,
+  });
+  assert.deepEqual(usage.extract({ total_usage: 99.5 }), {
+    value: 99.5,
+    kind: 'spent_total',
+    unit: 'total_usage_raw',
+    currency: null,
+    resolution: 0.001,
+    integerCents: false,
+  });
   assert.deepEqual(usage.extract({ total_usage: 1234.0 }), usage.extract({ total_usage: 1234 }));
+  assert.equal(usage.extract({ total_usage: '13058.6184' }), null);
+  assert.equal(usage.extract({ total_usage: Number.NaN }), null);
 });
 
 test('credit_grants extractor maps total_available to balance USD', () => {
@@ -92,10 +111,12 @@ test('probeBalance reads scripted usage from the mock server', async () => {
     assert.ok(first);
     assert.equal(first?.endpoint, '/dashboard/billing/usage');
     assert.equal(first?.kind, 'spent_total');
-    assert.equal(first?.unit, 'USD');
-    assert.equal(first?.value, 1.0);
+    assert.equal(first?.unit, 'total_usage_raw');
+    assert.equal(first?.integerCents, true);
+    assert.equal(first?.value, 100);
     const second = await probeBalance(mock.baseUrl, 'test-key', 2000);
-    assert.equal(second?.value, 0.99);
+    assert.equal(second?.value, 99);
+    assert.equal(second?.integerCents, true);
   } finally {
     mock.server.close();
   }
@@ -115,6 +136,82 @@ test('probeBalance returns null when every candidate 404s', async () => {
   } finally {
     server.close();
   }
+});
+
+test('probeBalanceDetailed：全败时逐候选写明失败原因（404/401/非 JSON）', async () => {
+  const statuses: number[] = [];
+  const server = createServer((req, res) => {
+    statuses.push(1);
+    if (req.url?.endsWith('/api/user/self')) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'unauthorized' } }));
+      return;
+    }
+    if (req.url?.endsWith('/dashboard/billing/credit_grants')) {
+      // 200 但响应非 JSON：schema/网关形态异常
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end('<html>gateway</html>');
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'not found' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === 'object');
+    const base = `http://127.0.0.1:${address.port}/v1`;
+    const outcome = await probeBalanceDetailed(base, 'test-key', 2000);
+    assert.equal(outcome.reading, null);
+    const reason = outcome.reason ?? '';
+    assert.match(reason, /候选余额接口均不可用/);
+    assert.match(reason, /\/dashboard\/billing\/usage → HTTP 404/);
+    assert.match(reason, /\/dashboard\/billing\/credit_grants → 响应非 JSON/);
+    assert.match(reason, /\/api\/user\/self → HTTP 401（需要登录态或该 key 无权读取余额）/);
+    // 三个候选都必须实际探测过（dashboard 端点含「根路径 404 → 用户路径回退」的第二次尝试，故为 ≥）
+    assert.ok(statuses.length >= 3, `至少三个候选被探测，实际 ${statuses.length}`);
+  } finally {
+    server.close();
+  }
+});
+
+test('probeBalanceDetailed：余额路由拼在站点根路径（剥掉 /v1 与反代版本段），成功时 reason 为 null', async () => {
+  // 真实 new-api 的余额接口位于站点根；旧实现拼在带 /v1 的 baseUrl 后会 404（既有真实故障点）。
+  const seenPaths: string[] = [];
+  const server = createServer((req, res) => {
+    seenPaths.push(req.url ?? '');
+    if (req.url === '/dashboard/billing/usage') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: 250 }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'not found' } }));
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const address = server.address();
+    assert.ok(address !== null && typeof address === 'object');
+    const base = `http://127.0.0.1:${(address as { port: number }).port}/compatible-mode/v1`;
+    const outcome = await probeBalanceDetailed(base, 'test-key', 2000);
+    assert.equal(outcome.reason, null);
+    assert.equal(outcome.reading?.value, 250);
+    assert.equal(outcome.reading?.unit, 'total_usage_raw');
+    assert.equal(outcome.reading?.integerCents, true);
+    assert.equal(outcome.reading?.resolution, 1);
+    assert.equal(outcome.reading?.endpoint, '/dashboard/billing/usage');
+    // dashboard 计费端点必须命中站点根（无 /compatible-mode 前缀）；new-api /api/status 探测先行，不属于断言范围
+    const billingHits = seenPaths.filter((p) => p.includes('/dashboard/billing/usage'));
+    assert.deepEqual(billingHits, ['/dashboard/billing/usage'], '必须直接命中根路径接口（无 /v1 前缀）');
+  } finally {
+    server.close();
+  }
+});
+
+test('probeBalanceDetailed：baseUrl 无法解析 → 明确原因，不抛异常', async () => {
+  const outcome = await probeBalanceDetailed('not a url', 'k', 100);
+  assert.equal(outcome.reading, null);
+  assert.match(outcome.reason ?? '', /无法解析为 URL/);
 });
 
 // ---------- new-api quota 端点（/api/usage/token + /api/status 校准，2026-10-19） ----------
@@ -289,7 +386,7 @@ test('probeBalanceStable：异步结算收敛（读数序列 100→99→99）→
     assert.ok(stable !== null);
     assert.equal(stable.settled, true);
     assert.equal(stable.polls, 3, '首次 + 两次对比读数');
-    assert.equal(stable.reading.value, 99.5, '取收敛后的稳定值，而非首次读数');
+    assert.equal(stable.reading.value, 9950, '取收敛后的稳定值（raw total_usage 透传，不做 ÷100），而非首次读数');
   } finally {
     fixture.close();
   }
@@ -302,7 +399,7 @@ test('probeBalanceStable：轮询上限内仍在变化（异步结算未停/账�
     assert.ok(stable !== null);
     assert.equal(stable.settled, false);
     assert.equal(stable.polls, 4, '首次 + 3 次上限轮询');
-    assert.equal(stable.reading.value, 98.5, '保留最后读数，交由调用方按不可归因作废倍率');
+    assert.equal(stable.reading.value, 9850, '保留最后读数（raw 透传），交由调用方按不可归因作废倍率');
   } finally {
     fixture.close();
   }
@@ -328,6 +425,38 @@ test('probeBalanceStable：端点不可达（全 404）→ null（与 probeBalan
     assert.equal(stable, null);
   } finally {
     fixture.close();
+  }
+});
+
+test('probeBalanceStable：轮询钉住命中的端点，后续轮次不再重跑整条候选链', async () => {
+  let total = 0;
+  const server = createServer((req, res) => {
+    total += 1;
+    const path = (req.url ?? '').split('?')[0] ?? '';
+    if (path.endsWith('/dashboard/billing/usage')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ total_usage: 10000 }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ message: 'not found' }));
+  });
+  const base = await new Promise<string>((resolve) => {
+    server.listen(0, '127.0.0.1', () => {
+      const address = server.address();
+      assert.ok(address !== null && typeof address === 'object');
+      resolve(`http://127.0.0.1:${(address as { port: number }).port}/v1`);
+    });
+  });
+  try {
+    const stable = await probeBalanceStable(base, 'test-key', 2000, 3, 0);
+    assert.ok(stable !== null);
+    assert.equal(stable.settled, true);
+    assert.equal(stable.polls, 2);
+    assert.equal(total, 3, '首轮走完整候选链（2 次），后续轮次只打钉住的端点（1 次）');
+  } finally {
+    server.closeAllConnections();
+    server.close();
   }
 });
 
@@ -403,6 +532,30 @@ test('probeBalance：quota_per_unit 量级不合理（<1）→ 视为校准失�
     const reading = await probeBalance(fixture.base, 'test-key', 2000);
     assert.ok(reading !== null);
     assert.equal(reading?.unit, 'quota');
+  } finally {
+    fixture.close();
+  }
+});
+
+test('isUsableQuotaPerUnit：0/负数/NaN/Infinity 一律不可用（不得除出伪金额）', () => {
+  assert.equal(isUsableQuotaPerUnit(500000), true);
+  assert.equal(isUsableQuotaPerUnit(1), true);
+  assert.equal(isUsableQuotaPerUnit(0), false);
+  assert.equal(isUsableQuotaPerUnit(-500000), false);
+  assert.equal(isUsableQuotaPerUnit(Number.NaN), false);
+  assert.equal(isUsableQuotaPerUnit(Number.POSITIVE_INFINITY), false);
+  assert.equal(isUsableQuotaPerUnit(null), false);
+});
+
+test('probeBalance：站点公示 quota_per_unit=0 → 保留 raw quota，不得产出 Infinity/NaN 伪 USD', async () => {
+  const fixture = await startUserSelfFixture({ quotaPerUnit: 0, quota: 375000 });
+  try {
+    const reading = await probeBalance(fixture.base, 'test-key', 2000);
+    assert.ok(reading !== null);
+    assert.equal(reading?.unit, 'quota', '非法换算系数下必须保留原单位');
+    assert.equal(reading?.value, 375000, '读数不得被除成 Infinity/NaN');
+    assert.ok(Number.isFinite(reading?.value ?? Number.NaN));
+    assert.equal(reading?.conversionNote, undefined, '未做换算时不得伪造换算说明');
   } finally {
     fixture.close();
   }

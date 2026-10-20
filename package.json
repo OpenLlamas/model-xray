@@ -20,10 +20,21 @@
   "keywords": [
     "llm",
     "openai",
+    "anthropic",
     "audit",
     "relay",
     "proxy",
-    "cli"
+    "cli",
+    "llm-audit",
+    "llm-proxy",
+    "ai-gateway",
+    "model-verification",
+    "fake-model-detection",
+    "token-billing",
+    "new-api",
+    "one-api",
+    "api-relay",
+    "llm-security"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",

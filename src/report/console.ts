@@ -2,6 +2,7 @@ import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
 import { levelLabel, statusTag } from '../scoring.js';
 import { colorize } from '../color.js';
 import { collectAnomalies } from './summary.js';
+import { billingSummaryRows } from './markdown.js';
 
 export interface ConsoleRenderOptions {
   /**
@@ -31,6 +32,22 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
     // 分值列占位与评分行完全一致（`  -` 三字符），保证 - 与数字同列。
     const tag = colorize(`[${statusTag(outcome.level)}]`.padEnd(6), outcome.level, color);
     lines.push(`${tag} ${outcome.id.padEnd(10)}   -  ${stripControl(outcome.headline)}`);
+  }
+
+  lines.push('');
+  // 倍率摘要：终端输出也要一眼看到「实测倍率 / 公示倍率 / 金额核验状态」，否则用户只看到
+  // "usage 计数核验通过" 这类文字，看不到任何倍率数字。
+  const billing = report.outcomes.find((outcome) => outcome.id === 'billing');
+  if (billing !== undefined) {
+    const values = new Map(billingSummaryRows(billing.metrics).map(([key, , value]) => [key, value]));
+    const measured = values.get('measured_ratio');
+    const declaredModel = values.get('declared_model_ratio');
+    const declaredCompletion = values.get('declared_completion_ratio');
+    if (measured !== undefined || declaredModel !== undefined || declaredCompletion !== undefined) {
+      lines.push(
+        `倍率: 实测 ${measured ?? '-'} · 公示 输入 ${declaredModel ?? '-'} / 输出 ${declaredCompletion ?? '-'} · 金额核验 ${values.get('money_check_state') ?? '-'}`,
+      );
+    }
   }
 
   lines.push('');

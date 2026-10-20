@@ -58,6 +58,13 @@ function isNonNegativeNumberStr(raw) {
   return Number.isFinite(value) && value >= 0;
 }
 
+/** quota 每美元换算系数的有效域（与 src/pricing.ts 的 QUOTA_PER_UNIT_MIN/MAX 同口径）。 */
+function isPlausibleQuotaPerUnitStr(raw) {
+  if (!/^[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return false;
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1 && value <= 1e12;
+}
+
 /**
  * 由表单输入生成可复制的 CLI 命令。
  * @returns {{ command: string, hints: string[], error: string | null }}
@@ -158,6 +165,28 @@ export function buildCommand(input) {
     }
   }
 
+  // 公示价 / 倍率锚点（CLI 同口径）：留空 = 全部不传，由 CLI 用缺省与自动探测。
+  const expectModelRatioRaw = String(input?.expectModelRatio ?? '').trim();
+  if (expectModelRatioRaw !== '' && !isPositiveNumberStr(expectModelRatioRaw)) {
+    return fail(`--expect-model-ratio 必须是大于 0 的数字（你所在分组的公示 model_ratio）。收到：${JSON.stringify(expectModelRatioRaw)}。示例：--expect-model-ratio 1.5`);
+  }
+  const expectCompletionRatioRaw = String(input?.expectCompletionRatio ?? '').trim();
+  if (expectCompletionRatioRaw !== '' && !isPositiveNumberStr(expectCompletionRatioRaw)) {
+    return fail(`--expect-completion-ratio 必须是大于 0 的数字（你所在分组的公示 completion_ratio）。收到：${JSON.stringify(expectCompletionRatioRaw)}。示例：--expect-completion-ratio 4`);
+  }
+  const quotaPerUsdRaw = String(input?.quotaPerUsd ?? '').trim();
+  // 与站点公示口径同一有效域（1~1e12）：域外值 CLI 会拒，前端提前拦并给同一口径的提示。
+  if (quotaPerUsdRaw !== '' && !isPlausibleQuotaPerUnitStr(quotaPerUsdRaw)) {
+    return fail(`--quota-per-usd 必须是 1~1e12 之间的数（每 1 美元对应的 quota 单位数，如 new-api 默认 500000）。收到：${JSON.stringify(quotaPerUsdRaw)}。示例：--quota-per-usd 500000`);
+  }
+  // 网页价格兜底页：同源相对路径或同源绝对 URL；同源/协议校验在 pricing-scrape 内 fail-closed。
+  const declaredPricePageRaw = String(input?.declaredPricePage ?? '').trim();
+  if (declaredPricePageRaw !== '' && !/^(\/[^\s]*|https?:\/\/[^\s]+)$/.test(declaredPricePageRaw)) {
+    return fail(`--declared-price-page 必须是同源相对路径（如 /pricing）或 http(s) 绝对 URL。收到：${JSON.stringify(declaredPricePageRaw)}。示例：--declared-price-page /pricing`);
+  }
+  const originIssue = declaredPricePageRaw !== '' ? declaredPricePageOriginIssue(baseUrl, declaredPricePageRaw) : null;
+  if (originIssue !== null) return fail(originIssue);
+
   const seedRaw = String(input?.seed ?? '').trim();
   if (seedRaw !== '' && !isPositiveIntStr(seedRaw)) {
     return fail(`--seed 必须是正整数。收到：${JSON.stringify(seedRaw)}。示例：--seed 12345`);
@@ -182,14 +211,17 @@ export function buildCommand(input) {
 
   // 引用健全性：宁可拒绝，也不产出会被 shell 静默损坏或注入元字符的命令。
   // posix 模式：单引号内一切字面量，但参数含单引号/控制字符时各 shell 规则不一致 → 拒绝。
-  // cmd 模式：双引号内 %VAR% 仍展开、双引号无法转义 → 拒绝 " 与 % 及控制字符。
-  const badChars = shell === 'cmd' ? /["%\r\n\0]/ : /['\r\n\0]/;
-  const badCharsLabel = shell === 'cmd' ? '双引号、% 或换行等控制字符' : '单引号或换行等控制字符';
+  // cmd 模式：双引号内 %VAR% 仍展开、双引号无法转义；! 在启用延迟展开（cmd /v:on，绝大多数启动脚本如此）
+  // 时同样展开且双引号不设防 → 与 % 同等对待。
+  const badChars = shell === 'cmd' ? /["%!\r\n\0]/ : /['\r\n\0]/;
+  const badCharsLabel = shell === 'cmd' ? '双引号、%、! 或换行等控制字符' : '单引号或换行等控制字符';
   for (const [raw, flag, example] of [
     [baseUrl, 'base-url', 'https://relay.example.com/v1'],
     [model, 'model', 'gpt-4o'],
     [outRaw, 'out', 'report.json'],
     [baselineRaw, 'baseline', 'baseline.json'],
+    // 价格兜底页同样要进引用健全性检查：它走 quote() 输出，cmd 模式下双引号/"%"/换行会破坏引用甚至注入命令。
+    [declaredPricePageRaw, 'declared-price-page', '/pricing'],
   ]) {
     if (badChars.test(raw)) {
       return fail(`--${flag} 含有${badCharsLabel}，无法可靠地在终端中引用。收到：${JSON.stringify(raw)}。示例：--${flag} ${example}`);
@@ -217,6 +249,10 @@ export function buildCommand(input) {
     }
   }
   if (seedRaw !== '') parts.push(`--seed ${seedRaw}`);
+  if (expectModelRatioRaw !== '') parts.push(`--expect-model-ratio ${expectModelRatioRaw}`);
+  if (expectCompletionRatioRaw !== '') parts.push(`--expect-completion-ratio ${expectCompletionRatioRaw}`);
+  if (quotaPerUsdRaw !== '') parts.push(`--quota-per-usd ${quotaPerUsdRaw}`);
+  if (declaredPricePageRaw !== '') parts.push(`--declared-price-page ${quote(declaredPricePageRaw)}`);
   if (timeoutRaw !== '') parts.push(`--timeout ${timeoutRaw}`);
   if (httpRetriesRaw !== '') parts.push(`--http-retries ${httpRetriesRaw}`);
   if (outRaw !== '') parts.push(`--out ${quote(outRaw)}`);
@@ -237,6 +273,183 @@ function badgeClass(level) {
 function fieldText(record, key) {
   const value = record?.[key];
   return typeof value === 'string' && value !== '' ? value : null;
+}
+
+// ---------------------------------------------------------------------------
+// 评分卡的倍率/指标渲染（纯函数，供 Node 测试直接 import）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「计费与倍率」摘要块：中文标签 + 固定展示顺序（公示价 → 抓价 → 实测倍率 → 金额核验 → 价格 → 证据）。
+ * 只渲染报告里实际存在的 key——缺失即不出现，绝不用占位值冒充结论。
+ * 与 src/report/markdown.ts 的 BILLING_METRIC_LABELS 同口径（web/ 不参与 tsc 编译，无法直接 import），
+ * 两侧一致性由 test/unit/report.test.ts 的漂移钉子守住。
+ */
+const BILLING_METRIC_LABELS = [
+  ['pricing_state', '公示价接口'],
+  ['declared_source', '公示价来源类型'],
+  ['declared_origin', '公示价来源'],
+  ['declared_captured_at', '公示价抓取时刻'],
+  ['declared_group', '生效分组'],
+  ['declared_group_ratio', '分组折扣倍率'],
+  ['group_ratio_verified', '分组倍率可信'],
+  ['declared_model_ratio', '公示输入倍率'],
+  ['declared_completion_ratio', '公示输出倍率'],
+  ['cache_ratio', '缓存倍率'],
+  ['declared_drift_count', '公示价漂移项数'],
+  ['declared_drift_fields', '公示价漂移字段'],
+  ['public_price_state', '公开价表状态'],
+  ['public_price_page', '公开价表页面'],
+  ['public_price_reason', '公开价表原因'],
+  ['public_price_entries', '公开价表条目数'],
+  ['public_price_matched', '公开价表命中模型'],
+  ['public_price_input_usd_per_m', '公开价输入价（$/百万）'],
+  ['public_price_output_usd_per_m', '公开价输出价（$/百万）'],
+  ['public_price_cached_usd_per_m', '公开价缓存价（$/百万）'],
+  ['public_price_list_input_usd_per_m', '公开价列表输入价（$/百万）'],
+  ['public_price_list_output_usd_per_m', '公开价列表输出价（$/百万）'],
+  ['public_price_list_cached_usd_per_m', '公开价列表缓存价（$/百万）'],
+  ['scraped_price_state', '网页抓价状态'],
+  ['scraped_price_reason', '网页抓价原因'],
+  ['scraped_price_page', '抓价页面'],
+  ['scraped_price_matched', '抓价命中模型'],
+  ['scraped_price_input_usd_per_m', '抓价输入价（$/百万）'],
+  ['scraped_price_output_usd_per_m', '抓价输出价（$/百万）'],
+  ['scraped_price_confidence', '抓价置信度'],
+  ['scraped_price_currency', '抓价币种'],
+  ['measured_ratio', '实测倍率'],
+  ['ratio_verified', '实测倍率可信'],
+  ['ratio_masked_verdict', '实测倍率结论'],
+  ['ratio_contaminated', '倍率被污染'],
+  ['ratio_samples', '倍率样本数'],
+  ['ratio_dropped', '丢弃样本数'],
+  ['balance_endpoint', '余额端点'],
+  ['balance_probe_reason', '余额探测原因'],
+  ['balance_unit', '余额读数单位'],
+  ['balance_resolution', '余额读数刻度'],
+  ['balance_calibrated_unit', '校准后单位'],
+  ['balance_calibration_confidence', '单位校准置信度'],
+  ['balance_scope', '余额口径'],
+  ['balance_pre_settled', '前快照已结算'],
+  ['balance_post_settled', '后快照已结算'],
+  ['balance_before', '请求前余额读数'],
+  ['balance_after', '请求后余额读数'],
+  ['spend_delta', '余额扣费差值'],
+  ['money_check_state', '金额核验状态'],
+  ['money_verified', '金额已核验'],
+  ['absolute_reconciliation', '绝对对账'],
+  ['expected_cost_usd_declared', '按公示价应缴（USD）'],
+  ['expected_quota_declared', '按公示价应缴（quota）'],
+  ['cost_is_upper_bound', '应缴额为上界'],
+  ['cost_is_lower_bound', '应缴额为下界'],
+  ['calibration_confidence', '单位校准置信度'],
+  ['reference_source', '令牌基准来源'],
+  ['reference_verified', '令牌基准已核验'],
+  ['quota_to_usd', 'quota→USD 系数'],
+  ['quota_per_unit', '站点 quota 每美元'],
+  ['expected_cost', '本轮应缴额'],
+  ['price_input', '宣称输入价（$/百万）'],
+  ['price_output', '宣称输出价（$/百万）'],
+  ['price_cached_read', '宣称缓存读价（$/百万）'],
+  ['price_threshold', '阶梯阈值（tokens）'],
+  ['price_input2', '二档输入价（$/百万）'],
+  ['price_output2', '二档输出价（$/百万）'],
+  ['price_cached_read2', '二档缓存读价（$/百万）'],
+  ['echo_model_mismatch', '回显模型不一致'],
+  ['requests', '请求数'],
+  ['details_reported_count', '已回报样本数'],
+  ['usage_missing', 'usage 缺失数'],
+  ['usage_inconsistent', 'usage 不一致数'],
+  ['constant_usage', '恒定 usage 数'],
+  ['completion_ratio_en', '输出侧倍率（英文题）'],
+  ['completion_ratio_zh', '输出侧倍率（中文题）'],
+  ['completion_pair_samples_en', '输出侧配对样本（英）'],
+  ['completion_pair_samples_zh', '输出侧配对样本（中）'],
+  ['slope_en', '输入 token 斜率（英）'],
+  ['slope_zh', '输入 token 斜率（中）'],
+  ['r2_en', '回归 R²（英）'],
+  ['r2_zh', '回归 R²（中）'],
+  ['evidence_level', '证据等级'],
+];
+
+/** 大型内部指标：完整倍率表/抓价命中的 JSON 串（数百模型时能刷屏），与 src/report/markdown.ts HIDDEN_METRICS 同口径。 */
+function isHiddenMetricKey(key) {
+  return key.endsWith('_json');
+}
+
+/**
+ * 抓价页与端点同源校验（pricing-scrape 内 fail-closed 的提前拦截）：
+ * 绝对 URL 必须与 baseUrl 同 origin；相对路径天然同源。baseUrl 本身非法时交回 CLI 报错（不抢答）。
+ * @returns {string | null} 错误文案；null 表示无问题。
+ */
+function declaredPricePageOriginIssue(baseUrl, page) {
+  if (!/^https?:\/\//i.test(page)) return null;
+  let base;
+  let target;
+  try {
+    base = new URL(baseUrl);
+    target = new URL(page);
+  } catch {
+    return null;
+  }
+  if (base.origin === target.origin) return null;
+  return `--declared-price-page 必须与 --base-url 同源（抓价绝不跨域）：端点 ${base.origin}，抓价页 ${target.origin}。示例：--declared-price-page /pricing（同源路径）`;
+}
+
+/** 单探针的非空指标条目；metrics 缺失或非对象（老报告/手改文件）降级为空数组，不整体失败。 */
+function metricEntries(record) {
+  const metrics = record?.metrics;
+  if (metrics === null || typeof metrics !== 'object' || Array.isArray(metrics)) return [];
+  return Object.entries(metrics).filter(([key, value]) => value !== null && value !== undefined && !isHiddenMetricKey(key));
+}
+
+/** 指标值文本：布尔读作是/否；对象走 JSON；超长字符串截断（完整值仍在下方指标明细表里）。 */
+function metricText(value) {
+  if (typeof value === 'boolean') return value ? '是' : '否';
+  let text;
+  if (value !== null && typeof value === 'object') {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = '[无法序列化的值]';
+    }
+  } else {
+    text = String(value);
+  }
+  return text.length > 160 ? `${text.slice(0, 160)}…` : text;
+}
+
+/** 计费探针的「倍率与金额」摘要块行；无对应指标（或报告里没有 billing 探针）返回空数组。 */
+function renderBillingMetrics(record) {
+  const entries = metricEntries(record);
+  if (entries.length === 0) return [];
+  const byKey = new Map(entries);
+  const cells = [];
+  for (const [key, label] of BILLING_METRIC_LABELS) {
+    if (!byKey.has(key)) continue;
+    cells.push(`          <div><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(metricText(byKey.get(key)))}</span></div>`);
+  }
+  if (cells.length === 0) return [];
+  return ['  <h4>计费与倍率</h4>', '  <div class="metrics-grid">', ...cells, '  </div>'];
+}
+
+/** 单探针的完整指标明细（默认折叠）：避免把 40+ 项内部指标直接糊在评分卡上。 */
+function renderMetricsDetail(record, label) {
+  const entries = metricEntries(record);
+  if (entries.length === 0) return [];
+  const rows = entries.map(
+    ([key, value]) => `            <tr><td>${escapeHtml(key)}</td><td>${escapeHtml(metricText(value))}</td></tr>`,
+  );
+  return [
+    `  <details class="metrics-detail"><summary>${escapeHtml(label)} 指标明细（${entries.length} 项）</summary>`,
+    '  <table class="probes">',
+    '    <thead><tr><th>指标</th><th>值</th></tr></thead>',
+    '    <tbody>',
+    ...rows,
+    '    </tbody>',
+    '  </table>',
+    '  </details>',
+  ];
 }
 
 /**
@@ -305,6 +518,10 @@ export function renderScorecard(jsonText) {
   const overall = typeof data.overall === 'string' ? data.overall : '';
   const overallLabel = OVERALL_LABEL[overall] ?? '未判定';
 
+  const billingOutcome = data.outcomes.find((raw) => fieldText(raw, 'id') === 'billing');
+  const billingBlock = renderBillingMetrics(billingOutcome);
+  const metricDetails = data.outcomes.flatMap((raw) => renderMetricsDetail(raw, fieldText(raw, 'id') ?? '（缺失）'));
+
   const html = [
     '<section class="scorecard">',
     `  <div class="scorecard-head"><span class="total">可信度总分：${escapeHtml(total)}</span><span class="badge badge-${badgeClass(overall)}">${escapeHtml(overallLabel)}</span></div>`,
@@ -314,6 +531,8 @@ export function renderScorecard(jsonText) {
     ...rows,
     '    </tbody>',
     '  </table>',
+    ...billingBlock,
+    ...metricDetails,
     `  <h4>findings（${findings.length}）</h4>`,
     ...(findings.length > 0 ? ['  <ul class="findings">', ...findings, '  </ul>'] : ['  <p class="placeholder">无 findings。</p>']),
     `  <h4>notes（${notes.length}）</h4>`,
@@ -466,6 +685,38 @@ export function classifyLogLine(text) {
   return 'log-line';
 }
 
+/**
+ * 归一化页面注入的会话 token：必须是 48 位小写十六进制（服务端 randomBytes(24) 的形态）。
+ * 占位符未替换（页面来自静态副本/缓存）、空串、形态不符 → null（= 未连上本地服务）。
+ */
+export function normalizeInjectedToken(raw) {
+  return typeof raw === 'string' && /^[0-9a-f]{48}$/.test(raw) ? raw : null;
+}
+
+/**
+ * 从控制台首页 HTML 中提取服务端当前注入的会话 token。
+ * 服务重启（或 token 文件被替换）后，页面可用它自愈：重新取一次首页 → 拿到新 token → 重试原请求。
+ * 取不到（页面不是本服务渲染的）返回 null。
+ */
+export function extractTokenFromHtml(html) {
+  if (typeof html !== 'string') return null;
+  const match = /window\.MX_TOKEN\s*=\s*'([0-9a-f]{48})'\s*;/.exec(html);
+  return match === null ? null : match[1];
+}
+
+/**
+ * 判断响应是否为「会话 token 不可用」（缺 token / token 与服务端不一致）。
+ * 命中即允许客户端重取一次 token 并重试一次；其余 403（如 Host/Origin 校验失败）不得重试。
+ */
+export function isTokenAuthError(status, data) {
+  if (status !== 403) return false;
+  const code = data !== null && typeof data === 'object' ? String(data.code ?? '') : '';
+  if (code === 'token_stale' || code === 'token_missing') return true;
+  // 兜底：旧版服务端没有 code 字段，只按文案判断（仅限 token 相关文案）。
+  const error = data !== null && typeof data === 'object' ? String(data.error ?? '') : '';
+  return /x-model-xray-token/i.test(error);
+}
+
 
 // ---------------------------------------------------------------------------
 // DOM 接线（仅浏览器执行；Node 测试 import 时 document 为 undefined，直接跳过）
@@ -479,29 +730,67 @@ if (typeof document !== 'undefined') {
   };
 
   // —— token / 在线状态：serve.mjs 注入 window.MX_TOKEN；占位符未替换 = 未连上本地服务 ——
-  const TOKEN =
-    typeof window !== 'undefined' &&
-    typeof window.MX_TOKEN === 'string' &&
-    window.MX_TOKEN !== '' &&
-    !window.MX_TOKEN.includes('__MX_TOKEN__')
-      ? window.MX_TOKEN
-      : null;
-  if (TOKEN === null) byId('offline-banner')?.removeAttribute('hidden');
+  //    token 可变（let）：服务重启后旧页面会通过 resyncToken() 自愈，无需用户手动刷新。
+  let token = normalizeInjectedToken(typeof window !== 'undefined' ? window.MX_TOKEN : null);
+  if (token === null) byId('offline-banner')?.removeAttribute('hidden');
+
+  // 网络不可达（fetch 抛错）时的诚实回应：不假装成功，把原因原样告诉用户。
+  const NETWORK_ERROR = {
+    status: 0,
+    ok: false,
+    data: {
+      error: '本地服务不可达：请确认 npm run ui 仍在运行（若刚重启，请刷新本页面后重试）。',
+      code: 'network_error',
+    },
+  };
+
+  /**
+   * 重新取一次服务端当前的会话 token（GET / 首页会带上注入后的 token）。
+   * 服务重启 / token 文件被替换后，页面据此自愈：拿到新 token 即可继续调用 API。
+   * @returns {Promise<boolean>} 是否成功换到新 token。
+   */
+  async function resyncToken() {
+    try {
+      const res = await fetch('/', { cache: 'no-store' });
+      if (!res.ok) return false;
+      const html = await res.text();
+      const next = extractTokenFromHtml(html);
+      if (next === null || next === token) return false;
+      token = next;
+      byId('offline-banner')?.setAttribute('hidden', '');
+      return true;
+    } catch {
+      return false;
+    }
+  }
 
   async function api(path, options = {}) {
-    const headers = { ...(options.headers ?? {}) };
-    if (options.body !== undefined) headers['content-type'] = 'application/json';
-    if (TOKEN !== null) headers['x-model-xray-token'] = TOKEN;
-    const res = await fetch(path, { method: options.method ?? 'GET', headers, body: options.body });
-    let data = null;
-    try {
-      data = await res.json();
-    } catch {
-      data = null;
-    }
-    return { status: res.status, ok: res.ok, data };
+    const send = async (useToken) => {
+      const headers = { ...(options.headers ?? {}) };
+      if (options.body !== undefined) headers['content-type'] = 'application/json';
+      if (useToken !== null) headers['x-model-xray-token'] = useToken;
+      let res;
+      try {
+        res = await fetch(path, { method: options.method ?? 'GET', headers, body: options.body });
+      } catch {
+        return NETWORK_ERROR;
+      }
+      let data = null;
+      try {
+        data = await res.json();
+      } catch {
+        data = null;
+      }
+      return { status: res.status, ok: res.ok, data };
+    };
+    const first = await send(token);
+    if (!isTokenAuthError(first.status, first.data)) return first;
+    // token 失效：换一次 token 重试。服务端在鉴权失败前不做任何副作用（闸门先于读体与路由），
+    // 故重试是安全的（不会重复写入 key / 重复清库）。
+    if (!(await resyncToken())) return first;
+    return send(token);
   }
-  const isOffline = () => TOKEN === null;
+  const isOffline = () => token === null;
 
   // —— 三 tab 切换 ——
   const tabs = { test: byId('tab-test'), gateway: byId('tab-gateway'), reports: byId('tab-reports') };
@@ -546,7 +835,12 @@ if (typeof document !== 'undefined') {
     renderKeyStatus(res.ok ? res.data : { keySource: null });
   }
   async function saveKey() {
-    if (isOffline()) return;
+    // 页面没有可用 token（占位符未替换/服务已停）：先自愈一次（重取首页 token），
+    // 仍拿不到就如实告知——绝不静默无响应（用户点了却不知道发生了什么）。
+    if (isOffline() && !(await resyncToken())) {
+      if (keyState) keyState.textContent = '保存失败：本地服务不可达：请确认 npm run ui 仍在运行（若刚重启，请刷新本页面后重试）。';
+      return;
+    }
     const key = inputValue('f-key').trim();
     if (key === '') {
       renderKeyStatus({ keySource: null });
@@ -565,9 +859,13 @@ if (typeof document !== 'undefined') {
     if (event instanceof KeyboardEvent && event.key === 'Enter') void saveKey();
   });
   byId('btn-key-clear')?.addEventListener('click', async () => {
-    if (isOffline()) return;
+    if (isOffline() && !(await resyncToken())) {
+      if (keyState) keyState.textContent = '清除失败：本地服务不可达：请确认 npm run ui 仍在运行。';
+      return;
+    }
     const res = await api('/api/key/clear', { method: 'POST', body: '{}' });
     if (res.ok) renderKeyStatus(res.data);
+    else if (keyState) keyState.textContent = `清除失败：${String(res.data?.error ?? res.status)}`;
   });
   void loadKeyStatus();
 
@@ -585,6 +883,10 @@ if (typeof document !== 'undefined') {
       priceInput2: inputValue('f-price-input2'),
       priceOutput2: inputValue('f-price-output2'),
       priceCachedRead2: inputValue('f-price-cached-read2'),
+      expectModelRatio: inputValue('f-expect-model-ratio'),
+      expectCompletionRatio: inputValue('f-expect-completion-ratio'),
+      quotaPerUsd: inputValue('f-quota-per-usd'),
+      declaredPricePage: inputValue('f-declared-price-page'),
       seed: inputValue('f-seed'),
       timeout: inputValue('f-timeout'),
       httpRetries: inputValue('f-http-retries'),
@@ -607,6 +909,7 @@ if (typeof document !== 'undefined') {
   for (const id of [
     'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
     'f-price-cached-read', 'f-price-threshold', 'f-price-input2', 'f-price-output2', 'f-price-cached-read2',
+    'f-expect-model-ratio', 'f-expect-completion-ratio', 'f-quota-per-usd', 'f-declared-price-page',
     'f-seed', 'f-timeout', 'f-http-retries', 'f-out', 'f-baseline',
   ]) {
     byId(id)?.addEventListener('input', updateCommandPreview);
@@ -803,7 +1106,8 @@ if (typeof document !== 'undefined') {
     }, 800);
   }
   btnRun?.addEventListener('click', async () => {
-    if (isOffline()) {
+    // 离线（页面没有可用 token）：先自愈一次（重取首页 token），仍不可用才如实报错。
+    if (isOffline() && !(await resyncToken())) {
       if (runError) {
         runError.textContent = '未连接本地服务：请在仓库目录运行 npm run ui，并使用打开的页面。';
         runError.removeAttribute('hidden');

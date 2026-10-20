@@ -1,7 +1,7 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
 import { levelLabel, PROBE_ORDER, statusTag } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
-import { CREDIBILITY_NOTE } from './markdown.js';
+import { CREDIBILITY_NOTE, HIDDEN_METRICS, billingSummaryRows } from './markdown.js';
 
 /** 每维度一行静态说明：测什么 / 评分依据（纯展示，不参与评分）。 */
 const DIMENSION_DESC: Readonly<Record<string, string>> = {
@@ -31,6 +31,7 @@ export function renderHtml(report: AuditReport): string {
 body{font:15px/1.6 -apple-system,Segoe UI,Roboto,Helvetica,Arial,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;padding:32px;background:#fafafa;color:#1a1a1a}
 main{max-width:960px;margin:0 auto}
 h1{font-size:22px} h2{margin-top:32px;border-bottom:1px solid var(--line);padding-bottom:6px}
+h4{font-size:15px;margin:16px 0 6px}
 table{border-collapse:collapse;width:100%;background:#fff} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
 th{background:#f0f0f0}
 .badge{display:inline-block;padding:6px 14px;border-radius:6px;font-weight:700;color:#fff;margin-right:8px}
@@ -109,14 +110,23 @@ function renderOutcome(outcome: ProbeOutcome): string {
       return `<li><span class="tag ${cls}">${esc(f.level.toUpperCase())}</span> ${esc(f.message)}${refs}</li>`;
     })
     .join('\n');
-  const metrics = Object.entries(outcome.metrics).filter(([, v]) => v !== null);
+  const metrics = Object.entries(outcome.metrics).filter(([key, v]) => v !== null && !HIDDEN_METRICS.has(key));
   const metricRows = metrics.length
     ? `<table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody>${metrics
         .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`)
         .join('')}</tbody></table>`
     : '';
+  // 计费维度：倍率/金额摘要块（中文标签 + 实测/公示倍率 + 「为什么没有倍率」的原因），紧跟 headline。
+  const billingRows = outcome.id === 'billing' ? billingSummaryRows(outcome.metrics) : [];
+  const billingBlock =
+    billingRows.length > 0
+      ? `<h4>计费与倍率</h4><table><thead><tr><th>指标</th><th>值</th></tr></thead><tbody>${billingRows
+          .map(([, label, value]) => `<tr><td>${esc(label)}</td><td>${esc(value)}</td></tr>`)
+          .join('')}</tbody></table>`
+      : '';
   return `<h3>${esc(outcome.id)} — <span class="tag ${outcome.level}">${esc(statusTag(outcome.level))}</span> (${outcome.score ?? '未判定'})</h3>
 <p>${esc(outcome.headline)}</p>
+${billingBlock}
 ${findings ? `<ul>${findings}</ul>` : ''}
 ${metricRows}`;
 }

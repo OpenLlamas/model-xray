@@ -1,11 +1,35 @@
 import { basename } from 'node:path';
-import type { ChatMessage, Finding, Level, ProbeCtx, ProbeOutcome, RunConfig } from '../types.js';
+import type { ChatMessage, DeclaredPricingSnapshot, Finding, Level, ProbeCtx, ProbeOutcome, RunConfig } from '../types.js';
 import { computeCostUsd, type ModelPrice } from '../gateway/pricing.js';
 import { estimateMessageTokens, estimateTokens } from '../tokens.js';
 import { linearRegression, mean } from '../stats.js';
 import { failureDigest } from '../diagnostics.js';
 import { recordCall } from '../evidence.js';
-import { probeBalanceStable, spendBetween, type BalanceReading } from '../balance.js';
+import { probeBalanceDetailed, probeBalanceStable, spendBetween, type BalanceReading } from '../balance.js';
+import {
+  calibrateSpendDelta,
+  calibrationLowConfidenceNote,
+  firstFinitePositive,
+  formatCalibrationCandidates,
+  type CalibrationConfidence,
+  type CalibrationOutcome,
+  type CalibrationUnit,
+} from '../calibration.js';
+import {
+  expectedCostFromDeclared,
+  fetchDeclaredPricing,
+  lookupDeclaredModel,
+  modelFamily,
+  normalizeModelName,
+  USD_PER_MILLION_PER_RATIO,
+  type DeclaredCostEstimate,
+  type DeclaredPricing,
+  type QuotaPerUnitSource,
+  type UsageTotals,
+} from '../pricing.js';
+import { fetchPublicPricing, type PublicPricingResult } from '../pricing-public.js';
+import { comparePricingSnapshots, type PricingDrift } from '../pricing-ledger.js';
+import { scrapeDeclaredPricing } from '../pricing-scrape.js';
 import { decideTokenReference, type TokenReferenceDecision } from '../token-reference.js';
 import { PROBESET_VERSION } from '../assets.js';
 
@@ -22,6 +46,15 @@ const BILLING_MAX_TOKENS = 16;
  * 不得因缺绝对对账悬置为 insufficient。
  */
 const SHAPE_ONLY_SCORE = 85;
+
+/** 公示价抓取失败时的通过分上限：有接口却读不到 = 证据缺口，不得与正常形状核验同分。 */
+const PRICING_FAILED_SCORE = 70;
+
+/**
+ * 公示倍率漂移（对照基线/价格账本历史快照）时的通过分上限：漂移可能直接对应计费上涨，
+ * 但「页面变化 ≠ 实收变化」，只降档不判 fail（实收核验由余额对账负责）。
+ */
+const PRICING_DRIFT_SCORE = 85;
 
 /**
  * 暗插固定 token 判定阈值：回归截距（x=0 外推的恒定项）超过该值即「与输入长度无关的恒定加计」。
@@ -105,6 +138,349 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (claimed.error !== null) {
     findings.push({ level: 'warn', message: `计费核价配置无效：${claimed.error}。本次不计算实测倍率。`, evidenceIds: [] });
   }
+  // 仅在「有消费者」时抓取公示价：显式价格核验、用户声明的倍率锚、历史基线/账本、或账本写回调。
+  // 三者皆无时（纯 usage 形状审计）不发起公示价探测：网络/路由不可达不应把形状结论拖成证据缺口。
+  const pricingFeaturesEnabled =
+    priceEnabled ||
+    ctx.cfg.expectModelRatio != null ||
+    ctx.cfg.expectCompletionRatio != null ||
+    ctx.previousPricing != null ||
+    ctx.previousPricingAlt != null ||
+    ctx.onPricingSnapshot !== undefined;
+  // 站点公示倍率快照（GET /api/pricing + /api/status，同源免鉴权、不计费）：在首个计费请求前抓取，
+  // 与余额观测窗口大致同窗。读取失败绝不 fail 探针本身——降级为显式状态并计入 money_check_state。
+  const declaredResult = pricingFeaturesEnabled
+    ? await fetchDeclaredPricing(ctx.client.baseUrl, {
+        timeoutMs: ctx.cfg.timeoutMs,
+        quotaPerUsd: ctx.cfg.quotaPerUsd ?? null,
+        group: ctx.cfg.group ?? null,
+      })
+    : {
+        state: 'not_applicable' as const,
+        origin: null,
+        pricing: null,
+        quotaPerUnit: ctx.cfg.quotaPerUsd ?? null,
+        reason: '未请求价格核验（无 --price-* / --expect-*-ratio / 基线或账本），跳过公示价抓取',
+      };
+  const declared = declaredResult.pricing;
+  const declaredLookup = declared !== null ? lookupDeclaredModel(declared, ctx.cfg.model) : null;
+  // 非 new-api 站点：/api/pricing 404 或未收录该模型时，回退站点公开价表（同源、免鉴权、不重试）。
+  // 公开价表只做模型级价格锚，不参与余额 quota 换算（quotaPerUnit 仍取真实源）。
+  let publicResult: PublicPricingResult | null = null;
+  if (pricingFeaturesEnabled && (declared === null || declaredLookup === null)) {
+    publicResult = await fetchPublicPricing(ctx.client.baseUrl, { timeoutMs: ctx.cfg.timeoutMs });
+  }
+  const publicLookup =
+    publicResult?.state === 'ok' && publicResult.pricing !== null
+      ? lookupDeclaredModel(publicResult.pricing, ctx.cfg.model)
+      : null;
+  const publicPrice =
+    publicResult !== null && publicResult.prices !== null && publicLookup !== null
+      ? (publicResult.prices[publicLookup.key] ?? null)
+      : null;
+  const anchorSource: 'api' | 'public-json' | null =
+    declaredLookup !== null ? 'api' : publicLookup !== null ? 'public-json' : null;
+  const anchorPricing =
+    anchorSource === 'api' ? declared : anchorSource === 'public-json' ? (publicResult?.pricing ?? null) : null;
+  const declaredModel = declaredLookup?.model ?? publicLookup?.model ?? null;
+  // 分组口径：--group 优先；未显式指定且公示表含 default 分组倍率时按 default 计价（与 README/HELP
+  // 的「缺省用站点 default 分组」一致）。公开价表无分组概念，固定 null（倍率 1）。
+  const effectiveGroup =
+    anchorSource === 'api' && declared !== null
+      ? (declared.group ?? ctx.cfg.group ?? (declared.groupRatio['default'] !== undefined ? 'default' : null))
+      : anchorSource === 'public-json'
+        ? null
+        : (ctx.cfg.group ?? null);
+  const quotaPerUnit = declaredResult.quotaPerUnit ?? ctx.cfg.quotaPerUsd ?? null;
+  // 换算系数来源：CLI 覆盖优先，其次站点 /api/status 公示。漂移比对据此区分
+  // 「站点改了换算系数」（实收金额随之变化，属漂移证据）与「用户换了覆盖值」（只披露）。
+  const quotaPerUnitSource: QuotaPerUnitSource =
+    ctx.cfg.quotaPerUsd != null ? 'cli' : declaredResult.quotaPerUnit != null ? 'site' : 'none';
+  // quota → USD 换算率（$1 = N quota ⇒ 1 quota = 1/N USD）；余额读数为 quota 单位时用它换算。
+  const quotaToUsd = quotaPerUnit !== null && quotaPerUnit > 0 ? 1 / quotaPerUnit : null;
+  // 账本/基线快照：公开价表只保留命中模型，且 quotaPerUnit 使用真实源，避免合成 500000 污染余额口径。
+  const snapshotPricing: DeclaredPricing | null =
+    anchorPricing === null
+      ? null
+      : anchorSource === 'public-json' && publicLookup !== null
+        ? {
+            ...anchorPricing,
+            quotaPerUnit,
+            quotaPerUnitSource,
+            quotaPerUnitConflict: null,
+            group: null,
+            groupRatio: {},
+            models: { [publicLookup.key]: publicLookup.model },
+            source: 'public-json',
+          }
+        : anchorPricing;
+  metrics['pricing_state'] = declaredResult.state;
+  metrics['declared_source'] = anchorSource;
+  metrics['declared_origin'] = anchorPricing?.origin ?? declaredResult.origin;
+  metrics['declared_model_ratio'] = declaredModel !== null ? declaredModel.modelRatio : null;
+  metrics['declared_completion_ratio'] = declaredModel !== null ? declaredModel.completionRatio : null;
+  metrics['cache_ratio'] = declaredModel !== null ? declaredModel.cacheRatio : null;
+  metrics['declared_group'] = anchorSource === 'public-json' ? null : effectiveGroup;
+  metrics['declared_group_ratio'] =
+    anchorSource === 'api' && declared !== null && effectiveGroup !== null ? (declared.groupRatio[effectiveGroup] ?? null) : null;
+  // 分组倍率是否能在公示表中核验：null = 无分组口径可评估；0 = 声明了分组但站点未公示该倍率。
+  metrics['group_ratio_verified'] =
+    anchorSource === 'api' && declared !== null && effectiveGroup !== null
+      ? declared.groupRatio[effectiveGroup] !== undefined
+        ? 1
+        : 0
+      : null;
+  metrics['quota_per_unit'] = quotaPerUnit;
+  metrics['quota_per_unit_source'] = quotaPerUnitSource;
+  // 公开价表状态与原始 USD 单价（列表价只披露，不参与判定）。
+  metrics['public_price_state'] = publicResult?.state ?? null;
+  metrics['public_price_page'] = publicResult?.page ?? null;
+  metrics['public_price_reason'] = publicResult?.reason ?? null;
+  metrics['public_price_entries'] = publicResult?.entries ?? null;
+  metrics['public_price_matched'] = publicLookup?.key ?? null;
+  metrics['public_price_input_usd_per_m'] = publicPrice?.inputUsdPerM ?? null;
+  metrics['public_price_output_usd_per_m'] = publicPrice?.outputUsdPerM ?? null;
+  metrics['public_price_cached_usd_per_m'] = publicPrice?.cachedUsdPerM ?? null;
+  metrics['public_price_list_input_usd_per_m'] = publicPrice?.listInputUsdPerM ?? null;
+  metrics['public_price_list_output_usd_per_m'] = publicPrice?.listOutputUsdPerM ?? null;
+  metrics['public_price_list_cached_usd_per_m'] = publicPrice?.listCachedUsdPerM ?? null;
+  // 快照内部字段（供 baseline 复原与漂移检测；报告渲染层会过滤这几个 key，避免表格膨胀）
+  metrics['declared_captured_at'] = snapshotPricing !== null ? snapshotPricing.capturedAt : null;
+  metrics['declared_models_json'] = snapshotPricing !== null ? serializeDeclaredModels(snapshotPricing) : null;
+  metrics['declared_group_ratio_json'] = snapshotPricing !== null ? JSON.stringify(snapshotPricing.groupRatio) : null;
+  // 价格账本：抓取成功即把本轮公示快照追加落盘（无需 --baseline 的历史对照来源，跨运行检测漂移）。
+  // 写入失败只披露（warn + 指标），本轮判定不受影响；回调缺席（库调用方/测试）时不产生账本指标。
+  let ledgerWriteFailed = false;
+  const onPricingSnapshot = ctx.onPricingSnapshot;
+  if (snapshotPricing !== null && onPricingSnapshot !== undefined) {
+    const write = onPricingSnapshot(snapshotPricing);
+    metrics['pricing_ledger_write_ok'] = write.ok ? 1 : 0;
+    metrics['pricing_ledger_error'] = write.error;
+    if (!write.ok) {
+      ledgerWriteFailed = true;
+      findings.push({
+        level: 'warn',
+        message: `价格账本写入失败（${write.error ?? '原因未知'}）：本轮已抓取快照但未能持久化，下次运行无法自动检测倍率漂移。`,
+        evidenceIds: [],
+      });
+    } else if (ctx.previousPricing == null) {
+      findings.push({
+        level: 'info',
+        message: `已写入本地价格账本（${write.path ?? '?'}），下次运行将自动对比公示倍率漂移`,
+        evidenceIds: [],
+      });
+    }
+  }
+  // 漂移对照来源如实透出：baseline=显式基线快照，ledger=本地价格账本，none=无历史对照；
+  // alt 为次对照源（--baseline 与账本同时存在时两者都参与对比）。
+  metrics['pricing_ledger_previous_source'] = ctx.previousPricing != null ? (ctx.previousPricingSource ?? 'baseline') : 'none';
+  metrics['pricing_ledger_alt_source'] = ctx.previousPricingAlt != null ? (ctx.previousPricingAltSource ?? 'ledger') : null;
+  metrics['pricing_ledger_read_error'] = ctx.pricingLedgerError ?? null;
+  // 账本损坏行：本地 I/O 问题（不是端点计费证据）→ 指标 + warn 披露，但绝不封顶分数/判 fail。
+  // 尾部损坏（更新的位置有坏行/半行）时对照基线可能不是最新快照，必须在文案中明示这一点。
+  const ledgerCorruptLines = ctx.pricingLedgerCorruptLines ?? 0;
+  metrics['pricing_ledger_corrupt_lines'] = ledgerCorruptLines;
+  if (ledgerCorruptLines > 0) {
+    const tailSuffix = ctx.pricingLedgerTailCorrupt === true ? '；损坏行更新于对照基线，本次对照基线可能不是最新快照' : '';
+    findings.push({
+      level: 'warn',
+      message: `价格账本有 ${ledgerCorruptLines} 行无法解析（可能历史损坏或并发写坏），漂移对照可能缺失最近快照${tailSuffix}：请检查 ${ctx.pricingLedgerPath ?? '本地价格账本文件'}`,
+      evidenceIds: [],
+    });
+  } else if (ctx.pricingLedgerTailCorrupt === true) {
+    findings.push({
+      level: 'warn',
+      message: `价格账本尾部存在未终止的半行：本次对照基线可能不是最新快照，漂移对照结论按此降级理解：请检查 ${ctx.pricingLedgerPath ?? '本地价格账本文件'}`,
+      evidenceIds: [],
+    });
+  }
+  metrics['declared_drift_count'] = null;
+  metrics['declared_drift_fields'] = null;
+  if (declaredResult.state === 'not_applicable') {
+    if (pricingFeaturesEnabled && anchorSource !== 'public-json') {
+      const publicNote =
+        publicResult?.state === 'not_applicable'
+          ? `；公开价表同样不可用（${publicResult.reason ?? '原因未知'}）`
+          : publicResult?.state === 'failed'
+            ? `；公开价表读取失败（${publicResult.reason ?? '原因未知'}）`
+            : '';
+      findings.push({
+        level: 'info',
+        message: `站点公示价不可用（${declaredResult.reason ?? '原因未知'}）${publicNote}：本轮未核验公示倍率与金额，仅核验 usage 形状。`,
+        evidenceIds: [],
+      });
+    }
+  } else if (declared !== null) {
+    if (declaredModel === null && anchorSource === null) {
+      findings.push({
+        level: 'info',
+        message: `站点公示价表可读，但未找到模型「${ctx.cfg.model}」的条目（已尝试大小写/版本后缀归并），无法换算应缴金额；可用 --expect-model-ratio 手工声明倍率。`,
+        evidenceIds: [],
+      });
+    }
+    if (declared.quotaPerUnitConflict !== null) {
+      findings.push({ level: 'info', message: declared.quotaPerUnitConflict, evidenceIds: [] });
+    }
+  }
+  if (anchorSource === 'public-json' && publicResult !== null) {
+    const why =
+      declaredResult.state === 'not_applicable'
+        ? `站点未提供 /api/pricing（${declaredResult.reason ?? '原因未知'}）`
+        : declaredResult.state === 'failed'
+          ? `站点 /api/pricing 读取失败（${declaredResult.reason ?? '原因未知'}）`
+          : `站点 /api/pricing 未收录模型「${ctx.cfg.model}」`;
+    findings.push({
+      level: 'info',
+      message:
+        `已改用站点公开价表 ${publicResult.page ?? '?'}（${publicResult.entries} 条）作为公示价锚：${why}。` +
+        '公开价表无分组概念，按倍率 1 折算，分组口径未核验；该价表不参与余额 quota 换算。',
+      evidenceIds: [],
+    });
+  } else if (publicResult?.state === 'failed') {
+    findings.push({
+      level: 'info',
+      message: `站点公开价表读取失败（${publicResult.reason ?? '原因未知'}）：本轮无法取得模型级公示价锚，金额侧仅按宣称价/usage 形状核验。`,
+      evidenceIds: [],
+    });
+  } else if (publicResult?.state === 'ok' && publicLookup === null) {
+    findings.push({
+      level: 'info',
+      message: `站点公开价表 ${publicResult.page ?? '?'} 可读（${publicResult.entries} 条），但未找到模型「${ctx.cfg.model}」：无法换算应缴金额。`,
+      evidenceIds: [],
+    });
+  }
+  if (snapshotPricing !== null) {
+    if (ctx.previousPricing != null && ctx.previousPricingSource === 'ledger') {
+      findings.push({
+        level: 'info',
+        message: `已从本地价格账本读取上次快照（${ctx.previousPricing.capturedAt}）用于漂移对比`,
+        evidenceIds: [],
+      });
+    }
+    // --baseline 与本地账本同时存在：两者都参与对照，明确披露双来源，避免用户误以为只看其一。
+    if (ctx.previousPricingAlt != null && ctx.previousPricingAltSource === 'ledger' && ctx.previousPricing != null) {
+      findings.push({
+        level: 'info',
+        message: `漂移对照同时使用 --baseline 快照（${ctx.previousPricing.capturedAt}）与本地价格账本快照（${ctx.previousPricingAlt.capturedAt}）`,
+        evidenceIds: [],
+      });
+    }
+    // 账本按主机+端口归档：对照快照抓取自同主机不同路径前缀时如实披露（两份快照可能口径不同）。
+    if (
+      (ctx.previousPricingSource === 'ledger' || ctx.previousPricingAltSource === 'ledger') &&
+      ctx.pricingLedgerOriginNote != null &&
+      ctx.pricingLedgerOriginNote !== ''
+    ) {
+      findings.push({ level: 'info', message: ctx.pricingLedgerOriginNote, evidenceIds: [] });
+    }
+    if (ctx.previousPricing == null) {
+      findings.push({
+        level: 'info',
+        message:
+          '首次记录站点公示倍率快照：本轮会把公示倍率并入基线落盘，下次审计用 --baseline 携带该基线即可检测倍率漂移' +
+          '（本轮若无任何可评分维度，基线不落盘，快照需待可评分的一轮留存）。',
+        evidenceIds: [],
+      });
+    }
+  }
+  // 账本读取失败（路径损坏/不可解析）：如实披露，不阻止审计，也不冒充「首次记录」。
+  // 已有 --baseline 时对照不因此缺失，文案必须区分两种情形。
+  if (ctx.pricingLedgerError != null && ctx.pricingLedgerError !== '') {
+    findings.push({
+      level: 'info',
+      message:
+        ctx.previousPricing != null
+          ? `价格账本读取失败（${ctx.pricingLedgerError}）：本轮未对比本地账本历史，已有基线/历史快照对照不受影响。`
+          : `价格账本读取失败（${ctx.pricingLedgerError}）：本轮未对比历史公示倍率。`,
+      evidenceIds: [],
+    });
+  }
+  // 网页价兜底（低信任参照）：/api/pricing 不可得且用户显式给出 --declared-price-page 时，
+  // 抓取站点网页公示价做金额侧参照。网页价是页面自述、无 schema 校验，绝不作为 fail 证据、
+  // 绝不写入价格账本（避免 scrape 快照污染 API 快照的漂移历史）。
+  const declaredPricePage = typeof ctx.cfg.declaredPricePage === 'string' ? ctx.cfg.declaredPricePage.trim() : '';
+  let scrapedReferenceEscalated = false;
+  if (declared === null && priceEnabled && declaredPricePage !== '') {
+    const scraped = await scrapeDeclaredPricing(ctx.client.baseUrl, ctx.cfg.model, {
+      timeoutMs: ctx.cfg.timeoutMs,
+      pricePage: declaredPricePage,
+    });
+    metrics['scraped_price_state'] = scraped.state;
+    metrics['scraped_price_page'] = scraped.page;
+    metrics['scraped_price_reason'] = scraped.reason;
+    metrics['scraped_price_entries'] = scraped.entries.length;
+    metrics['scraped_price_matched'] = scraped.matched !== null ? scraped.matched.modelName : null;
+    metrics['scraped_price_matched_json'] = scraped.matched !== null ? JSON.stringify(scraped.matched) : null;
+    metrics['scraped_price_currency'] = scraped.matched !== null ? scraped.matched.currency : null;
+    metrics['scraped_price_input_usd_per_m'] = scraped.matched !== null ? scraped.matched.inputUsdPerM : null;
+    metrics['scraped_price_output_usd_per_m'] = scraped.matched !== null ? scraped.matched.outputUsdPerM : null;
+    metrics['scraped_price_confidence'] = scraped.matched !== null ? scraped.matched.confidence : null;
+    const lowTrust = '网页价为低信任参照（页面自述、无 schema 校验），不作暗扣检测、不写入价格账本。';
+    if (scraped.state === 'failed') {
+      findings.push({ level: 'info', message: `网页公示价抓取失败（${scraped.reason ?? '原因未知'}）：${lowTrust}`, evidenceIds: [] });
+    } else if (scraped.state === 'not_applicable') {
+      findings.push({ level: 'info', message: `网页公示价不可用（${scraped.reason ?? '原因未知'}）：${lowTrust}`, evidenceIds: [] });
+    } else if (scraped.matched === null) {
+      findings.push({
+        level: 'info',
+        message: `网页价目表 ${scraped.page ?? ''} 可读（${scraped.entries.length} 条价格证据），但未找到模型「${ctx.cfg.model}」：${lowTrust}`,
+        evidenceIds: [],
+      });
+    } else {
+      const entry = scraped.matched;
+      if (entry.currency === 'USD' && entry.inputUsdPerM !== null && entry.outputUsdPerM !== null && price !== null) {
+        const relIn = Math.abs(entry.inputUsdPerM - price.input) / price.input;
+        const relOut = Math.abs(entry.outputUsdPerM - price.output) / price.output;
+        const rel = Math.max(relIn, relOut);
+        if (rel > 0.5) {
+          scrapedReferenceEscalated = true;
+          findings.push({
+            level: 'warn',
+            message:
+              `网页公示价（${entry.confidence}）为输入 $${round(entry.inputUsdPerM)}/M、输出 $${round(entry.outputUsdPerM)}/M，` +
+              `与宣称的 $${price.input}/M、$${price.output}/M 相对差 ${(rel * 100).toFixed(1)}%（>50%）：存在加价嫌疑。${lowTrust}`,
+            evidenceIds: [],
+          });
+        } else if (rel > 0.2) {
+          scrapedReferenceEscalated = true;
+          findings.push({
+            level: 'warn',
+            message:
+              `网页公示价（${entry.confidence}）为输入 $${round(entry.inputUsdPerM)}/M、输出 $${round(entry.outputUsdPerM)}/M，` +
+              `与宣称价相对差 ${(rel * 100).toFixed(1)}%（>20%）：存在加价嫌疑。${lowTrust}`,
+            evidenceIds: [],
+          });
+        } else {
+          findings.push({
+            level: 'info',
+            message:
+              `网页公示价（${entry.confidence}）为输入 $${round(entry.inputUsdPerM)}/M、输出 $${round(entry.outputUsdPerM)}/M，` +
+              `与宣称价相对差 ${(rel * 100).toFixed(1)}%（≤20%）：${lowTrust}`,
+            evidenceIds: [],
+          });
+        }
+      } else {
+        findings.push({
+          level: 'info',
+          message:
+            `网页价目表命中模型「${entry.modelName}」，但币种为 ${entry.currency} 或输入/输出归属不明确` +
+            `（原文：${entry.rawLine}），不做美元比价；${lowTrust}`,
+          evidenceIds: [],
+        });
+      }
+    }
+  }
+  // money_check_state 尽早落定：探针可能因样本不足提前返回（insufficient），金额侧状态仍必须可见。
+  // money_verified 只认余额绝对对账（下方 ratioVerified 后覆盖），token-reference 不含金额。
+  metrics['money_verified'] = 0;
+  metrics['money_check_state'] =
+    anchorSource !== null
+      ? 'declared_only'
+      : declaredResult.state === 'failed'
+        ? 'failed'
+        : declaredResult.state === 'not_applicable'
+          ? 'not_applicable'
+          : 'declared_only';
   let expectedCost = 0;
   let ratioSamples = 0;
   // 第一个计费请求之前查 balanceBefore：pre 快照同样做稳定化轮询，且必须「首比即稳」（polls≤2）。
@@ -113,8 +489,23 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const balanceBeforeStable = priceEnabled
     ? await probeBalanceStable(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
     : null;
-  const balanceBefore = balanceBeforeStable?.reading ?? null;
+  let balanceBefore: BillingBalanceReading | null = balanceBeforeStable?.reading ?? null;
+  // quota / total_usage_raw 读数注入换算率：单位换算推迟到 decideRatio（校准需要应缴金额作锚），
+  // 这里只附带可信元数据，不改动 unit/value，probeBalanceStable 的稳定判定口径不变。
+  if (
+    balanceBefore !== null &&
+    (balanceBefore.unit === 'quota' || balanceBefore.unit === 'total_usage_raw') &&
+    quotaToUsd !== null
+  ) {
+    balanceBefore = { ...balanceBefore, quotaToUsd };
+  }
+  // 余额稳定快照 = 首查后已结算且轮询次数 ≤2（最多 3 次查询，避免探测本身被计费/限流）。
   const balancePreClean = balanceBeforeStable !== null && balanceBeforeStable.settled && balanceBeforeStable.polls <= 2;
+  // 读不到余额时的诊断原因：probeBalanceStable 只返回读数，失败时需要 detailed 探测给出可披露的 reason。
+  let balanceProbeReason: string | null = null;
+  if (priceEnabled && balanceBeforeStable === null) {
+    balanceProbeReason = (await probeBalanceDetailed(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)).reason;
+  }
 
   interface Track {
     lang: 'en' | 'zh';
@@ -124,6 +515,12 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     /** 参与回归的样本证据 id（fail 级 finding 必须能回溯原始请求，兑现「每条 finding 链接证据」承诺） */
     evidenceIds: string[];
   }
+  /** 应缴估算用的 usage 总量（仅通过 usage 校验的样本与自适应补采样本） */
+  let promptTotal = 0;
+  let completionTotal = 0;
+  let usageValidSamples = 0;
+  /** 成功响应回显的 model（与请求不一致时为换壳/计价错配线索；携带证据 id 供 finding 回溯） */
+  const echoModels: Array<{ model: string; evidenceId: string }> = [];
   const tracks: Track[] = langs.map((lang) => ({ lang, xs: [], ys: [], raws: [], evidenceIds: [] }));
   const allResponses: number[] = [];
   /** token-reference 对比用：通过 usage 校验样本的逐档 prompt_tokens（key `${lang}_${level}`） */
@@ -210,6 +607,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         failureEvidenceIds.push(evidence.id);
         continue;
       }
+      // 回显模型收集（与 usage 是否可用无关：只要响应成功就检查计价错配线索）
+      if (result.model !== null && result.model.trim() !== '') {
+        echoModels.push({ model: result.model.trim(), evidenceId: evidence.id });
+      }
       if (!result.usage) {
         usageMissing += 1;
         if (result.usageRejected === 'inconsistent') {
@@ -277,6 +678,9 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       track.evidenceIds.push(evidence.id);
       validEvidenceIds.push(evidence.id);
       allResponses.push(result.usage.prompt_tokens);
+      promptTotal += result.usage.prompt_tokens;
+      completionTotal += result.usage.completion_tokens;
+      usageValidSamples += 1;
       metrics[`prompt_tokens_${lang}_${targetTokens}`] = result.usage.prompt_tokens;
       refPairs[`${lang}_${targetTokens}`] = result.usage.prompt_tokens;
       // details 明细累计：仅统计通过校验的样本；!= null 判定保证 cached=0 也计数
@@ -289,10 +693,26 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 自适应补采（top-up）：应缴金额低于余额最小刻度 3 倍时（如整数美分类余额端点 + 便宜模型，
   // 应缴 $0.02 → 精度噪声支配倍率）decideRatio 必然 N/A——余额端点明明可用却测不出倍率。
   // 主序列后、post 快照前追加最大档回声请求抬升 Δ 至可判定区间。守门（2026-10-19 图纸双审必修）：
-  // 仅窗口干净（无失败/无污染重试）且 pre 首比即稳、余额为 USD 口径、至少 1 个有效计价样本时才付费；
+  // 仅窗口干净（无失败/无污染重试）且 pre 首比即稳、余额刻度可折算为 USD、至少 1 个有效计价样本时才付费；
   // 8 笔封顶 + 硬预算（按宣称价 3× 目标额，已含重试最坏放大）；预估到不了作废门槛则直接跳过
   // （不为注定 N/A 的窗口付费）；补采中一旦出现不可归因事件（失败/污染重试/usage 缺失）立即停。
   // 补采样本不进回归轨道/输出侧比对（固定档重复会破坏 x 分布），只进 Δ 与应缴金额。
+  // 刻度折算：USD 直接用；quota 用 quotaToUsd；整数 total_usage_raw 按 OpenAI 美分 schema ×0.01；
+  // 非整数 raw 单位未知（校准可能采信任一假设）→ 不补采，避免按错误刻度付费。
+  const balanceResolutionUsd =
+    balanceBefore === null ||
+    !Number.isFinite(balanceBefore.resolution) ||
+    (balanceBefore.resolution as number) <= 0
+      ? null
+      : balanceBefore.unit === 'USD'
+        ? (balanceBefore.resolution as number)
+        : balanceBefore.unit === 'quota'
+          ? quotaToUsd !== null
+            ? (balanceBefore.resolution as number) * quotaToUsd
+            : null
+          : balanceBefore.unit === 'total_usage_raw' && balanceBefore.integerCents === true
+            ? (balanceBefore.resolution as number) * 0.01
+            : null;
   let topupRequests = 0;
   let topupExpected = 0;
   let topupSkipped = false;
@@ -302,13 +722,11 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     ratioSamples > 0 &&
     balanceBefore !== null &&
     balancePreClean &&
-    balanceBefore.unit === 'USD' &&
-    Number.isFinite(balanceBefore.resolution) &&
-    (balanceBefore.resolution as number) > 0 &&
+    balanceResolutionUsd !== null &&
     failures.length === 0 &&
     contaminatingRetries === 0
   ) {
-    const resolution = balanceBefore.resolution as number;
+    const resolution = balanceResolutionUsd;
     const gateFloor = 3 * resolution;
     const target = 5 * resolution;
     const budget = 3 * target;
@@ -366,6 +784,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
             expectedCost += cost;
             ratioSamples += 1;
             topupExpected += cost;
+            // 补采样本同样计入公示价应缴估算（真实扣费的一部分）；仍不进回归/输出侧比对。
+            promptTotal += result.usage.prompt_tokens;
+            completionTotal += result.usage.completion_tokens;
+            usageValidSamples += 1;
           }
         }
       }
@@ -377,8 +799,18 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const balanceAfterStable = priceEnabled
     ? await probeBalanceStable(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)
     : null;
-  const balanceAfter = balanceAfterStable?.reading ?? null;
+  let balanceAfter: BillingBalanceReading | null = balanceAfterStable?.reading ?? null;
+  if (
+    balanceAfter !== null &&
+    (balanceAfter.unit === 'quota' || balanceAfter.unit === 'total_usage_raw') &&
+    quotaToUsd !== null
+  ) {
+    balanceAfter = { ...balanceAfter, quotaToUsd };
+  }
   const balancePostSettled = balanceAfterStable?.settled ?? null;
+  if (priceEnabled && balanceAfterStable === null && balanceProbeReason === null) {
+    balanceProbeReason = (await probeBalanceDetailed(ctx.client.baseUrl, ctx.cfg.apiKey, ctx.cfg.timeoutMs)).reason;
+  }
   const spendDelta = balanceBefore !== null && balanceAfter !== null ? spendBetween(balanceBefore, balanceAfter) : null;
   if (priceEnabled) {
     const reading = balanceBefore ?? balanceAfter;
@@ -400,6 +832,10 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     metrics['balance_post_settled'] = balancePostSettled === null ? null : balancePostSettled ? 1 : 0;
     metrics['balance_post_polls'] = balanceAfterStable?.polls ?? null;
     metrics['balance_scope'] = balanceBefore ? (balanceBefore.endpoint === '/api/user/self' ? 'user' : 'key') : null;
+    metrics['quota_to_usd'] = quotaToUsd;
+    // 余额不可读时的诊断原因（probeBalanceDetailed）：N/A finding 里会一并披露，避免把
+    // 「站点禁用余额接口」误读成「工具拿不到数据」。
+    metrics['balance_probe_reason'] = balanceProbeReason;
     metrics['billing_topup_requests'] = topupRequests;
     metrics['billing_topup_expected_usd'] = round(topupExpected);
     if (topupSkipped) metrics['billing_topup_skipped'] = 1;
@@ -433,6 +869,380 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
   let headline = defaultHeadline;
+  /** 回显他族模型（无法比价）：level/headline 延后到证据分级之后生效，避免跳过 85 封顶。 */
+  let familyMismatchHeadline: string | null = null;
+
+  // ———— 公示倍率侧核验（与 usage 回归独立；不因样本不足而跳过） ————
+  const usageTotals: UsageTotals = {
+    promptTokens: promptTotal,
+    completionTokens: completionTotal,
+    samples: usageValidSamples,
+    droppedSamples: Math.max(0, requests - usageValidSamples),
+  };
+  // 分组倍率：API 源沿用站点分组口径；公开价表无分组概念，固定倍率 1 并在 finding 披露未核验。
+  const groupFactor =
+    anchorSource === 'api' && declared !== null && effectiveGroup !== null ? (declared.groupRatio[effectiveGroup] ?? 1) : 1;
+  const groupRatioUnverified =
+    anchorSource === 'api' && declared !== null && effectiveGroup !== null && declared.groupRatio[effectiveGroup] === undefined;
+  const groupPricingNote =
+    anchorSource === 'public-json'
+      ? '公开价表无分组概念，按倍率 1 折算（分组口径未核验）'
+      : effectiveGroup !== null && declared !== null
+        ? groupRatioUnverified
+          ? `分组「${effectiveGroup}」未在公示表中给出倍率，按倍率 1 参照（未验证）`
+          : `按公示分组倍率 ${effectiveGroup}×${groupFactor} 折算`
+        : '未指定分组，按倍率 1 折算';
+  const anchorInPerM =
+    anchorSource === 'public-json' && publicPrice !== null
+      ? publicPrice.inputUsdPerM
+      : declaredModel !== null
+        ? declaredModel.modelRatio * groupFactor * USD_PER_MILLION_PER_RATIO
+        : null;
+  const anchorOutPerM =
+    anchorSource === 'public-json' && publicPrice !== null
+      ? publicPrice.outputUsdPerM
+      : declaredModel !== null
+        ? declaredModel.modelRatio * USD_PER_MILLION_PER_RATIO * declaredModel.completionRatio * groupFactor
+        : null;
+  const declaredEstimate =
+    anchorPricing !== null && declaredModel !== null && usageValidSamples > 0
+      ? expectedCostFromDeclared(
+          anchorPricing,
+          declaredModel,
+          usageTotals,
+          anchorSource === 'api' && effectiveGroup !== null ? { group: effectiveGroup } : undefined,
+        )
+      : null;
+  // quota_type=1（按次计费）时 token→quota 换算不成立：金额侧整体按未核验透出（null），不显示 0。
+  // 公开价表锚无站点 quota 单位（SYNTHETIC_QUOTA_PER_UNIT 只用于内部 USD 换算）：应缴只以 USD 披露，
+  // 不把合成 500000 口径的 quota 冒充站点单位写进报告。
+  metrics['expected_quota_declared'] =
+    declaredEstimate !== null && declaredEstimate.state === 'priced' && anchorSource !== 'public-json'
+      ? round(declaredEstimate.quota)
+      : null;
+  metrics['expected_cost_usd_declared'] =
+    declaredEstimate !== null && declaredEstimate.state === 'priced' && declaredEstimate.usd !== null
+      ? round(declaredEstimate.usd)
+      : null;
+  metrics['cost_is_upper_bound'] = declaredEstimate !== null && declaredEstimate.state === 'priced' ? (declaredEstimate.isUpperBound ? 1 : 0) : null;
+  metrics['cost_is_lower_bound'] = declaredEstimate !== null && declaredEstimate.state === 'priced' ? (declaredEstimate.isLowerBound ? 1 : 0) : null;
+
+  if (declaredResult.state === 'failed' && anchorSource === null) {
+    findings.push({
+      level: 'warn',
+      message: `站点公示价读取失败（${declaredResult.reason ?? '原因未知'}）：本轮无法核验公示倍率与金额侧，仅能核验 usage 形状。`,
+      evidenceIds: [],
+    });
+    score = Math.min(score, PRICING_FAILED_SCORE);
+    level = escalate(level, 'warn');
+    if (headline === defaultHeadline) headline = '站点公示价读取失败，公示倍率与金额侧证据缺失';
+  }
+
+  // ———— 公示倍率漂移（对照 --baseline / 本地价格账本） ————
+  if (snapshotPricing !== null) {
+    const driftSources: Array<{ source: 'baseline' | 'ledger'; snapshot: DeclaredPricingSnapshot }> = [];
+    if (ctx.previousPricing != null) {
+      driftSources.push({ source: ctx.previousPricingSource ?? 'baseline', snapshot: ctx.previousPricing });
+    }
+    if (ctx.previousPricingAlt != null) {
+      driftSources.push({ source: ctx.previousPricingAltSource ?? 'ledger', snapshot: ctx.previousPricingAlt });
+    }
+    const driftLabel = (source: 'baseline' | 'ledger', capturedAt: string): string =>
+      source === 'ledger' ? `对照本地价格账本快照 ${capturedAt}` : `对照 --baseline 快照 ${capturedAt}`;
+    const seenKeys = new Set<string>();
+    const merged: Array<{ drift: PricingDrift; label: string }> = [];
+    const crossSourceSkipped: string[] = [];
+    for (const { source, snapshot: previous } of driftSources) {
+      const previousSource = previous.source;
+      const currentSource = snapshotPricing.source;
+      const sameSource =
+        (previousSource === undefined && currentSource === undefined) ||
+        (previousSource !== undefined && currentSource !== undefined && previousSource === currentSource);
+      if (!sameSource) {
+        crossSourceSkipped.push(
+          `${driftLabel(source, previous.capturedAt)}（上次来源 ${previousSource ?? '未知（legacy）'}，本轮来源 ${currentSource ?? '未知（legacy）'}）`,
+        );
+        continue;
+      }
+      for (const drift of comparePricingSnapshots(previous, snapshotPricing, { model: ctx.cfg.model })) {
+        const key = JSON.stringify([drift.field, drift.model ?? null, drift.oldValue ?? null, drift.newValue ?? null]);
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+        merged.push({ drift, label: driftLabel(source, previous.capturedAt) });
+      }
+    }
+    if (crossSourceSkipped.length > 0) {
+      findings.push({
+        level: 'info',
+        message: `跨来源快照跳过漂移比对：${crossSourceSkipped.join('；')}。不同来源（/api/pricing、公开价表、网页抓价）的计价口径不可互换。`,
+        evidenceIds: [],
+      });
+    }
+    if (driftSources.length > 0) {
+      // 「显著」口径与价格账本/基线一致（pricing-ledger 的 significant，相对变化 >5%）；
+      // 其余只披露、不封顶，避免把定价页排版/注释微调误判成「偷改价格」。
+      const significant = merged.filter((item) => item.drift.significant);
+      metrics['declared_drift_count'] = significant.length;
+      metrics['declared_drift_fields'] = merged.length > 0 ? merged.map((item) => `${item.drift.kind}:${item.drift.field}`).join(',') : 'none';
+      if (significant.length > 0) {
+        score = Math.min(score, PRICING_DRIFT_SCORE);
+        level = escalate(level, 'warn');
+        const directionText = (direction: PricingDrift['direction']): string =>
+          direction === 'down' ? '下调' : direction === 'up' ? '上调' : '发生变化';
+        const first = significant[0];
+        if (first !== undefined) {
+          headline = `站点公示倍率与历史快照相比已变化：${driftSubjectText(first.drift)} ${first.drift.message}（${directionText(first.drift.direction)}）`;
+        }
+        for (const { drift, label } of significant.slice(0, 10)) {
+          findings.push({
+            level: 'warn',
+            message: `${label}：${driftSubjectText(drift)} ${drift.message}（${directionText(drift.direction)}）。`,
+            evidenceIds: [],
+          });
+        }
+        if (merged.length > significant.length) {
+          findings.push({
+            level: 'info',
+            message: `另有 ${merged.length - significant.length} 项公示价排版/字段变化（相对变化 ≤5%），不计入漂移降档`,
+            evidenceIds: [],
+          });
+        }
+      } else if (merged.length > 0) {
+        findings.push({
+          level: 'info',
+          message: `公示倍率与历史快照存在 ${merged.length} 项非显著变化（相对变化 ≤5%），不计入漂移降档`,
+          evidenceIds: [],
+        });
+      }
+    }
+  }
+
+  // ———— 用户声明倍率 vs 站点公示倍率（带 --expect-model-ratio/--expect-completion-ratio 时） ————
+  // 相对差 >5% → fail：直接比对「同一模型」的两个倍率字段，与宣称价格口径相互独立，
+  // 不依赖 usage 样本，故样本不足时也能给出金额侧结论。
+  const expectModelRatio = ctx.cfg.expectModelRatio ?? null;
+  const expectCompletionRatio = ctx.cfg.expectCompletionRatio ?? null;
+  if (declaredModel !== null) {
+    const expectChecks: Array<{ flag: string; expected: number; actual: number }> = [];
+    if (expectModelRatio !== null) {
+      expectChecks.push({ flag: 'expect-model-ratio', expected: expectModelRatio, actual: declaredModel.modelRatio });
+    }
+    if (expectCompletionRatio !== null) {
+      expectChecks.push({ flag: 'expect-completion-ratio', expected: expectCompletionRatio, actual: declaredModel.completionRatio });
+    }
+    for (const check of expectChecks) {
+      if (!Number.isFinite(check.expected) || check.expected <= 0) continue;
+      const rel = Math.abs(check.actual - check.expected) / check.expected;
+      if (rel > 0.05) {
+        const directionText = check.actual > check.expected ? '实际高于声明' : '实际低于声明';
+        score = Math.min(score, PRICING_FAILED_SCORE);
+        level = escalate(level, 'fail');
+        headline = `${check.flag} 与站点公示倍率不符：声明 ${check.expected}，公示 ${check.actual}（相对差 ${(rel * 100).toFixed(1)}%，${directionText}）`;
+        findings.push({
+          level: 'fail',
+          message: `用户声明 ${check.flag}=${check.expected}，站点公示倍率 ${check.actual}（相对差 ${(rel * 100).toFixed(1)}%，${directionText}）：站点计价口径与声明不一致，存在虚标倍率嫌疑。`,
+          evidenceIds: [],
+        });
+      }
+    }
+  } else if (expectModelRatio !== null || expectCompletionRatio !== null) {
+    // 锚定失败：用户声明了倍率但站点公示表不可读/未收录该模型 → 证据缺口按 warn 收口，不伪造 fail。
+    const flags = [expectModelRatio !== null ? '--expect-model-ratio' : null, expectCompletionRatio !== null ? '--expect-completion-ratio' : null]
+      .filter((item): item is string => item !== null)
+      .join('/');
+    findings.push({
+      level: 'warn',
+      message: `已声明 ${flags}，但站点公示价表中未找到模型「${ctx.cfg.model}」（或 /api/pricing 不可得）：声明倍率无法与公示值锚定，本次不判 fail，仅按证据缺口降档。`,
+      evidenceIds: [],
+    });
+    score = Math.min(score, PRICING_FAILED_SCORE);
+    level = escalate(level, 'warn');
+    if (headline === defaultHeadline) headline = '声明的倍率无法与站点公示值锚定，金额侧证据不完整';
+  }
+
+  // ———— 公示价 vs 宣称价（同一报价口径的绝对核对；>50% 才 fail） ————
+  if (priceEnabled && declaredModel !== null && price !== null && anchorPricing !== null && declaredModel.modelRatio > 0) {
+    const declaredIn = declaredModel.modelRatio * groupFactor * USD_PER_MILLION_PER_RATIO;
+    const declaredOut = declaredModel.modelRatio * declaredModel.completionRatio * groupFactor * USD_PER_MILLION_PER_RATIO;
+    if (anchorSource === 'public-json') {
+      // 方向性依据：claimed（宣称价/用户被报价）是成交价基准；published 高于 claimed 才可能是站点加价，
+      // published 更低说明站点比宣称更便宜，无可归因于站点的加价（不判罚，避免「站更便宜反被判虚标」）。
+      // 这与 new-api 源的对称比价刻意不同：那是站点自己公示的倍率与用户宣称的绝对差，任一侧偏离都值得披露。
+      const publishedIn = publicPrice?.inputUsdPerM ?? declaredIn;
+      const publishedOut = publicPrice?.outputUsdPerM ?? declaredOut;
+      const disclosure: string[] = [];
+      if (publicPrice?.listInputUsdPerM != null || publicPrice?.listOutputUsdPerM != null) {
+        disclosure.push(
+          `列表价输入 $${publicPrice?.listInputUsdPerM != null ? round(publicPrice.listInputUsdPerM) : 'N/A'}/M、输出 ` +
+            `$${publicPrice?.listOutputUsdPerM != null ? round(publicPrice.listOutputUsdPerM) : 'N/A'}/M`,
+        );
+      }
+      if (publicPrice?.cachedUsdPerM != null) {
+        disclosure.push(`缓存读价 $${round(publicPrice.cachedUsdPerM)}/M`);
+      }
+      const listNote = disclosure.length > 0 ? `；${disclosure.join('、')}（仅披露，不参与判定）` : '';
+      const ratios = [publishedIn / price.input, publishedOut / price.output].filter(
+        (ratio) => Number.isFinite(ratio) && ratio > 0,
+      );
+      const unitMismatch = ratios.some((ratio) => Math.abs(Math.log10(ratio)) >= 2.5);
+      if (unitMismatch) {
+        const magnitude =
+          ratios.length > 0 ? Math.max(...ratios.map((ratio) => (ratio >= 1 ? ratio : 1 / ratio))) : 1;
+        findings.push({
+          level: 'info',
+          message:
+            `站点公开价表输入 $${round(publishedIn)}/M、输出 $${round(publishedOut)}/M 与宣称价相差约 ${round(magnitude)}×` +
+            `（≥316×）：疑似每千 token 与每百万 token 单位口径不同，不作价格比对，仅披露。${listNote}`,
+          evidenceIds: [],
+        });
+      } else {
+        const upIn = publishedIn > price.input ? (publishedIn - price.input) / price.input : 0;
+        const upOut = publishedOut > price.output ? (publishedOut - price.output) / price.output : 0;
+        const relUp = Math.max(upIn, upOut);
+        const sourceText = `（来源：公开价表 ${publicResult?.page ?? '?'}）`;
+        if (relUp > 0.5) {
+          score = Math.min(score, PRICING_FAILED_SCORE);
+          level = escalate(level, 'fail');
+          headline = `站点公开价与宣称价格不符（相对差 ${(relUp * 100).toFixed(1)}%），存在虚标价格嫌疑`;
+          findings.push({
+            level: 'fail',
+            message:
+              `公开价表输入价 $${round(publishedIn)}/M vs 宣称 $${price.input}/M、公开价表输出价 $${round(publishedOut)}/M vs 宣称 $${price.output}/M` +
+              `（相对差 ${(relUp * 100).toFixed(1)}%，>50%）：站点公开价高于宣称价，存在虚标价格嫌疑。${sourceText}${listNote}。`,
+            evidenceIds: [],
+          });
+        } else if (relUp > 0.2) {
+          level = escalate(level, 'warn');
+          findings.push({
+            level: 'warn',
+            message:
+              `公开价表输入价 $${round(publishedIn)}/M vs 宣称 $${price.input}/M、公开价表输出价 $${round(publishedOut)}/M vs 宣称 $${price.output}/M` +
+              `（相对差 ${(relUp * 100).toFixed(1)}%，>20%）：站点公开价高于宣称价，存在加价嫌疑。${sourceText}${listNote}。`,
+            evidenceIds: [],
+          });
+        } else if (relUp > 0) {
+          findings.push({
+            level: 'info',
+            message:
+              `公开价表输入价 $${round(publishedIn)}/M vs 宣称 $${price.input}/M、输出价 $${round(publishedOut)}/M vs 宣称 $${price.output}/M` +
+              `（相对差 ${(relUp * 100).toFixed(1)}%，≤20%）：公开价略高于宣称价，仅披露，未达 warn 阈值。${sourceText}${listNote}。`,
+            evidenceIds: [],
+          });
+        } else {
+          // published 各轴都不高于 claimed：站点公示价更便宜。但「公示低、实收按宣称价」的引流收割
+          // （低价表吸引、口头报价更高）在无余额对账时不可见，差值 ≥50% 时给 warn 披露该假设，绝不 fail。
+          const downIn = (price.input - publishedIn) / price.input;
+          const downOut = (price.output - publishedOut) / price.output;
+          const relDown = Math.max(downIn, downOut, 0);
+          if (relDown > 0.5) {
+            level = escalate(level, 'warn');
+            findings.push({
+              level: 'warn',
+              message:
+                `公开价表输入价 $${round(publishedIn)}/M、输出价 $${round(publishedOut)}/M 不足宣称价 $${price.input}/M、$${price.output}/M 的一半` +
+                `（低 ${(relDown * 100).toFixed(1)}%）：若实际结算按宣称价收取，存在「低价表引流、高价结算」的嫌疑` +
+                `（假设实收=宣称价，未经余额验证，不判 fail）。${sourceText}${listNote}。`,
+              evidenceIds: [],
+            });
+          } else if (publishedIn < price.input || publishedOut < price.output) {
+            findings.push({
+              level: 'info',
+              message: `站点公开价低于宣称价，无可归因的加价。${sourceText}${listNote}。`,
+              evidenceIds: [],
+            });
+          } else {
+            findings.push({
+              level: 'info',
+              message: `站点公开价与宣称价一致，无可归因的加价。${sourceText}${listNote}。`,
+              evidenceIds: [],
+            });
+          }
+        }
+      }
+    } else {
+      // cache 同乘分组倍率（缓存读价与输入价同属一个倍率体系）
+      const declaredCache =
+        declaredModel.cacheRatio !== null
+          ? declaredModel.modelRatio * declaredModel.cacheRatio * groupFactor * USD_PER_MILLION_PER_RATIO
+          : null;
+      const cacheNote = declaredCache !== null ? `；公示缓存读价 $${round(declaredCache)}/M（同倍率折算）` : '';
+      const rel = Math.max(
+        Math.abs(declaredIn - price.input) / price.input,
+        Math.abs(declaredOut - price.output) / price.output,
+      );
+      if (rel > 0.5) {
+        score = Math.min(score, PRICING_FAILED_SCORE);
+        level = escalate(level, 'fail');
+        headline = `站点公示价与宣称价格不符（相对差 ${(rel * 100).toFixed(1)}%），存在虚标价格嫌疑`;
+        findings.push({
+          level: 'fail',
+          message:
+            `公示输入价 $${round(declaredIn)}/M vs 宣称 $${price.input}/M、公示输出价 $${round(declaredOut)}/M vs 宣称 $${price.output}/M` +
+            `（相对差 ${(rel * 100).toFixed(1)}%，>50%）：站点公示价与自身宣称价格不符，存在虚标价格嫌疑。` +
+            `${groupPricingNote}${cacheNote}。`,
+          evidenceIds: [],
+        });
+      } else if (rel > 0.2) {
+        findings.push({
+          level: 'warn',
+          message:
+            `公示输入价 $${round(declaredIn)}/M vs 宣称 $${price.input}/M、公示输出价 $${round(declaredOut)}/M vs 宣称 $${price.output}/M` +
+            `（相对差 ${(rel * 100).toFixed(1)}%，≤50%）：存在价格口径差异，未达 fail 阈值。${groupPricingNote}${cacheNote}。`,
+          evidenceIds: [],
+        });
+      }
+    }
+  }
+
+  // ———— 回显模型 vs 请求模型（换芯/计价错配线索） ————
+  if (anchorPricing !== null && echoModels.length > 0) {
+    const requestedNorm = normalizeModelName(ctx.cfg.model);
+    const byEcho = new Map<string, { evidenceIds: string[] }>();
+    let mismatchCount = 0;
+    for (const echo of echoModels) {
+      const echoNorm = normalizeModelName(echo.model);
+      if (echoNorm !== requestedNorm) mismatchCount += 1;
+      const bucket = byEcho.get(echo.model) ?? { evidenceIds: [] };
+      bucket.evidenceIds.push(echo.evidenceId);
+      byEcho.set(echo.model, bucket);
+    }
+    metrics['echo_model_mismatch'] = mismatchCount;
+    metrics['echo_model_distinct'] = byEcho.size;
+    const reqHit = lookupDeclaredModel(anchorPricing, ctx.cfg.model);
+    for (const [echo, info] of byEcho) {
+      const echoHit = lookupDeclaredModel(anchorPricing, echo);
+      if (echoHit !== null && reqHit !== null && reqHit.model.modelRatio > 0) {
+        const ratio = echoHit.model.modelRatio / reqHit.model.modelRatio;
+        if (ratio < 0.5) {
+          const pct = (ratio * 100).toFixed(0);
+          score = Math.min(score, PRICING_FAILED_SCORE);
+          level = escalate(level, 'fail');
+          headline = `响应回显模型「${echo}」公示倍率仅为请求模型「${ctx.cfg.model}」的 ${pct}%，疑似换芯/低价模型冒充`;
+          findings.push({
+            level: 'fail',
+            message:
+              `响应回显模型「${echo}」的公示 model_ratio ${echoHit.model.modelRatio} 仅为请求模型「${ctx.cfg.model}」` +
+              `（${reqHit.model.modelRatio}）的 ${pct}%（<50%）：疑似用低价/弱模型冒充高价模型，或计价口径被降级（换芯/错配）。`,
+            evidenceIds: info.evidenceIds,
+          });
+        }
+        continue;
+      }
+      // 无公示价可对比 → 只能按模型族名判断是否「完全不同的模型」；同族变体（如 -lite 后缀）不告警。
+      const echoFamily = modelFamily(echo);
+      const reqFamily = modelFamily(ctx.cfg.model);
+      if (echoFamily !== null && echoFamily !== undefined && echoFamily === reqFamily) continue;
+      familyMismatchHeadline = `请求模型「${ctx.cfg.model}」的响应回显为其他模型「${echo}」（无公示价可判定换芯，仅披露）`;
+      findings.push({
+        level: 'warn',
+        message:
+          `请求模型「${ctx.cfg.model}」的响应回显为「${echo}」，与请求模型名不一致` +
+          `（${info.evidenceIds.length} 次样本），且无公示价可判定换芯/降配；仅披露，不单独定罪。`,
+        evidenceIds: info.evidenceIds,
+      });
+      break;
+    }
+  }
 
   if (failures.length > 0) {
     // 请求失败不是「计费正常」：回归可能仍靠剩余样本运行，但样本面已有缺口，
@@ -687,12 +1497,37 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
           ratioDropped: usageMissing,
           regressionLevel,
           scope: balanceBefore?.endpoint === '/api/user/self' ? 'user' : 'key',
+          balanceProbeReason,
         })
       : null;
   }
   if (priceEnabled) {
     metrics['measured_ratio'] = ratioDecision && ratioDecision.ratio !== null ? round(ratioDecision.ratio) : 'N/A';
     metrics['ratio_masked_verdict'] = ratioDecision ? ratioDecision.maskedVerdict : null;
+    metrics['balance_calibrated_unit'] = ratioDecision ? (ratioDecision.calibratedUnit ?? null) : null;
+    metrics['balance_calibration_confidence'] = ratioDecision ? (ratioDecision.calibrationConfidence ?? null) : null;
+    // 兼容旧键名（蓝图早期口径）：两个 key 同值透出，下游任取其一均可。
+    metrics['calibration_confidence'] = ratioDecision ? (ratioDecision.calibrationConfidence ?? null) : null;
+    // 校准候选明细只对 raw total_usage 有意义（quota 换算率是公示可信元数据，无候选）。
+    const rawCalibrationRan =
+      balanceBefore?.unit === 'total_usage_raw' || balanceAfter?.unit === 'total_usage_raw';
+    let calibrationCandidates: string | null = null;
+    if (
+      rawCalibrationRan &&
+      balanceBefore !== null &&
+      balanceAfter !== null &&
+      spendDelta !== null &&
+      spendDelta > 0
+    ) {
+      const calibrationOutcome = calibrateSpendDelta({ before: balanceBefore, after: balanceAfter, spendDelta, expectedCost });
+      if (calibrationOutcome.status === 'adopted') {
+        metrics['spend_delta'] = round(calibrationOutcome.delta);
+        calibrationCandidates = formatCalibrationCandidates(calibrationOutcome.hypotheses);
+      } else {
+        calibrationCandidates = calibrationOutcome.message ?? '无法校准';
+      }
+    }
+    metrics['balance_calibration_candidates'] = calibrationCandidates;
   }
 
   if (usageMissing >= Math.ceil(requests / 2) && requests > 0) {
@@ -751,24 +1586,86 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   metrics['ratio_verified'] = ratioVerified ? 1 : 0;
   metrics['absolute_reconciliation'] = absoluteVerified ? 1 : 0;
   metrics['evidence_level'] = absoluteVerified ? 'absolute' : 'shape-only';
+  // 金额侧状态：ratio_verified 是唯一能证明「实收金额与宣称价一致」的证据（token-reference 不含金额）。
+  if (ratioVerified) {
+    metrics['money_verified'] = 1;
+    metrics['money_check_state'] = 'verified';
+  }
 
   if (level === 'pass' && !absoluteVerified) {
-    // billing 的核验对象是端点自报 usage：形状（线性）、内部一致性（total=prompt+completion、
-    // 非负值）、输出侧（completion 与正文/上限）与恒定检测全部通过，即给出「usage 未发现造假
-    // 证据」的明确判定，不因缺绝对对账悬置（2026-10-19 用户口径：本维度只验证 usage）。
-    // 证据分级仍如实透出：score 85 < 绝对对账的 100，headline 与 info finding 说明
-    // 「扣费金额真实性未验证」——×1.3 全量等比缩放或常量偏移只有 --token-reference /
-    // 价格+余额对账能识别。
-    findings.push({
-      level: 'info',
-      message:
-        '本轮已核验端点自报 usage 与输入长度线性、内部一致且输出侧无矛盾，未发现造假证据；' +
-        '未做绝对对账，扣费金额真实性未验证——全量等比缩放（如 ×1.3）或常量偏移在回归中不可见。' +
-        '如需绝对对账：提供 --token-reference（同名模型历史报告），或同时提供宣称价格并确保余额端点可用。',
-      evidenceIds: [],
-    });
-    score = Math.min(score, SHAPE_ONLY_SCORE);
-    headline = 'usage 计数核验通过，未发现造假证据（未做绝对对账，扣费金额真实性未验证）';
+    // 证据分级：billing 的核验对象是端点自报 usage。形状（线性）、内部一致性
+    // （total=prompt+completion、非负值）、输出侧（completion 与正文/上限）与恒定检测
+    // 全部通过时，按「公示价可得程度」分档给出结论，但一律 ≤85（shape-only）：
+    // ×1.3 全量等比缩放或常量偏移只有 --token-reference / 价格+余额对账能识别。
+    if (declaredEstimate !== null && declaredEstimate.groupRatioUnverified && effectiveGroup !== null) {
+      level = escalate(level, 'warn');
+      findings.push({
+        level: 'warn',
+        message: `声明分组「${effectiveGroup}」未在站点公示分组倍率表中出现：分组折扣/加价无法核验，金额侧结论按未验证处理（不判罚、仅降档）。`,
+        evidenceIds: [],
+      });
+    }
+    if (declaredModel !== null && declaredEstimate !== null && declaredEstimate.state === 'unverified') {
+      // quota_type=1（按次计费）：token→quota 换算不成立，不能用 token 形状替代金额核验。
+      findings.push({
+        level: 'info',
+        message:
+          '站点公示该模型为按次计费（quota_type=1）：usage 的 token 形状通过，但 token→金额换算不成立，' +
+          '金额侧未验证（不判罚）。',
+        evidenceIds: [],
+      });
+      score = Math.min(score, SHAPE_ONLY_SCORE);
+      headline = 'usage 形状核验通过；站点为按次计费，金额侧未验证';
+    } else if (anchorPricing !== null && declaredModel !== null && declaredEstimate !== null) {
+      const inputPerM = round(anchorInPerM ?? declaredModel.modelRatio * groupFactor * USD_PER_MILLION_PER_RATIO);
+      const outputPerM = round(
+        anchorOutPerM ??
+          declaredModel.modelRatio * USD_PER_MILLION_PER_RATIO * declaredModel.completionRatio * groupFactor,
+      );
+      const sourceNote =
+        anchorSource === 'public-json'
+          ? `已读取站点公开价表（${publicResult?.page ?? '?'}，由 USD 单价反推倍率）`
+          : '已抓取站点公示倍率';
+      findings.push({
+        level: 'info',
+        message:
+          `${sourceNote}（model_ratio ${declaredModel.modelRatio}、completion_ratio ${declaredModel.completionRatio}，` +
+          `公示输入 $${inputPerM}/M、输出 $${outputPerM}/M，${groupPricingNote}；` +
+          `按自报 usage 折算应缴 $${declaredEstimate.usd !== null ? round(declaredEstimate.usd) : 'N/A'}` +
+          `${declaredEstimate.isUpperBound ? '（上界）' : ''}）。` +
+          '本轮未做余额绝对对账：usage 形状未发现造假证据，但扣费金额真实性未验证。',
+        evidenceIds: [],
+      });
+      score = Math.min(score, SHAPE_ONLY_SCORE);
+      headline =
+        anchorSource === 'public-json'
+          ? 'usage 计数核验通过，已按站点公开价表折算应缴金额（未与实收对账，扣费金额真实性未验证）'
+          : 'usage 计数核验通过，已按站点公示倍率折算应缴金额（未与实收对账，扣费金额真实性未验证）';
+    } else if (anchorPricing !== null || declared !== null || publicResult?.state === 'ok') {
+      findings.push({
+        level: 'info',
+        message:
+          `已读取站点${anchorSource === 'public-json' ? '公开价表' : '公示价表'}，但模型未收录或未采到有效 usage：` +
+          'usage 形状通过，金额侧未验证（不判罚）。',
+        evidenceIds: [],
+      });
+      score = Math.min(score, SHAPE_ONLY_SCORE);
+      headline =
+        anchorSource === 'public-json'
+          ? 'usage 计数核验通过（公开价表未覆盖该模型或未采到有效 usage，扣费金额真实性未验证）'
+          : 'usage 计数核验通过（公示价表未覆盖该模型，扣费金额真实性未验证）';
+    } else {
+      findings.push({
+        level: 'info',
+        message:
+          '本轮已核验端点自报 usage 与输入长度线性、内部一致且输出侧无矛盾，未发现造假证据；' +
+          '未做绝对对账，扣费金额真实性未验证——全量等比缩放（如 ×1.3）或常量偏移在回归中不可见。' +
+          '如需绝对对账：提供 --token-reference（同名模型历史报告），或同时提供宣称价格并确保余额端点可用。',
+        evidenceIds: [],
+      });
+      score = Math.min(score, SHAPE_ONLY_SCORE);
+      headline = 'usage 计数核验通过，未发现造假证据（未做绝对对账，扣费金额真实性未验证）';
+    }
   } else if (level === 'pass') {
     findings.push({
       level: 'info',
@@ -778,6 +1675,40 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     headline = referenceVerified
       ? 'Token 计数与长度线性关系正常，且与参考报告一致'
       : 'Token 计数与长度线性关系正常，实测倍率与宣称价格一致';
+  }
+  // 金额侧证据统一追加在 headline 末尾：实测倍率 N/A 原因 + 公示价/折算金额，避免埋在指标表里。
+  const measuredMetric = metrics['measured_ratio'];
+  const moneySide = composeMoneySide({
+    priceEnabled,
+    pricingFeaturesEnabled,
+    headline,
+    measuredRatio: typeof measuredMetric === 'number' ? measuredMetric : null,
+    // 只有前后两次余额探测都没拿到读数才算「端点不可用」；单侧缺读数/读数不稳是「样本不足」，不得误述端点能力。
+    balanceEndpointUnavailable: balanceBeforeStable === null && balanceAfterStable === null,
+    anchorInPerM,
+    anchorOutPerM,
+    declaredEstimate,
+    publicPriceState: publicResult?.state ?? null,
+    declaredState: declaredResult.state,
+  });
+  if (moneySide !== '') headline += moneySide;
+  // 回显他族模型：finding 已在收集处加入；这里只在 headline 仍为默认/形状结论时披露，并升 warn。
+  if (familyMismatchHeadline !== null) {
+    level = escalate(level, 'warn');
+    if (headline === defaultHeadline || headline.startsWith('usage 形状核验通过') || headline.startsWith('usage 计数核验通过')) {
+      headline = familyMismatchHeadline;
+    }
+  }
+  // 价格账本写入失败/损坏：证据链降级（下次无法自动检测漂移），升 warn 但不封顶分数。
+  if (ledgerWriteFailed || ledgerCorruptLines > 0 || ctx.pricingLedgerTailCorrupt === true) {
+    level = escalate(level, 'warn');
+  }
+  // 网页价低信任参照发现显著差异：升 warn，但绝不改 fail、绝不参与漂移历史。
+  if (scrapedReferenceEscalated) {
+    level = escalate(level, 'warn');
+    if (headline === defaultHeadline || headline.startsWith('usage 形状核验通过') || headline.startsWith('usage 计数核验通过')) {
+      headline = '网页公示价与宣称价格存在差异（低信任参照，未作暗扣检测）';
+    }
   }
   return { id: 'billing', status: 'ok', score, level, headline, findings, metrics };
 }
@@ -789,6 +1720,71 @@ function buildEnglish(tokens: number): string {
 function buildChinese(tokens: number): string {
   const unit = '工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。';
   return unit.repeat(Math.max(1, Math.ceil(tokens / unit.length)));
+}
+
+/** 公示价压缩为 baseline/账本快照用的 JSON（名字 → [modelRatio, completionRatio, cacheRatio, modelPrice, quotaType]）。 */
+function serializeDeclaredModels(declared: DeclaredPricing): string {
+  const compact: Record<string, Array<number | null>> = {};
+  for (const [name, model] of Object.entries(declared.models)) {
+    compact[name] = [model.modelRatio, model.completionRatio, model.cacheRatio, model.modelPrice, model.quotaType];
+  }
+  return JSON.stringify(compact);
+}
+
+/** 漂移项主体：模型级带模型名，全局项（group_ratio）直接用字段名。 */
+function driftSubjectText(drift: PricingDrift): string {
+  return drift.model !== null ? `${drift.model} ${drift.field}` : drift.field;
+}
+
+interface MoneySideArgs {
+  priceEnabled: boolean;
+  pricingFeaturesEnabled: boolean;
+  headline: string;
+  measuredRatio: number | null;
+  balanceEndpointUnavailable: boolean;
+  anchorInPerM: number | null;
+  anchorOutPerM: number | null;
+  declaredEstimate: DeclaredCostEstimate | null;
+  publicPriceState: PublicPricingResult['state'] | null;
+  declaredState: 'ok' | 'not_applicable' | 'failed';
+}
+
+/**
+ * headline 金额侧后缀：实测倍率（或 N/A 原因）+ 公示价与按公示价折算的应缴上界。
+ * 只在价格核验功能启用时追加，纯 usage 形状审计保持原文；已含「实测倍率」「按站点公示倍率」的部分不重复。
+ */
+function composeMoneySide(args: MoneySideArgs): string {
+  if (!args.pricingFeaturesEnabled) return '';
+  const parts: string[] = [];
+  if (args.priceEnabled && !args.headline.includes('实测倍率')) {
+    if (args.measuredRatio !== null) {
+      parts.push(`实测倍率 ${round(args.measuredRatio)}`);
+    } else if (args.balanceEndpointUnavailable) {
+      parts.push('实测倍率 N/A（余额端点不可用）');
+    } else {
+      parts.push('实测倍率 N/A（余额读数不足或窗口不可归因）');
+    }
+  }
+  const amountText =
+    args.declaredEstimate !== null && args.declaredEstimate.state === 'priced' && args.declaredEstimate.usd !== null
+      ? `已按公示价折算应缴 $${round(args.declaredEstimate.usd)}${args.declaredEstimate.isUpperBound ? '（上界）' : ''}`
+      : '';
+  if (!args.headline.includes('按站点公示倍率')) {
+    if (args.anchorInPerM !== null && args.anchorOutPerM !== null) {
+      let text = `公示 输入 $${round(args.anchorInPerM)}/M · 输出 $${round(args.anchorOutPerM)}/M`;
+      if (amountText !== '') text += `，${amountText}`;
+      parts.push(text);
+    } else if (args.publicPriceState === 'failed') {
+      parts.push('公示倍率不可得（公开价表读取失败）');
+    } else if (args.declaredState === 'failed') {
+      parts.push('公示倍率不可得（公示价读取失败）');
+    } else {
+      parts.push('站点未公示倍率');
+    }
+  } else if (amountText !== '') {
+    parts.push(amountText);
+  }
+  return parts.length > 0 ? `；${parts.join('；')}` : '';
 }
 
 function round(value: number): number {
@@ -805,13 +1801,24 @@ function escalate(current: ProbeOutcome['level'], next: ProbeOutcome['level']): 
   return LEVEL_RANK[next] > LEVEL_RANK[current] ? next : current;
 }
 
+/**
+ * 计费侧余额读数：在 balance.ts 的 BalanceReading 上附加可信换算元数据。
+ * quotaToUsd 只由 billing 在 quota / total_usage_raw 口径下注入（来源：/api/status 公示
+ * quota_per_unit 或 --quota-per-usd），balance.ts 与 probeBalanceStable 的契约不变。
+ */
+interface BillingBalanceReading extends BalanceReading {
+  quotaToUsd?: number | null;
+}
+
 export interface RatioArgs {
-  before: BalanceReading | null;
-  after: BalanceReading | null;
+  before: BillingBalanceReading | null;
+  after: BillingBalanceReading | null;
   spendDelta: number | null;
   expectedCost: number;
   ratioDropped: number;
   regressionLevel: Level;
+  /** 余额不可读时的诊断原因（probeBalanceDetailed）：随 N/A finding 一并披露。 */
+  balanceProbeReason?: string | null;
   /**
    * 余额口径：'key' = key/请求级端点（new-api /api/usage/token、dashboard 类）；
    * 'user' = 用户级端点（/api/user/self，该用户全部 key 共享）。用户级口径下其他 key 的
@@ -824,7 +1831,8 @@ export interface RatioArgs {
 export interface RatioDecision {
   verdict: 'N/A' | 'ok' | 'warn' | 'fail';
   /**
-   * 保守降级掩蔽掉的底层判定档位：仅 ratioDropped>0 且按「无缺失」重算出 warn/fail 时非 null。
+   * 保守降级/不可归因掩蔽掉的底层判定档位：ratioDropped>0 按「无缺失」重算出 warn/fail、
+   * USD 口径 >10、raw 三口径带外且最接近口径 >10 时非 null。
    * 仅供 CI/报告观测（metrics['ratio_masked_verdict']），不参与合分——
    * 缺失使分母偏小、该判定上偏，直接采信会冤枉端点。
    */
@@ -832,6 +1840,10 @@ export interface RatioDecision {
   cap: number | null;
   finding: Finding;
   ratio: number | null;
+  /** raw total_usage 单位校准采信的口径（仅 total_usage_raw 且采信时存在）。 */
+  calibratedUnit?: CalibrationUnit;
+  /** 单位换算置信档：raw 校准采信 / quota 公示换算为 high，同向虚高形态采信为 low。 */
+  calibrationConfidence?: CalibrationConfidence;
 }
 
 /**
@@ -839,22 +1851,29 @@ export interface RatioDecision {
  * 判定基于「本次扣费 Δspend ÷ 按宣称价格与端点自报 usage 估算的应缴金额 expectedCost」。
  */
 export function decideRatio(args: RatioArgs): RatioDecision | null {
-  const { before, after, spendDelta, expectedCost, ratioDropped, regressionLevel } = args;
+  const { before, after, expectedCost, ratioDropped, regressionLevel, balanceProbeReason } = args;
   const scope = args.scope ?? 'key';
+  // 递归重入（ratioDropped>0 时按「无缺失」重算底层档位）必须从原始 Δ 重新校准：
+  // 下方单位换算会就地改写 spendDelta，若把已换算值再传进来会被二次换算。
+  const rawSpendDelta = args.spendDelta;
+  let spendDelta = rawSpendDelta;
+  let calibratedUnit: CalibrationUnit | null = null;
+  let calibrationConfidence: CalibrationConfidence | null = null;
+  let calibrationOutcome: CalibrationOutcome | null = null;
   // 证据不足一律 N/A + info，不加罚
   if (before === null || after === null) {
-    return na('余额端点不可用或返回未知 schema（如 /dashboard/billing/usage 的 total_usage 非整数美分）：无法建立可比余额读数，实测倍率无法验证（中转站可通过禁用/改写余额接口规避此项，建议在其后台人工核对）。');
+    const detail =
+      balanceProbeReason !== null && balanceProbeReason !== undefined && balanceProbeReason !== ''
+        ? `探测原因：${balanceProbeReason}。`
+        : '';
+    return na(
+      '余额端点不可用或返回未知 schema（如余额接口返回不可解析结构）：无法建立可比余额读数，实测倍率无法验证' +
+        '（中转站可通过禁用/改写余额接口规避此项，建议在其后台人工核对）。' +
+        detail,
+    );
   }
   if (spendDelta === null) {
     return na('两次余额查询不同源（endpoint/kind/unit 不一致，可能被路由到不同后端），无法作差计算实测倍率。');
-  }
-  if (before.unit !== 'USD' || after.unit !== 'USD') {
-    // 非美元口径（如 one-api 的 quota）：expectedCost 按宣称价格折算为美元，quota 差值与美元直接作比
-    // 会产出天文/荒谬倍率（quota 粒度通常 1 单位 ≪ 1 USD），必须整体作废而非出 warn。
-    return na(
-      `余额读数单位为 ${before.unit === after.unit ? before.unit : `${before.unit}/${after.unit}`}（非美元口径），` +
-        '无法与按宣称价格折算的美元应缴金额直接作比（工具不换算单位），实测倍率判定作废。',
-    );
   }
   if (spendDelta === 0) {
     return na('审计窗口内余额差值 Δ=0：余额粒度不足或消费延迟入账，实测倍率无法计算。');
@@ -862,10 +1881,91 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
   if (spendDelta < 0) {
     return na(`审计窗口内余额不降反升（Δ=${round(spendDelta)}）：疑有充值干扰，实测倍率判定作废。`);
   }
-  const resolution = Math.max(
+  let resolution = Math.max(
     Number.isFinite(before.resolution) ? (before.resolution as number) : 0,
     Number.isFinite(after.resolution) ? (after.resolution as number) : 0,
   );
+  if (before.unit !== 'USD' || after.unit !== 'USD') {
+    if (before.unit === 'total_usage_raw' && after.unit === 'total_usage_raw') {
+      // raw 口径：以应缴金额为锚在 分位/同单位/quota 三种刻度假设中择近（total_usage 的单位因站点而异，
+      // 无法从前缀判定）；采信后 Δ/resolution 同步换算为同一计价单位，后续判定与同单位口径完全一致。
+      const outcome = calibrateSpendDelta({ before, after, spendDelta, expectedCost });
+      calibrationOutcome = outcome;
+      if (outcome.status !== 'adopted') {
+        const winner =
+          outcome.unit !== null ? (outcome.hypotheses.find((hypothesis) => hypothesis.unit === outcome.unit) ?? null) : null;
+        // 带外分支同样先过精度噪声门：1-2 个刻度的 Δ 不能因为「相对应缴看起来 >10×」就出 warn。
+        const outOfBandResolution = outcome.resolution;
+        if (
+          winner !== null &&
+          outcome.status === 'out_of_band' &&
+          outOfBandResolution > 0 &&
+          (winner.delta < 3 * outOfBandResolution || expectedCost < 3 * outOfBandResolution)
+        ) {
+          return na(
+            `审计窗口内余额差值 Δ=${round(winner.delta)} 或应缴金额 ${round(expectedCost)} 低于余额读数最小分辨率（${round(outOfBandResolution)}）的 3 倍：` +
+              '无法区分真实扣费与读数精度噪声，实测倍率无法判定（可增大审计窗口或改用 token-reference 对账）。',
+          );
+        }
+        if (outcome.status === 'out_of_band' && winner !== null && winner.ratio > 10) {
+          // 三口径全部落在可信带外、且最接近口径仍 >10×：与 USD 口径的 >10 分支同一语义——
+          // 账户级并发/单位错配无法归因，保留原始倍率与底层 fail 档位，但不判 fail。
+          return {
+            verdict: 'N/A',
+            maskedVerdict: 'fail',
+            cap: null,
+            ratio: winner.ratio,
+            finding: {
+              level: 'warn',
+              message:
+                `${outcome.message ?? ''} 最接近口径（${winner.unit}）倍率 ${round(winner.ratio)} 远超应缴金额：` +
+                '无法归因到本次审计（疑账户级并发消费或余额单位错配），本次不判 fail；请确认审计窗口独占、余额单位一致，或人工核对该站账单。',
+              evidenceIds: [],
+            },
+          };
+        }
+        return na(outcome.message ?? 'total_usage 单位口径无法校准：本次不判定，请人工核对账单。');
+      }
+      spendDelta = outcome.delta;
+      resolution = outcome.resolution;
+      calibratedUnit = outcome.unit;
+      calibrationConfidence = outcome.confidence;
+    } else if (before.unit === 'quota' && after.unit === 'quota') {
+      // quota 口径：换算率来自站点 /api/status 的 quota_per_unit 或 --quota-per-usd（可信元数据）。
+      const quotaToUsd = firstFinitePositive(before.quotaToUsd, after.quotaToUsd);
+      if (quotaToUsd === null) {
+        return na(
+          '余额读数单位为 quota，与宣称价不是同一单位，且未拿到站点公示的换算率（quota→计价单位），无法与应缴金额作比。' +
+            '可用 --quota-per-usd <n> 打开换算（站点 /api/status 公示 quota_per_unit 时也会自动启用）。',
+        );
+      }
+      spendDelta = spendDelta * quotaToUsd;
+      resolution = resolution * quotaToUsd;
+      calibrationConfidence = 'high';
+    } else {
+      // 其他无法换算的单位（或前后单位不一致）：expectedCost 与宣称价同单位，直接作比会产出
+      // 天文/荒谬倍率，必须整体作废而非出 warn。
+      return na(
+        `余额读数单位为 ${before.unit === after.unit ? before.unit : `${before.unit}/${after.unit}`}，与宣称价既不同单位也无公示换算率，` +
+          '无法与应缴金额作比（工具只做同单位比值，不做币种换算），实测倍率判定作废。',
+      );
+    }
+  }
+  const calibration: { calibratedUnit?: CalibrationUnit; calibrationConfidence?: CalibrationConfidence } = {};
+  if (calibratedUnit !== null) calibration.calibratedUnit = calibratedUnit;
+  if (calibrationConfidence !== null) calibration.calibrationConfidence = calibrationConfidence;
+  const lowConfidenceNote =
+    calibrationOutcome !== null && calibrationOutcome.confidence === 'low'
+      ? calibrationLowConfidenceNote(calibrationOutcome)
+      : '';
+  const finalize = (decision: RatioDecision): RatioDecision => {
+    const withCalibration: RatioDecision = { ...decision, ...calibration };
+    if (lowConfidenceNote === '') return withCalibration;
+    return {
+      ...withCalibration,
+      finding: { ...withCalibration.finding, message: `${withCalibration.finding.message}${lowConfidenceNote}` },
+    };
+  };
   if (resolution > 0 && spendDelta < 3 * resolution) {
     // 精度噪声门：Δ 只有零点几个最小刻度时，无法区分「真实小额扣费」与「读数舍入噪声」，
     // 采信会产生离谱倍率（Δ=0.01/res=0.01 → ratio 任意大），必须 N/A。
@@ -893,12 +1993,21 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
     // 有意设计的保守降级（防误报）：缺失使分母偏小、实测倍率上偏，上偏的 ratio 出 fail 恰会冤枉端点，
     // 故任何缺失都以 info 收场，不进入任何 fail/warn 判定（含下方回归 fail 分支——此时偏差方向不可知）。
     // 但不掩盖事实：按「无缺失」假设重算底层档位，经 maskedVerdict/metrics 透出供 CI 观测。
-    const underlying = decideRatio({ before, after, spendDelta, expectedCost, ratioDropped: 0, regressionLevel });
+    // 注意传原始 Δ：本函数会对 raw/quota 重新校准，传已换算值会被二次换算。
+    const underlying = decideRatio({
+      before,
+      after,
+      spendDelta: rawSpendDelta,
+      expectedCost,
+      ratioDropped: 0,
+      regressionLevel,
+      scope,
+    });
     const masked =
       underlying !== null && (underlying.verdict === 'fail' || underlying.verdict === 'warn')
         ? underlying.verdict
         : (underlying?.maskedVerdict ?? null);
-    return {
+    return finalize({
       verdict: 'ok',
       maskedVerdict: masked,
       cap: null,
@@ -910,12 +2019,12 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
           (masked !== null ? `（按无缺失重算底层档位为 ${masked}，因上偏不采信）。` : '。'),
         evidenceIds: [],
       },
-    };
+    });
   }
   if (ratio > 10) {
     // 余额差值是账户级口径：10 倍以上更可能是窗口内其他并发消费、充值/退款混入或单位错配，
     // 无法归因到本次审计。保留原始倍率与 maskedVerdict 供复核，但不判 fail（防冤枉端点）。
-    return {
+    return finalize({
       verdict: 'N/A',
       maskedVerdict: 'fail',
       cap: null,
@@ -928,13 +2037,13 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
           '请确认审计窗口独占、余额单位一致，或人工核对该站账单。',
         evidenceIds: [],
       },
-    };
+    });
   }
   if (regressionLevel === 'fail') {
     // usage 回归失败 → usage 虚增只会压小 ratio，ratio 是真实倍率的下限
     if (ratio > 1.5) {
       if (scope === 'user') {
-        return {
+        return finalize({
           verdict: 'warn',
           maskedVerdict: 'fail',
           cap: 70,
@@ -944,9 +2053,9 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
             message: `实测倍率 ${round(ratio)} > 1.5，但余额来源为用户级口径（/api/user/self，该用户全部 key 共享 Δ）：无法排除其他 key 并发消费混入，按不诬告原则降为 warn（底层档位 fail 仅记录于 metrics），建议以 key 级余额端点复测。`,
             evidenceIds: [],
           },
-        };
+        });
       }
-      return {
+      return finalize({
         verdict: 'fail',
         maskedVerdict: null,
         cap: null,
@@ -956,9 +2065,9 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
           message: `即便按端点自报 usage 计算，扣费仍超宣称 1.5 倍（实测倍率 ${round(ratio)}）；usage 不可信时真实倍率更高。`,
           evidenceIds: [],
         },
-      };
+      });
     }
-    return {
+    return finalize({
       verdict: 'ok',
       maskedVerdict: null,
       cap: null,
@@ -968,11 +2077,11 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
         message: `usage 回归失败（计数不可信），按自报 usage 计算的倍率 ${round(ratio)} 未超 1.5，倍率无法判定。`,
         evidenceIds: [],
       },
-    };
+    });
   }
   if (ratio > 1.5) {
     if (scope === 'user') {
-      return {
+      return finalize({
         verdict: 'warn',
         maskedVerdict: 'fail',
         cap: 70,
@@ -982,35 +2091,35 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
           message: `实测倍率 ${round(ratio)} > 1.5：实际扣费显著高于按宣称价格与自报 usage 的应缴金额；但余额来源为用户级口径（/api/user/self，该用户全部 key 共享 Δ），无法排除其他 key 并发消费混入，按不诬告原则降为 warn（底层档位 fail 仅记录于 metrics），建议以 key 级余额端点复测。`,
           evidenceIds: [],
         },
-      };
+      });
     }
-    return {
+    return finalize({
       verdict: 'fail',
       maskedVerdict: null,
       cap: 30,
       ratio,
       finding: {
         level: 'fail',
-        message: `实测倍率 ${round(ratio)} > 1.5：实际扣费显著高于按宣称价格与自报 usage 的应缴金额，计费虚高。`,
+        message: `实测倍率 ${round(ratio)} > 1.5：实际扣费显著高于按宣称价格与自报 usage 的应缴金额，计费虚高（本结论以「宣称价与余额读数同单位」为前提：若填入的价格被换算成了另一种币种，请照抄站方价目表原值复测）。`,
         evidenceIds: [],
       },
-    };
+    });
   }
   if (ratio > 1.1) {
-    return {
+    return finalize({
       verdict: 'warn',
       maskedVerdict: null,
       cap: 70,
       ratio,
       finding: {
         level: 'warn',
-        message: `实测倍率 ${round(ratio)} 落在 (1.1, 1.5]：实际扣费高于宣称价格，存在加价嫌疑。`,
+        message: `实测倍率 ${round(ratio)} 落在 (1.1, 1.5]：实际扣费高于宣称价格，存在加价嫌疑（若宣称价与余额读数不是同一单位，请照抄站方价目表原值核对）。`,
         evidenceIds: [],
       },
-    };
+    });
   }
   if (ratio >= 0.8) {
-    return {
+    return finalize({
       verdict: 'ok',
       maskedVerdict: null,
       cap: null,
@@ -1020,12 +2129,12 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
         message: `实测倍率 ${round(ratio)} 落在 [0.8, 1.1]：与宣称价格基本一致。`,
         evidenceIds: [],
       },
-    };
+    });
   }
   if (ratio >= 0.5) {
     // 低报 20%-50% 不能算「一致」：可能是 usage 少计、价格/余额单位错配或账户级抵扣。
     // 不判 fail（方向对用户有利且账户级噪声未知），但必须 warn 阻止 PASS。
-    return {
+    return finalize({
       verdict: 'warn',
       maskedVerdict: null,
       cap: null,
@@ -1035,19 +2144,19 @@ export function decideRatio(args: RatioArgs): RatioDecision | null {
         message: `实测倍率 ${round(ratio)} 落在 [0.5, 0.8)：实际扣费低于按宣称价格与自报 usage 的应缴金额，疑 usage 少计、价格/余额单位错配或账户级抵扣，请人工核对。`,
         evidenceIds: [],
       },
-    };
+    });
   }
-  return {
+  return finalize({
     verdict: 'warn',
     maskedVerdict: null,
     cap: null,
     ratio,
     finding: {
       level: 'warn',
-      message: `实测倍率 ${round(ratio)} < 0.5：疑价格与余额单位错配或余额精度不足，请人工核对单位（工具只算比值，不换算单位）。`,
+      message: `实测倍率 ${round(ratio)} < 0.5：疑宣称价与余额读数不同单位（最常见是把价格换算成了另一种币种）、usage 少计或余额精度不足，请照抄站方价目表原值核对（工具只作同单位比值，不做币种换算）。`,
       evidenceIds: [],
     },
-  };
+  });
 }
 
 function na(message: string): RatioDecision {

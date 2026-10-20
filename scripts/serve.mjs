@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // scripts/serve.mjs — model-xray 本地控制台服务器（仅绑定 127.0.0.1 回环）。
 // 职责：
-//   ① 托管 web/ 控制台页面（index.html 注入一次性 token，页面凭 token 调用本服务 API）；
+//   ① 托管 web/ 控制台页面（index.html 注入会话 token，页面凭 token 调用本服务 API）；
 //   ② 一次性检测：POST /api/test 真实 spawn CLI 子进程，逐行流式回传日志（/api/jobs/:id/log）；
 //   ③ key 页面录入：仅存于本进程内存（keySource=page），绝不回显、绝不写日志；
 //   ④ 历史报告：列取/读取 reports/ 下的报告文件（白名单扩展名 + 防穿越）；
@@ -10,7 +10,8 @@
 //      S1 账本（dist/src/ledger，reports/gateway-ledger.db）随网关启动做恢复、随停止关闭（正文零持久化）。
 //      ⚠ 当前版本 API 聚合暂未上线（后需迭代上线）：/api/gateway/* 默认回 503（测试用 gatewayEnabled:true 显式开启）。
 // 安全约定：
-//   - 只监听 127.0.0.1；token 每次启动随机生成；/api/gateway/* 与全部 POST 端点必须携带 x-model-xray-token；
+//   - 只监听 127.0.0.1；token 按仓库持久化到 tmp/console-token（重启后旧页面仍可用，
+//     文件缺失/不可写时回退为内存随机 token）；/api/gateway/* 与全部 POST 端点必须携带 x-model-xray-token；
 //   - key 只经环境变量 MODEL_XRAY_KEY 注入子进程，不出现在命令行参数 / 日志 / 响应里；
 //   - 网关上游 apiKey 只存本进程内存（渠道视图 hasKey:true，绝不回显/落盘/日志）；
 //   - 静态文件仅限 web/ 目录；路径穿越、点文件、畸形编码一律拒绝；
@@ -19,14 +20,18 @@ import { createServer, request as httpRequest } from 'node:http';
 import { request as httpsRequest } from 'node:https';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
-import { mkdir, readFile, readdir, rm, stat } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { mkdir, readFile, readdir, rm, stat, writeFile } from 'node:fs/promises';
+import { existsSync, realpathSync } from 'node:fs';
 import { basename, isAbsolute, dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const DEFAULT_PORT = 8620;
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const REPORT_EXT_WHITELIST = new Set(['.json', '.md', '.html', '.txt', '.log', '.jsonl']);
+// 报告文件单文件上限：超过即拒绝经控制台读取（避免整份读进内存拖垮进程），提示本地直接打开。
+const REPORT_FILE_MAX_BYTES = 32 * 1024 * 1024;
+// 任务看门狗：子进程超过该时长仍未结束即强制终止，避免控制台的单任务槽被永久占住。
+const HARD_JOB_TIMEOUT_MS = 30 * 60 * 1000;
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -43,6 +48,13 @@ const CONTENT_TYPES = {
 const CONSOLE_CSP =
   "default-src 'none'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; " +
   "img-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
+// 报告文件（尤其 .html）与控制台同源：若不加隔离，恶意报告可读 '/' 拿到控制台 token，
+// 再用该 token 调 /api/test 让本机把已保存的 API Key 发往攻击者地址。
+// sandbox（无 allow-scripts/allow-same-origin）→ 报告成为不透明源、脚本不执行，
+// 既保住「点开即可看报告」的体验，又切断同源提权链。
+const REPORT_CSP =
+  "sandbox; default-src 'none'; style-src 'unsafe-inline'; img-src data:; " +
+  "base-uri 'none'; form-action 'none'; frame-ancestors 'none'";
 // 仅支持 POST 的已登记端点：非 POST 方法在这些路径回 405；其余未知路径的非 POST 方法必须回 404。
 const POST_ONLY_ENDPOINTS = new Set(['/api/key', '/api/key/clear', '/api/reports/clear', '/api/test']);
 
@@ -59,9 +71,34 @@ function isNonNegativeNumberStr(raw) {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 0;
 }
+/** quota 每美元换算系数的有效域（与 src/pricing.ts 的 QUOTA_PER_UNIT_MIN/MAX 同口径）。 */
+function isPlausibleQuotaPerUnitStr(raw) {
+  const value = Number(raw);
+  return Number.isFinite(value) && value >= 1 && value <= 1e12;
+}
 function bad(message) {
   return { ok: false, error: message };
 }
+/** URL 脱敏（与 src/redact.ts 同口径，由 test/unit/redact.test.ts 的等价性用例守住）：
+ * 抹掉 userinfo 与 query/hash，并遮蔽 path 段里形如 sk-xxxxxxxx 的 key 片段。 */
+export function redactUrl(raw) {
+  const value = String(raw);
+  const fallback = () => {
+    const cut = value.split(/[?#]/)[0] ?? value;
+    return cut.replace(/^([a-zA-Z][\w+.-]*:\/\/)[^/@]*@/, '$1');
+  };
+  let text;
+  try {
+    const parsed = new URL(value);
+    if (parsed.origin === 'null') return fallback();
+    const path = parsed.pathname === '/' && parsed.search === '' && parsed.hash === '' ? '' : parsed.pathname;
+    text = `${parsed.origin}${path}`;
+  } catch {
+    return fallback();
+  }
+  return text.replace(/sk-[A-Za-z0-9_-]{6,}/g, 'sk-***');
+}
+
 function validateBaseUrl(raw) {
   if (typeof raw !== 'string' || raw.trim() === '') {
     return bad('baseUrl 非法：收到值 (空)。示例：https://relay.example.com/v1（通常以 /v1 结尾）');
@@ -71,12 +108,21 @@ function validateBaseUrl(raw) {
   try {
     parsed = new URL(value);
   } catch {
-    return bad(`baseUrl 非法：收到值 ${JSON.stringify(value)}。示例：https://relay.example.com/v1（通常以 /v1 结尾）`);
+    return bad(`baseUrl 非法：收到值 ${JSON.stringify(redactUrl(value))}。示例：https://relay.example.com/v1（通常以 /v1 结尾）`);
   }
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    return bad(`baseUrl 协议必须为 http/https：收到值 ${JSON.stringify(value)}。示例：https://relay.example.com/v1`);
+    return bad(`baseUrl 协议必须为 http/https：收到值 ${JSON.stringify(redactUrl(value))}。示例：https://relay.example.com/v1`);
   }
   return { ok: true, value };
+}
+
+/** 两个 baseUrl 是否同源（只比 origin：路径不同仍是同一台上游服务器）。 */
+function sameOrigin(a, b) {
+  try {
+    return new URL(a).origin === new URL(b).origin;
+  } catch {
+    return false;
+  }
 }
 
 // —— Host/Origin 校验（防 DNS rebinding；静态页与 /api/* 全覆盖，先于一切路由） ——
@@ -105,6 +151,9 @@ function originAllowed(raw) {
   return url.protocol === 'http:' && CONSOLE_HOST_ALLOWLIST.has(url.hostname);
 }
 
+/** 单行日志上限：上游可能吐超长行（整个 JSON 响应体），不截断会让内存被单行吃光。 */
+const MAX_LOG_LINE_CHARS = 16 * 1024;
+
 /** 逐行收集子进程输出；任何 key 痕迹（会话 key 或 sk- 前缀）都替换为 ***，绝不落日志。 */
 function createLineCollector(push, secrets) {
   const scrub = (text) => {
@@ -112,7 +161,11 @@ function createLineCollector(push, secrets) {
     for (const secret of secrets) {
       if (secret !== '' && out.includes(secret)) out = out.split(secret).join('***');
     }
-    return out.replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-***');
+    out = out.replace(/sk-[A-Za-z0-9_\-]{8,}/g, 'sk-***');
+    if (out.length > MAX_LOG_LINE_CHARS) {
+      out = `${out.slice(0, MAX_LOG_LINE_CHARS)}…（本行已截断，原长 ${out.length} 字符）`;
+    }
+    return out;
   };
   return (stream) => {
     let buffer = '';
@@ -122,6 +175,11 @@ function createLineCollector(push, secrets) {
       const lines = buffer.split(/\r?\n/);
       buffer = lines.pop() ?? '';
       for (const line of lines) push(scrub(line));
+      // 长时间没有换行的超长流：先切一段出来（并截断），否则 buffer 会无限增长直到打爆内存。
+      while (buffer.length > MAX_LOG_LINE_CHARS) {
+        push(scrub(buffer.slice(0, MAX_LOG_LINE_CHARS)));
+        buffer = buffer.slice(MAX_LOG_LINE_CHARS);
+      }
     });
     stream.on('end', () => {
       if (buffer !== '') push(scrub(buffer));
@@ -151,15 +209,76 @@ function parseReportPaths(lines, dryRun) {
   return any === null ? null : paths;
 }
 
+// 会话 token 的形态约束：48 位小写十六进制（randomBytes(24)）。
+// 持久化文件里出现别的内容（人工编辑/截断/被别的程序占用）时一律视为「无有效 token」→ 重新生成，
+// 绝不把任意字节当成 token 使用（否则会把脏数据当凭据比对，行为不可预期）。
+const TOKEN_PATTERN = /^[0-9a-f]{48}$/;
+
+/**
+ * 解析本次服务实例使用的会话 token。
+ * @param {string | null} tokenFile
+ *   - 非 null：token 持久化到该文件。已存在且合法 → 复用（服务重启后旧页面仍可用）；
+ *     不存在/内容非法 → 生成新的并写入（写入失败不阻断启动，回退为仅内存 token）。
+ *   - null：完全不落盘，每次启动都是新的随机 token（测试隔离用：多实例互不影响，也不污染仓库 tmp/）。
+ */
+async function resolveSessionToken(tokenFile) {
+  if (tokenFile === null) return randomBytes(24).toString('hex');
+  let existing = null;
+  try {
+    const raw = (await readFile(tokenFile, 'utf8')).trim();
+    if (TOKEN_PATTERN.test(raw)) existing = raw;
+  } catch {
+    existing = null;
+  }
+  if (existing !== null) return existing;
+  const fresh = randomBytes(24).toString('hex');
+  try {
+    await mkdir(dirname(tokenFile), { recursive: true });
+    // 'wx'：文件已存在时写入失败（不覆盖他人写的 token）。
+    await writeFile(tokenFile, `${fresh}\n`, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    return fresh;
+  } catch (error) {
+    const code = error !== null && typeof error === 'object' && 'code' in error ? String(error.code) : '';
+    if (code === 'EEXIST') {
+      // 并发启动：另一个实例刚写入了自己的 token → 读它并复用（两实例共享同一 token，避免互相 403）。
+      try {
+        const raw = (await readFile(tokenFile, 'utf8')).trim();
+        if (TOKEN_PATTERN.test(raw)) return raw;
+      } catch {
+        /* 读回失败：继续用新 token */
+      }
+      // 文件存在但内容非法（人工编辑/截断）→ 覆盖为合法 token。
+      try {
+        await writeFile(tokenFile, `${fresh}\n`, { encoding: 'utf8', mode: 0o600 });
+        return fresh;
+      } catch {
+        /* 覆盖失败：继续用内存 token */
+      }
+    }
+    // 其余落盘失败（只读目录/权限不足等）不阻断启动：本次仍可用新 token 正常服务。
+  }
+  return fresh;
+}
+
 export async function createConsoleServer(options = {}) {
   const portArg = Number(options.port ?? 0);
   const repoRoot = resolve(String(options.repoRoot ?? process.cwd()));
   const webRoot = join(repoRoot, 'web');
   const reportsRoot = join(repoRoot, 'reports');
   const cliPath = join(repoRoot, 'dist', 'src', 'cli.js');
-  const token = randomBytes(24).toString('hex');
+  // 会话 token：默认按仓库持久化（tmp/console-token），服务重启后已打开的页面仍可继续用；
+  // options.tokenFile === null 表示纯内存（测试隔离用，不落盘、不跨实例共享）。
+  const tokenFile = options.tokenFile === undefined ? join(repoRoot, 'tmp', 'console-token') : options.tokenFile;
+  const token = await resolveSessionToken(tokenFile);
   // API 聚合（网关）功能开关：默认停用（后需迭代上线）；测试用 gatewayEnabled:true 显式开启覆盖存量契约。
   const gatewayEnabled = options.gatewayEnabled === true;
+  // 报告文件大小上限与任务看门狗：可用 options 覆盖（测试用小值验证分支，不必真的造 32MB 文件 / 等 30 分钟）。
+  const reportFileMaxBytes =
+    typeof options.reportFileMaxBytes === 'number' && options.reportFileMaxBytes > 0
+      ? options.reportFileMaxBytes
+      : REPORT_FILE_MAX_BYTES;
+  const jobTimeoutMs =
+    typeof options.jobTimeoutMs === 'number' && options.jobTimeoutMs > 0 ? options.jobTimeoutMs : HARD_JOB_TIMEOUT_MS;
 
   const state = {
     sessionKey: null,
@@ -218,8 +337,21 @@ export async function createConsoleServer(options = {}) {
   }
   function requireToken(req, res) {
     const header = String(req.headers['x-model-xray-token'] ?? '');
+    if (header === '') {
+      // 缺 token 与 token 不匹配要分开说：前者是「请求没带凭据」，后者多半是「服务重启后页面还拿着旧 token」。
+      send(res, 403, {
+        error: '缺少 x-model-xray-token：请从控制台页面发起请求（token 由页面携带）。',
+        code: 'token_missing',
+      });
+      return false;
+    }
     if (header !== token) {
-      sendError(res, 403, '缺少或错误的 x-model-xray-token：请从控制台页面发起请求（token 由页面携带）。');
+      send(res, 403, {
+        error:
+          'x-model-xray-token 不匹配：本地服务可能已重启或页面已过期。' +
+          '请刷新控制台页面（Ctrl+R）后重试；若仍失败请确认 npm run ui 仍在运行。',
+        code: 'token_stale',
+      });
       return false;
     }
     return true;
@@ -227,7 +359,9 @@ export async function createConsoleServer(options = {}) {
 
   // —— 静态文件：仅 web/ 目录、仅 GET/HEAD ——
   function resolveStaticPath(pathname) {
-    if (pathname === '/') return { file: join(webRoot, 'index.html'), isIndex: true };
+    // /index.html 与 / 是同一个控制台页面：必须同样注入 token 并下发 CSP，
+    // 否则该路径既没有 token（占位符裸露）又没有 CSP（可被远端 iframe 点击劫持）。
+    if (pathname === '/' || pathname === '/index.html') return { file: join(webRoot, 'index.html'), isIndex: true };
     let decoded;
     try {
       decoded = decodeURIComponent(pathname);
@@ -321,6 +455,26 @@ export async function createConsoleServer(options = {}) {
       sendError(res, 404, `不支持的报告文件类型：${ext}（白名单：${[...REPORT_EXT_WHITELIST].join(' ')}）。`);
       return;
     }
+    // 先 stat 再读：报告文件可能被放到几百 MB（异常日志/超大题集），整份读进内存会拖垮控制台。
+    let info;
+    try {
+      info = await stat(file);
+    } catch {
+      sendError(res, 404, '未找到该报告文件。');
+      return;
+    }
+    if (!info.isFile()) {
+      sendError(res, 404, '未找到该报告文件。');
+      return;
+    }
+    if (info.size > reportFileMaxBytes) {
+      sendError(
+        res,
+        404,
+        `报告文件过大（${(info.size / 1024 / 1024).toFixed(1)} MB，上限 ${(reportFileMaxBytes / 1024 / 1024).toFixed(1)} MB）：请在本地直接打开查看。`,
+      );
+      return;
+    }
     let content;
     try {
       content = await readFile(file);
@@ -333,6 +487,10 @@ export async function createConsoleServer(options = {}) {
       'content-length': String(content.length),
       'x-content-type-options': 'nosniff',
       'cache-control': 'no-store',
+      // 报告与控制台同源：必须隔离，否则恶意报告可读控制台 token 并外带已保存的 API Key。
+      'content-security-policy': REPORT_CSP,
+      'x-frame-options': 'DENY',
+      'referrer-policy': 'no-referrer',
     });
     res.end(content);
   }
@@ -448,6 +606,66 @@ export async function createConsoleServer(options = {}) {
         if (priceCachedRead2 !== '') args.push('--price-cached-read2', priceCachedRead2);
       }
     }
+    const expectModelRatio = typeof body.expectModelRatio === 'string' ? body.expectModelRatio.trim() : '';
+    if (expectModelRatio !== '') {
+      if (!isPositiveNumberStr(expectModelRatio)) {
+        throw new Error(`expect-model-ratio 必须是大于 0 的数字（你所在分组的公示 model_ratio）。收到：${JSON.stringify(expectModelRatio)}。示例：1.5`);
+      }
+      args.push('--expect-model-ratio', expectModelRatio);
+    }
+    const expectCompletionRatio = typeof body.expectCompletionRatio === 'string' ? body.expectCompletionRatio.trim() : '';
+    if (expectCompletionRatio !== '') {
+      if (!isPositiveNumberStr(expectCompletionRatio)) {
+        throw new Error(`expect-completion-ratio 必须是大于 0 的数字（你所在分组的公示 completion_ratio）。收到：${JSON.stringify(expectCompletionRatio)}。示例：4`);
+      }
+      args.push('--expect-completion-ratio', expectCompletionRatio);
+    }
+    const quotaPerUsd = typeof body.quotaPerUsd === 'string' ? body.quotaPerUsd.trim() : '';
+    if (quotaPerUsd !== '') {
+      // 与站点公示口径同一有效域（1~1e12）：域外值会让 CLI 与余额换算给出两种结论。
+      if (!isPositiveNumberStr(quotaPerUsd) || !isPlausibleQuotaPerUnitStr(quotaPerUsd)) {
+        throw new Error(
+          `quota-per-usd 必须是 1~1e12 之间的数（每 1 美元对应的 quota 单位数）。收到：${JSON.stringify(quotaPerUsd)}。示例：500000`,
+        );
+      }
+      args.push('--quota-per-usd', quotaPerUsd);
+    }
+    const declaredPricePage = typeof body.declaredPricePage === 'string' ? body.declaredPricePage.trim() : '';
+    if (declaredPricePage !== '') {
+      // 同源/协议校验在 pricing-scrape 内 fail-closed（不符契约报 not_applicable，绝不带 key 发请求）；
+      // 这里只做「形状像路径或 URL」的快速拒绝，避免把明显非法值送进子进程。
+      if (!/^(\/[^\s]*|https?:\/\/[^\s]+)$/.test(declaredPricePage)) {
+        throw new Error(
+          `declared-price-page 必须是同源相对路径（如 /pricing）或 http(s) 绝对 URL。收到：${JSON.stringify(declaredPricePage)}。示例：/pricing`,
+        );
+      }
+      // 控制台会把这串值渲染成「可复制命令」给用户贴到终端里执行：双引号/控制字符必须在此挡掉
+      // （cmd.exe 的双引号无法转义，闭合引号即可注入命令）。此处只挡这两类，与 web/app.js 的差异是刻意的：
+      // 前端多挡 % 与 !（双引号内 cmd 仍展开 %VAR%，/v:on 下 ! 同理），而服务端是 argv 传参、无 shell，
+      // 放宽 % 与 ! 不会带来注入面，挡了反而会把合法 URL（如 %E4%B8%AD 的百分号编码）误杀。
+      if (/["\u0000-\u001f]/.test(declaredPricePage)) {
+        throw new Error(
+          `declared-price-page 不得含双引号或控制字符（会被终端引用规则破坏）。收到：${JSON.stringify(declaredPricePage)}。示例：/pricing`,
+        );
+      }
+      // 绝对 URL 提前拦跨域（pricing-scrape 内 fail-closed 会把跨域判成 not_applicable，用户看不到明确原因）
+      if (/^https?:\/\//i.test(declaredPricePage)) {
+        let baseOrigin = null;
+        let pageOrigin = null;
+        try {
+          baseOrigin = new URL(body.baseUrl).origin;
+          pageOrigin = new URL(declaredPricePage).origin;
+        } catch {
+          // baseUrl 非法由 CLI 子进程报错，这里不抢答
+        }
+        if (baseOrigin !== null && pageOrigin !== null && baseOrigin !== pageOrigin) {
+          throw new Error(
+            `declared-price-page 必须与 baseUrl 同源（抓价绝不跨域）：端点 ${baseOrigin}，抓价页 ${pageOrigin}。示例：/pricing（同源路径）`,
+          );
+        }
+      }
+      args.push('--declared-price-page', declaredPricePage);
+    }
     const seed = typeof body.seed === 'string' ? body.seed.trim() : '';
     if (seed !== '') {
       if (!isPositiveIntStr(seed)) throw new Error(`seed 必须是正整数。收到：${JSON.stringify(seed)}。示例：12345`);
@@ -480,7 +698,61 @@ export async function createConsoleServer(options = {}) {
       args.push('--out', out);
     }
     const baseline = typeof body.baseline === 'string' ? body.baseline.trim() : '';
-    if (baseline !== '') args.push('--baseline', baseline);
+    if (baseline !== '') {
+      // 基线文件只允许「仓库内的 .json」：任意绝对路径 = 任意文件读，
+      // UNC 路径（\\host\share\x.json）还会让 Windows 尝试用本机 NTLM 凭据访问远端共享（凭据外泄）。
+      const normalized = baseline.replaceAll('\\', '/');
+      if (normalized.startsWith('//')) {
+        throw new Error(
+          `baseline 不接受 UNC/网络路径（会触发本机凭据外泄）。收到：${JSON.stringify(baseline)}。示例：reports/baseline-xxx.json`,
+        );
+      }
+      const absoluteLike = /^[A-Za-z]:\//.test(normalized) || normalized.startsWith('/');
+      let resolvedBaseline;
+      if (absoluteLike) {
+        resolvedBaseline = resolve(baseline);
+      } else {
+        const segments = normalized.split('/');
+        for (const segment of segments) {
+          if (segment === '' || segment === '.' || segment === '..') {
+            throw new Error(
+              `baseline 路径非法（含空段或 . / ..）。收到：${JSON.stringify(baseline)}。示例：reports/baseline-xxx.json`,
+            );
+          }
+        }
+        resolvedBaseline = resolve(repoRoot, ...segments);
+      }
+      const relBaseline = relative(repoRoot, resolvedBaseline);
+      if (relBaseline === '' || relBaseline.startsWith('..') || isAbsolute(relBaseline)) {
+        throw new Error(
+          `baseline 必须位于仓库目录内。收到：${JSON.stringify(baseline)}。示例：reports/baseline-xxx.json`,
+        );
+      }
+      if (!resolvedBaseline.toLowerCase().endsWith('.json')) {
+        throw new Error(`baseline 必须是 .json 文件。收到：${JSON.stringify(baseline)}。示例：reports/baseline-xxx.json`);
+      }
+      // 符号链接兜底：仓库内的一个链接可能指向仓库外（词法路径检查看不出），realpath 后再判一次。
+      let realBaseline;
+      try {
+        realBaseline = realpathSync(resolvedBaseline);
+      } catch (error) {
+        // 只吞文件系统类异常（文件不存在、无权限、句柄耗尽等）：这些交由 CLI 报「基线不可读」，
+        // 控制台不因文件系统异常变 500；逻辑错误（如 TypeError）照常抛出，不能被静默吞掉。
+        const code = typeof error?.code === 'string' ? error.code : '';
+        const fsErrors = new Set(['ENOENT', 'EACCES', 'EPERM', 'EMFILE', 'ENFILE', 'ENOTDIR', 'ELOOP', 'EISDIR']);
+        if (!fsErrors.has(code)) throw error;
+        realBaseline = null;
+      }
+      if (realBaseline !== null) {
+        const relReal = relative(repoRoot, realBaseline);
+        if (relReal === '' || relReal.startsWith('..') || isAbsolute(relReal)) {
+          throw new Error(
+            `baseline 指向仓库之外（符号链接或真实路径越界）。收到：${JSON.stringify(baseline)}。示例：reports/baseline-xxx.json`,
+          );
+        }
+      }
+      args.push('--baseline', baseline);
+    }
     if (body.deep === true) args.push('--deep');
     if (body.dryRun === true) args.push('--dry-run');
     else args.push('--yes');
@@ -500,11 +772,24 @@ export async function createConsoleServer(options = {}) {
     };
     state.job = job;
     const secrets = [effectiveKey() ?? '', String(body.key ?? '')].filter((s) => s !== '');
+    // 总字符上限：行数上限（25000）乘单行上限（16KB）最坏可达 400MB，
+    // 一个不正常的子进程就能把控制台内存吃光——超限后只保留一行终止说明，不再收。
+    const MAX_LOG_TOTAL_CHARS = 4 * 1024 * 1024;
+    let logChars = 0;
     const collect = createLineCollector(
       (text) => {
+        if (logChars >= MAX_LOG_TOTAL_CHARS) {
+          if (job.lines[0]?.text?.startsWith('日志已截断') === true) return;
+          job.lines.length = 0;
+          job.lines.push({ seq: job.nextSeq, text: `日志已截断（累计超过 ${MAX_LOG_TOTAL_CHARS / 1024 / 1024} MB）：后续输出不再接收。` });
+          job.nextSeq += 1;
+          return;
+        }
+        logChars += text.length;
         job.lines.push({ seq: job.nextSeq, text });
         job.nextSeq += 1;
-        if (job.lines.length > 20000) job.lines.splice(0, job.lines.length - 20000);
+        // 保留最近 20000 行：按批裁剪（每行都 splice 会搬移整段数组，是 O(n²)）。
+        if (job.lines.length > 25000) job.lines.splice(0, job.lines.length - 20000);
       },
       secrets,
     );
@@ -520,6 +805,24 @@ export async function createConsoleServer(options = {}) {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
       job.child = child;
+      // 看门狗：子进程若永久挂住（上游黑洞/管道不收），控制台的「单任务」槽会被一直占住，
+      // 后续每次运行都只能拿到 409。超时强制结束并如实标记 error——宁可中断也不卡死控制台。
+      const watchdog = setTimeout(() => {
+        if (job.status === 'running' && job.child !== null) {
+          job.status = 'error';
+          job.lines.push({
+            seq: job.nextSeq,
+            text: `任务超过 ${Math.round(jobTimeoutMs / 1000)} 秒仍未结束，已强制终止（可重跑或调大 --timeout）。`,
+          });
+          job.nextSeq += 1;
+          try {
+            job.child.kill('SIGKILL');
+          } catch {
+            /* 子进程已退出：忽略 */
+          }
+        }
+      }, jobTimeoutMs);
+      watchdog.unref?.();
       collect(child.stdout);
       collect(child.stderr);
       child.on('error', (error) => {
@@ -529,8 +832,15 @@ export async function createConsoleServer(options = {}) {
       });
       child.on('exit', (code) => {
         job.exitCode = code;
-        job.status = code === null ? 'error' : 'done';
-        job.reportPaths = parseReportPaths(job.lines.map((l) => l.text), body.dryRun === true);
+      });
+      // 报告路径取自子进程 stdout 末几行：stdout 管道可能晚于 exit 才排空，
+      // 故在 'close'（stdio 全部关闭）后再解析并置完成态，否则会漏掉最后一行 → 报告链接丢失。
+      child.on('close', () => {
+        clearTimeout(watchdog);
+        if (job.status !== 'error') {
+          job.status = job.exitCode === null ? 'error' : 'done';
+          job.reportPaths = parseReportPaths(job.lines.map((l) => l.text), body.dryRun === true);
+        }
         job.child = null;
       });
     } catch (error) {
@@ -979,6 +1289,7 @@ export async function createConsoleServer(options = {}) {
             let baseUrl = typeof gbody.baseUrl === 'string' ? gbody.baseUrl.trim() : '';
             let apiKey = typeof gbody.apiKey === 'string' ? gbody.apiKey : '';
             let allowPrivate = gbody.allowPrivateUpstream === true;
+            let crossOriginKeyRequired = false;
             if (typeof gbody.channelId === 'string' && gbody.channelId !== '') {
               const store = await ensureChannelStore();
               if (store === null) {
@@ -990,8 +1301,13 @@ export async function createConsoleServer(options = {}) {
                 sendError(res, 404, `未找到渠道 ${JSON.stringify(gbody.channelId)}（可能已被删除）。示例：先用 GET /api/gateway/channels 列出有效 id。`);
                 return;
               }
+              const requestedBaseUrl = baseUrl;
               if (baseUrl === '') baseUrl = existing.baseUrl;
-              if (apiKey === '') apiKey = existing.apiKey;
+              if (apiKey === '') {
+                // 换了上游域名却没带 key：绝不复用渠道已保存的 key（否则 key 会被发到陌生域名）。
+                crossOriginKeyRequired = requestedBaseUrl !== '' && !sameOrigin(requestedBaseUrl, existing.baseUrl);
+                if (!crossOriginKeyRequired) apiKey = existing.apiKey;
+              }
               if (gbody.allowPrivateUpstream === undefined) allowPrivate = existing.allowPrivateUpstream === true;
               // 编辑已有渠道时省略 protocol：沿用渠道已保存的协议，不能静默退回 unified
               if (!protocolProvided) protocol = existing.protocol ?? 'unified';
@@ -1001,7 +1317,13 @@ export async function createConsoleServer(options = {}) {
               return;
             }
             if (apiKey === '') {
-              sendError(res, 400, '缺少上游 API Key：新渠道必须携带 apiKey；编辑已有渠道可传 channelId 复用已保存的 Key。示例：{"baseUrl":"https://relay.example.com/v1","apiKey":"sk-…"}');
+              sendError(
+                res,
+                400,
+                crossOriginKeyRequired
+                  ? '缺少上游 API Key：本次请求更换了上游地址（与已保存渠道不同源），出于安全考虑不会复用该渠道已保存的 Key，请显式携带 apiKey。示例：{"baseUrl":"https://relay.example.com/v1","apiKey":"sk-…"}'
+                  : '缺少上游 API Key：新渠道必须携带 apiKey；编辑已有渠道可传 channelId 复用已保存的 Key。示例：{"baseUrl":"https://relay.example.com/v1","apiKey":"sk-…"}',
+              );
               return;
             }
             const ssrfModule = await loadSsrfModule();

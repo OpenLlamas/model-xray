@@ -44,10 +44,43 @@ test('cli: unknown command exits 2', async () => {
   assert.equal(result.status, 2);
 });
 
+test('cli: --quota-per-usd 越出 1~1e12 有效域 → exit 2（与站点公示/余额换算同域）', async () => {
+  for (const bad of ['0', '0.5', '-1', '1e13', 'abc']) {
+    const result = await runCli([...REMOTE_ARGS, '--quota-per-usd', bad]);
+    assert.equal(result.status, 2, `--quota-per-usd ${bad} 应 exit 2，实际 ${String(result.status)}：${result.stderr}`);
+    assert.match(result.stderr, /quota-per-usd/, result.stderr);
+  }
+});
+
 test('cli: --help exits 0', async () => {
   const result = await runCli(['--help']);
   assert.equal(result.status, 0);
   assert.ok(result.stdout.includes('model-xray'));
+});
+
+test('cli: pricing-watch --help exits 0 and documents the subcommand', async () => {
+  const result = await runCli(['pricing-watch', '--help']);
+  assert.equal(result.status, 0);
+  assert.ok(result.stdout.includes('pricing-watch'));
+  assert.ok(result.stdout.includes('--interval'));
+});
+
+test('cli: pricing-watch without --base-url exits 2', async () => {
+  const result = await runCli(['pricing-watch']);
+  assert.equal(result.status, 2);
+  assert.ok(result.stderr.includes('--base-url'));
+});
+
+test('cli: pricing-watch with an invalid --interval exits 2 (strict integer)', async () => {
+  const result = await runCli(['pricing-watch', '--base-url', 'https://relay.example.com/v1', '--interval', '5s']);
+  assert.equal(result.status, 2);
+  assert.ok(result.stderr.includes('--interval'));
+});
+
+test('cli: pricing-watch rejects a --base-url carrying credentials', async () => {
+  const result = await runCli(['pricing-watch', '--base-url', 'https://user:pass@relay.example.com/v1']);
+  assert.equal(result.status, 2);
+  assert.ok(result.stderr.includes('--base-url'));
 });
 
 test('cli: --dry-run sends no requests', async () => {
@@ -135,6 +168,8 @@ test('cli: honest endpoint exits 0 and writes md/html/json reports', async () =>
         'createdAt',
         'identity',
         'model',
+        // pricing 为本轮新增的可空顶层字段（公示价快照；version 仍为 1，旧基线读取时补 null）
+        'pricing',
         'probesetVersion',
         'quality',
         'seed',

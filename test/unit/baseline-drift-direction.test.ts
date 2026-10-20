@@ -20,6 +20,7 @@ function base(accuracy: number, mainCorrect: number, mainTotal: number): Baselin
     quality: { accuracy, mainCorrect, mainTotal },
     capability: null,
     billing: null,
+    pricing: null,
   };
 }
 

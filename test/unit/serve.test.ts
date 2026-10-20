@@ -1,7 +1,8 @@
 import { afterEach, test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, request as httpRequest } from 'node:http';
-import { existsSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createMockServer, type MockServer } from '../mock-server.js';
@@ -29,7 +30,15 @@ export interface ConsoleServer {
   close(): Promise<void>;
 }
 const serveModule = (await import(SERVE_URL)) as {
-  createConsoleServer(options: { port: number; repoRoot: string; gatewayEnabled?: boolean }): Promise<ConsoleServer>;
+  createConsoleServer(options: {
+    port: number;
+    repoRoot: string;
+    gatewayEnabled?: boolean;
+    tokenFile?: string | null;
+    reportFileMaxBytes?: number;
+    jobTimeoutMs?: number;
+  }): Promise<ConsoleServer>;
+  redactUrl(raw: string): string;
 };
 
 interface HttpResponse {
@@ -75,9 +84,19 @@ function postJson(port: number, path: string, body: unknown, token?: string): Pr
 }
 // 当前测试实例：afterEach 统一关闭（port 0 随机端口，各测试互不冲突）
 let current: ConsoleServer | null = null;
-async function startServer(): Promise<ConsoleServer> {
+async function startServer(
+  options: { tokenFile?: string | null; reportFileMaxBytes?: number; jobTimeoutMs?: number } = {},
+): Promise<ConsoleServer> {
   // API 聚合默认停用（后需迭代上线）：本文件的存量网关契约用例显式开启后覆盖原契约。
-  const instance = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  // tokenFile 默认 null：测试绝不读写仓库 tmp/console-token，避免与正在运行的控制台抢 token。
+  const instance = await serveModule.createConsoleServer({
+    port: 0,
+    repoRoot: REPO_ROOT,
+    gatewayEnabled: true,
+    tokenFile: options.tokenFile === undefined ? null : options.tokenFile,
+    ...(options.reportFileMaxBytes === undefined ? {} : { reportFileMaxBytes: options.reportFileMaxBytes }),
+    ...(options.jobTimeoutMs === undefined ? {} : { jobTimeoutMs: options.jobTimeoutMs }),
+  });
   current = instance;
   return instance;
 }
@@ -101,12 +120,79 @@ test('serve：GET /api/status 200 且 {keyConfigured, keySource} 形状正确', 
   assert.equal(data['keyConfigured'], data['keySource'] !== null, 'keyConfigured 应与 keySource 非空一致');
   assert.deepEqual(Object.keys(data).sort(), ['keyConfigured', 'keySource']);
 });
-test('serve：POST /api/test 缺 token → 403', async () => {
+test('serve：POST /api/test 缺 token → 403 + code=token_missing（引导从页面发起）', async () => {
   const server = await startServer();
   const res = await postJson(server.port, '/api/test', { baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o' });
   assert.equal(res.status, 403);
   const data = JSON.parse(res.body) as Record<string, unknown>;
+  assert.equal(data['code'], 'token_missing');
   assert.match(String(data.error ?? ''), /token/i);
+  assert.match(String(data.error ?? ''), /控制台页面/);
+});
+test('serve：token 不匹配 → 403 + code=token_stale + 刷新提示，且鉴权失败零副作用（key 未被写入）', async () => {
+  const server = await startServer();
+  const before = JSON.parse((await request(server.port, '/api/status')).body) as { keyConfigured: boolean };
+  const res = await postJson(server.port, '/api/key', { key: 'sk-should-not-land' }, 'f'.repeat(48));
+  assert.equal(res.status, 403);
+  const data = JSON.parse(res.body) as Record<string, unknown>;
+  assert.equal(data['code'], 'token_stale');
+  assert.match(String(data.error ?? ''), /x-model-xray-token/);
+  assert.match(String(data.error ?? ''), /刷新控制台页面/);
+  const after = JSON.parse((await request(server.port, '/api/status')).body) as { keyConfigured: boolean };
+  assert.equal(after.keyConfigured, before.keyConfigured, '403 后 key 不得被写入（鉴权闸门必须先于读体与路由）');
+});
+test('serve：token 按 tokenFile 持久化，重启后复用同一 token（旧页面无需刷新）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mx-token-'));
+  const tokenFile = join(dir, 'console-token');
+  try {
+    const first = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile });
+    const firstToken = first.token;
+    try {
+      assert.match(firstToken, /^[0-9a-f]{48}$/, 'token 必须是 48 位小写 hex');
+      const page = await request(first.port, '/');
+      assert.ok(page.body.includes(firstToken), '页面必须注入当前 token');
+      assert.match(readFileSync(tokenFile, 'utf8').trim(), /^[0-9a-f]{48}$/, 'token 必须落盘');
+    } finally {
+      await first.close();
+    }
+    const second = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile });
+    try {
+      assert.equal(second.token, firstToken, '同一 tokenFile 重启后 token 必须复用');
+      // 旧页面的 token 重启后仍能过闸门：非法 key 得到 400（已进入路由），而不是 403。
+      const passed = await postJson(second.port, '/api/key', { key: 123 }, firstToken);
+      assert.equal(passed.status, 400, `旧 token 应通过鉴权：${passed.body}`);
+    } finally {
+      await second.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('serve：tokenFile 内容非法 → 重新生成合法 token 并覆盖（绝不把脏字节当凭据）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mx-token-'));
+  const tokenFile = join(dir, 'console-token');
+  try {
+    writeFileSync(tokenFile, 'not-a-token\n', 'utf8');
+    const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile });
+    try {
+      assert.match(server.token, /^[0-9a-f]{48}$/);
+      assert.equal(readFileSync(tokenFile, 'utf8').trim(), server.token, '非法内容必须被合法 token 覆盖');
+    } finally {
+      await server.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+test('serve：tokenFile=null 纯内存（两实例 token 不同，不落盘）', async () => {
+  const a = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile: null });
+  const b = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile: null });
+  try {
+    assert.notEqual(a.token, b.token, 'tokenFile=null 时每次启动都应是新的随机 token');
+  } finally {
+    await a.close();
+    await b.close();
+  }
 });
 test('serve：POST /api/test 非法 base-url（带正确 token）→ 400 含中文与示例', async () => {
   const server = await startServer();
@@ -618,5 +704,260 @@ test('serve：probe-models 服务端代取上游 /models（Bearer 头、SSRF 私
     assert.equal(missing.status, 404);
   } finally {
     await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test('serve：报告文件同源提权防线——HTML 报告下发 sandbox CSP + X-Frame-Options + Referrer-Policy', async () => {
+  const server = await startServer();
+  const reportsDir = join(REPO_ROOT, 'reports');
+  mkdirSync(reportsDir, { recursive: true });
+  const probe = join(reportsDir, 'report-csp-probe.html');
+  // 恶意报告：若能执行脚本，就能读 '/' 拿控制台 token，再调 /api/test 把本机已保存的 Key 发走。
+  writeFileSync(probe, '<!doctype html><meta charset="utf-8"><script>fetch("/").then(r=>r.text())</script>', 'utf8');
+  try {
+    const res = await request(server.port, `/api/reports/file?name=${encodeURIComponent('report-csp-probe.html')}`);
+    assert.equal(res.status, 200, `报告应可读：${res.body}`);
+    const csp = String(res.headers['content-security-policy'] ?? '');
+    assert.match(csp, /sandbox/, `报告必须被 sandbox 隔离（否则同源可提权）：${csp}`);
+    assert.ok(!csp.includes('allow-same-origin'), `sandbox 不得放行同源（会退回可读控制台 token）：${csp}`);
+    assert.ok(!csp.includes('allow-scripts'), `sandbox 不得放行脚本：${csp}`);
+    assert.equal(String(res.headers['x-frame-options'] ?? ''), 'DENY', '报告不得被 iframe 嵌套');
+    assert.equal(String(res.headers['referrer-policy'] ?? ''), 'no-referrer');
+  } finally {
+    rmSync(probe, { force: true });
+  }
+});
+
+test('serve：/index.html 与 / 等价（注入 token + 下发 CSP），不得成为无防护旁路', async () => {
+  const server = await startServer();
+  const res = await request(server.port, '/index.html');
+  assert.equal(res.status, 200);
+  assert.ok(res.body.includes(server.token), '/index.html 也应注入 token');
+  assert.ok(!res.body.includes('__MX_TOKEN__'), '占位符不应残留');
+  const csp = String(res.headers['content-security-policy'] ?? '');
+  assert.match(csp, /script-src/, `/index.html 必须与 / 同等下发 CSP：${csp}`);
+  assert.match(csp, /frame-ancestors 'none'/, `/index.html 不得可被 iframe 嵌套：${csp}`);
+});
+
+test('serve：POST /api/test baseline 越界/UNC/非 JSON → 400（不得变成任意文件读）', async () => {
+  const server = await startServer();
+  for (const [baseline, pattern] of [
+    ['../outside-baseline.json', /仓库|路径非法/],
+    ['\\\\attacker\\share\\x.json', /UNC|网络路径/],
+    ['reports/baseline-x.txt', /\.json/],
+  ] as const) {
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', baseline },
+      server.token,
+    );
+    assert.equal(res.status, 400, `baseline=${baseline} 应 400，实际 ${String(res.status)}：${res.body}`);
+    const data = JSON.parse(res.body) as Record<string, unknown>;
+    assert.match(String(data.error ?? ''), pattern, `baseline=${baseline} 的报错应点明原因：${res.body}`);
+  }
+  // 仓库内相对路径的 .json 基线放行
+  const ok = await postJson(
+    server.port,
+    '/api/test',
+    { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', baseline: 'reports/baseline-ok.json' },
+    server.token,
+  );
+  assert.equal(ok.status, 200, `仓库内相对基线应放行：${ok.body}`);
+});
+
+test('serve：probe-models 更换上游地址且未带 key → 400（不得把已存 Key 发往陌生域名）', async () => {
+  const server = await startServer();
+  let authSeen = '';
+  const upstream = createServer((req, res) => {
+    if (req.method === 'GET' && (req.url ?? '').startsWith('/')) {
+      authSeen = String(req.headers.authorization ?? '');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ object: 'list', data: [{ id: 'gpt-4o' }] }));
+      return;
+    }
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end('{"error":{"message":"not found"}}');
+  });
+  await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', () => resolve()));
+  const address = upstream.address();
+  const upstreamPort = address !== null && typeof address === 'object' ? address.port : 0;
+  const key = 'sk-cross-origin-key-99998888';
+  try {
+    const create = await postJson(
+      server.port,
+      '/api/gateway/channels',
+      { label: '跨源探测渠道', baseUrl: `http://127.0.0.1:${upstreamPort}/v1`, apiKey: key, models: ['gpt-4o'], allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(create.status, 200, `创建渠道应 200：${create.body}`);
+    const channelId = (JSON.parse(create.body) as { channel: { id: string } }).channel.id;
+    // 换一个端口（= 换一台上游服务器）却不带 key：必须拒绝复用已存 Key
+    const crossOrigin = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { channelId, baseUrl: `http://127.0.0.1:${upstreamPort + 1}/v1`, allowPrivateUpstream: true },
+      server.token,
+    );
+    assert.equal(crossOrigin.status, 400, `跨源且未带 key 应 400，实际 ${String(crossOrigin.status)}：${crossOrigin.body}`);
+    const error = String((JSON.parse(crossOrigin.body) as { error: string }).error);
+    assert.match(error, /不会复用|更换了上游地址/, `报错应点明「不复用已存 Key」：${error}`);
+    assert.equal(authSeen, '', '被拒的请求不得把已存 Key 发到上游');
+    // 同源（同一 origin，仅路径不同）→ 允许复用已存 Key
+    const sameOrigin = await postJson(
+      server.port,
+      '/api/gateway/probe-models',
+      { channelId, baseUrl: `http://127.0.0.1:${upstreamPort}/other` },
+      server.token,
+    );
+    assert.equal(sameOrigin.status, 200, `同源应允许复用已存 Key：${sameOrigin.body}`);
+    assert.equal(authSeen, `Bearer ${key}`, '同源复用应携带已存 Key');
+  } finally {
+    await new Promise<void>((resolve) => upstream.close(() => resolve()));
+  }
+});
+
+test('serve：报告文件超过上限 → 404 并提示本地打开（不得把超大文件读进内存）', async () => {
+  // 用小阈值覆盖分支（32MB 默认值不必真的造一个 32MB 文件）。
+  const server = await startServer({ reportFileMaxBytes: 1024 });
+  const dir = join(REPO_ROOT, 'reports', 'tmp-serve-cap');
+  mkdirSync(dir, { recursive: true });
+  const big = join(dir, 'report-big.json');
+  writeFileSync(big, 'x'.repeat(4096), 'utf8');
+  try {
+    const res = await request(server.port, `/api/reports/file?name=${encodeURIComponent(big)}`);
+    assert.equal(res.status, 404, `超限报告应 404，实际 ${String(res.status)}`);
+    assert.match(String((JSON.parse(res.body) as { error: string }).error), /报告文件过大/);
+    // 阈值内的同名小文件照常可读：证明拦截的是体积而不是路径
+    const small = join(dir, 'report-small.json');
+    writeFileSync(small, '{"ok":true}', 'utf8');
+    const ok = await request(server.port, `/api/reports/file?name=${encodeURIComponent(small)}`);
+    assert.equal(ok.status, 200, `未超限报告应 200：${ok.body}`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('serve：任务看门狗超时 → 强制终止并如实标记 error（单任务槽不得被挂死任务永久占住）', { timeout: 30000 }, async () => {
+  const hang = createServer(() => {
+    /* 接受连接但永不回应：让 CLI 的模型请求一直挂着，模拟上游黑洞 */
+  });
+  await new Promise<void>((resolvePromise) => hang.listen(0, '127.0.0.1', () => resolvePromise()));
+  const address = hang.address();
+  const hangPort = address !== null && typeof address === 'object' ? address.port : 0;
+  // 1s 看门狗：不必真等 30 分钟，也证明看门狗阈值来自 options 而非写死。
+  const server = await startServer({ jobTimeoutMs: 1000 });
+  try {
+    await postJson(server.port, '/api/key', { key: 'sk-watchdog-test-key-1234567890' }, server.token);
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { dryRun: false, baseUrl: `http://127.0.0.1:${hangPort}/v1`, model: 'gpt-4o' },
+      server.token,
+    );
+    assert.equal(res.status, 200, `POST /api/test 应 200：${res.body}`);
+    const { id } = JSON.parse(res.body) as { id: string };
+    const deadline = Date.now() + 20000;
+    let sawStatus = '';
+    let sawKillLine = false;
+    while (Date.now() < deadline) {
+      const logRes = await request(server.port, `/api/jobs/${id}/log?after=0`);
+      const log = JSON.parse(logRes.body) as { lines: Array<{ text: string }>; status: string };
+      sawStatus = log.status;
+      sawKillLine = log.lines.some((line) => line.text.includes('强制终止'));
+      if (log.status !== 'running') break;
+      await delay(200);
+    }
+    assert.equal(sawStatus, 'error', `看门狗触发后任务应标记 error，实际 ${sawStatus}`);
+    assert.ok(sawKillLine, '日志应出现「已强制终止」提示行（不得静默改状态）');
+  } finally {
+    hang.closeAllConnections?.();
+    await new Promise<void>((resolvePromise) => hang.close(() => resolvePromise()));
+  }
+});
+
+test('serve：declared-price-page 含双引号/控制字符 → 400（控制台渲染的命令不得被终端引用规则破坏）', async () => {
+  const server = await startServer();
+  for (const bad of ['/pricing" & calc', '/pricing\nset x=1', '/pri"cing']) {
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', declaredPricePage: bad },
+      server.token,
+    );
+    assert.equal(res.status, 400, `${JSON.stringify(bad)} 应 400，实际 ${String(res.status)}：${res.body}`);
+    assert.match(String((JSON.parse(res.body) as { error: string }).error), /declared-price-page/);
+  }
+});
+
+test('serve：quota-per-usd 越出 1~1e12 有效域 → 400（与 CLI/公示价同一口径）', async () => {
+  const server = await startServer();
+  for (const bad of ['0', '0.5', '1e13', '-1', 'abc']) {
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', quotaPerUsd: bad },
+      server.token,
+    );
+    assert.equal(res.status, 400, `${bad} 应 400，实际 ${String(res.status)}：${res.body}`);
+    assert.match(String((JSON.parse(res.body) as { error: string }).error), /quota-per-usd/);
+  }
+  // 域内值放行（CLI 会拿到同一个数）
+  const ok = await postJson(
+    server.port,
+    '/api/test',
+    { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', quotaPerUsd: '500000' },
+    server.token,
+  );
+  assert.equal(ok.status, 200, `域内值应 200：${ok.body}`);
+});
+
+test('serve：scripts/serve.mjs 的 redactUrl 与 src/redact.ts 逐例等价（防两处实现漂移）', async () => {
+  const srcRedact = (await import(pathToFileURL(join(REPO_ROOT, 'dist', 'src', 'redact.js')).href)) as {
+    redactUrl(raw: string): string;
+  };
+  for (const raw of [
+    'https://relay.example.com/v1',
+    'https://user:pass@relay.example.com/v1',
+    'https://relay.example.com/v1?key=sk-secret#frag',
+    'https://relay.example.com',
+    'https://relay.example.com/sk-abcdef123456/v1',
+    'not-a-url?key=sk-secret',
+    'file:///C:/secrets/key.txt',
+    'mailto:ops@relay.example.com?subject=sk-secret',
+    'ftp://user:pass@files.example.com/x?y=1',
+  ]) {
+    assert.equal(serveModule.redactUrl(raw), srcRedact.redactUrl(raw), `两处 redactUrl 口径不一致：${raw}`);
+  }
+});
+
+test('serve：baseline 指向仓库外的符号链接 → 400（词法在仓内、真实路径在仓外同样拒绝）', async () => {
+  const dir = join(REPO_ROOT, 'reports', 'tmp-serve-link');
+  mkdirSync(dir, { recursive: true });
+  const outside = join(tmpdir(), `model-xray-outside-${process.pid}.json`);
+  writeFileSync(outside, '{"secret":true}', 'utf8');
+  const link = join(dir, 'escape.json');
+  try {
+    symlinkSync(outside, link, 'file');
+  } catch (error) {
+    // Windows 未开启开发者模式/无符号链接权限：无法构造该场景，显式跳过（不是静默通过）
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
+    console.log(`# skip 符号链接用例（当前环境无创建权限：${error instanceof Error ? error.message : String(error)}）`);
+    return;
+  }
+  const server = await startServer();
+  try {
+    const res = await postJson(
+      server.port,
+      '/api/test',
+      { dryRun: true, baseUrl: 'http://127.0.0.1:9/v1', model: 'gpt-4o', baseline: link },
+      server.token,
+    );
+    assert.equal(res.status, 400, `指向仓外的符号链接应 400，实际 ${String(res.status)}：${res.body}`);
+    assert.match(String((JSON.parse(res.body) as { error: string }).error), /符号链接|仓库之外/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(outside, { force: true });
   }
 });

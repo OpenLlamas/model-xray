@@ -343,9 +343,12 @@ test('e2e price flags produce measured-ratio metrics from balance delta', async 
     const billing = report.outcomes.find((o) => o.id === 'billing');
     assert.ok(billing);
     assert.equal(billing?.metrics['balance_endpoint'], '/dashboard/billing/usage');
-    assert.equal(billing?.metrics['balance_unit'], 'USD');
-    assert.equal(billing?.metrics['balance_before'], 99.5);
-    assert.equal(billing?.metrics['balance_after'], 100);
+    // raw 透传口径：balance_unit 记录原始读数单位，balance_before/after 为 raw 值（不再提取层 ÷100）；
+    // 单位校准由 decideRatio 完成，校准采信口径落在 balance_calibrated_unit，spend_delta 被校准覆写。
+    assert.equal(billing?.metrics['balance_unit'], 'total_usage_raw');
+    assert.equal(billing?.metrics['balance_calibrated_unit'], 'cents');
+    assert.equal(billing?.metrics['balance_before'], 9950);
+    assert.equal(billing?.metrics['balance_after'], 10000);
     assert.equal(billing?.metrics['spend_delta'], 0.5);
     assert.equal(billing?.metrics['ratio_samples'], 10);
     assert.equal(billing?.metrics['ratio_dropped'], 0);

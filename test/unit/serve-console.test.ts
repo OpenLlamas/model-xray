@@ -123,6 +123,30 @@ test('serve.mjs：非 POST 方法语义——未知路径 404，仅已登记 POS
   assert.ok(region.includes("sendError(res, 405, '该端点仅支持 POST。', { allow: 'POST' })"), '已登记端点的非 POST 方法仍回 405，且必须带 Allow: POST');
 });
 
+test('serve.mjs：buildTestArgs 透传公示价锚点四参数（倍率/quota 系数/网页兜底页），非法值带示例报错', () => {
+  const start = source.indexOf('function buildTestArgs');
+  const end = source.indexOf('function startTestJob', start);
+  assert.ok(start !== -1 && end > start, '未找到 buildTestArgs 边界（抽取规则疑似过期）');
+  const region = source.slice(start, end);
+  for (const [field, flag] of [
+    ['expectModelRatio', '--expect-model-ratio'],
+    ['expectCompletionRatio', '--expect-completion-ratio'],
+    ['quotaPerUsd', '--quota-per-usd'],
+    ['declaredPricePage', '--declared-price-page'],
+  ]) {
+    assert.ok(region.includes(`body.${field}`), `buildTestArgs 未读取 body.${field}`);
+    assert.ok(region.includes(`'${flag}',`), `buildTestArgs 未透传 ${flag}`);
+  }
+  // 三个数值参数共用严格正数校验；兜底页只做形状拒绝（同源/协议校验在 pricing-scrape 内 fail-closed）
+  assert.ok(region.includes('if (!isPositiveNumberStr(expectModelRatio))'), 'expect-model-ratio 缺正数校验');
+  assert.ok(region.includes('if (!isPositiveNumberStr(expectCompletionRatio))'), 'expect-completion-ratio 缺正数校验');
+  assert.ok(region.includes('if (!isPositiveNumberStr(quotaPerUsd) || !isPlausibleQuotaPerUnitStr(quotaPerUsd))'), 'quota-per-usd 缺正数/有效域校验（应与 CLI、站点公示同域 1~1e12）');
+  assert.ok(region.includes('declared-price-page 必须是同源相对路径'), '兜底页缺形状校验与示例');
+  assert.ok(region.includes('/["\\u0000-\\u001f]/'), '兜底页缺双引号/控制字符拒绝（控制台渲染的命令会被终端引用规则破坏）');
+  assert.ok(region.includes('declared-price-page 必须与 baseUrl 同源'), '兜底页缺跨域提前拦截（否则用户只看到 not_applicable）');
+  assert.ok(!region.includes('--group'), '控制台未登记 --group（未在表单暴露的 flag 不得偷偷透传）');
+});
+
 test('serve.mjs：WebUI 任务启用逐请求进度，且 /log 下发 startedAt（运行中状态条依赖）', () => {
   const logStart = source.indexOf('const jobLogMatch = pathname.match');
   const logEnd = source.indexOf('const jobMatch = pathname.match', logStart);
@@ -130,4 +154,32 @@ test('serve.mjs：WebUI 任务启用逐请求进度，且 /log 下发 startedAt�
   const logRegion = source.slice(logStart, logEnd);
   assert.ok(logRegion.includes('startedAt: job.startedAt'), '/api/jobs/:id/log 必须返回 startedAt');
   assert.ok(source.includes("MODEL_XRAY_PROGRESS: '1'"), '控制台任务必须注入 MODEL_XRAY_PROGRESS=1');
+});
+
+test('serve.mjs：会话 token 持久化（tmp/console-token），重启复用且不把脏内容当凭据', () => {
+  assert.ok(source.includes('const TOKEN_PATTERN = /^[0-9a-f]{48}$/'), '缺少 token 形态约束');
+  const start = source.indexOf('async function resolveSessionToken');
+  const end = source.indexOf('export async function createConsoleServer', start);
+  assert.ok(start !== -1 && end > start, '未找到 resolveSessionToken 边界（抽取规则疑似过期）');
+  const region = source.slice(start, end);
+  assert.ok(region.includes('if (tokenFile === null) return'), 'tokenFile=null 必须纯内存（测试隔离）');
+  assert.ok(region.includes("flag: 'wx'"), '必须以 wx 创建 token 文件（并发实例不得互相覆盖）');
+  assert.ok(region.includes('mode: 0o600'), 'token 文件必须 0600');
+  assert.ok(region.includes("code === 'EEXIST'"), '并发写入必须回读收敛为同一 token');
+  assert.ok(region.includes('catch {') && region.includes('return fresh'), '落盘失败必须回退内存 token，不得阻断启动');
+  const create = source.indexOf('export async function createConsoleServer');
+  const createRegion = source.slice(create, create + 1600);
+  assert.ok(createRegion.includes("join(repoRoot, 'tmp', 'console-token')"), '默认必须持久化到 tmp/console-token');
+  assert.ok(createRegion.includes('await resolveSessionToken(tokenFile)'), 'createConsoleServer 必须复用持久化 token');
+});
+
+test('serve.mjs：403 区分缺 token 与 token 过期，带机器可读 code 与刷新提示（客户端据此自愈）', () => {
+  const start = source.indexOf('function requireToken');
+  const end = source.indexOf('function resolveStaticPath', start);
+  assert.ok(start !== -1 && end > start, '未找到 requireToken 边界（抽取规则疑似过期）');
+  const region = source.slice(start, end);
+  assert.ok(region.includes("code: 'token_missing'"), '缺 token 必须回 token_missing');
+  assert.ok(region.includes("code: 'token_stale'"), '不匹配必须回 token_stale');
+  assert.ok(region.includes('刷新控制台页面（Ctrl+R）'), '不匹配必须提示刷新页面');
+  assert.ok(!region.includes("code: 'token_invalid'"), 'token_invalid 已废弃（客户端只认 missing/stale）');
 });

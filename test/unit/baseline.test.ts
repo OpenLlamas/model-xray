@@ -63,6 +63,40 @@ test('buildBaseline yields null sections when probes are missing', () => {
   assert.equal(baseline.billing, null);
 });
 
+function pricingOutcome(source?: string): ProbeOutcome {
+  const metrics: ProbeOutcome['metrics'] = {
+    declared_origin: 'https://relay.example.com',
+    declared_captured_at: '2026-10-01T00:00:00.000Z',
+    declared_models_json: JSON.stringify({ 'gpt-4o': [1, 4, null, null, 0] }),
+    declared_group_ratio_json: '{}',
+    quota_per_unit: 500000,
+    declared_group: null,
+  };
+  if (source !== undefined) metrics['declared_source'] = source;
+  return outcome('billing', metrics);
+}
+
+test('buildBaseline pricing source：合法值透传，legacy/非法值不生成键', () => {
+  const publicBaseline = buildBaseline([pricingOutcome('public-json')], META);
+  assert.equal(publicBaseline.pricing?.source, 'public-json');
+
+  const legacy = buildBaseline([pricingOutcome()], META);
+  assert.equal(Object.hasOwn(legacy.pricing ?? {}, 'source'), false);
+
+  const invalid = buildBaseline([pricingOutcome('bogus')], META);
+  assert.equal(Object.hasOwn(invalid.pricing ?? {}, 'source'), false);
+});
+
+test('diffBaseline：公示价快照来源不同 → 跳过数值对比并给出跨来源 note', () => {
+  const oldBaseline = buildBaseline([pricingOutcome('api')], META);
+  const current = buildBaseline([pricingOutcome('public-json')], META);
+  const diff = diffBaseline(oldBaseline, current);
+  assert.ok(
+    diff.notes.some((note) => note.includes('跨来源快照跳过漂移比对')),
+    JSON.stringify(diff.notes),
+  );
+});
+
 test('loadBaseline accepts version 1 and rejects others', () => {
   const dir = mkdtempSync(join(tmpdir(), 'mx-baseline-'));
   try {
@@ -314,4 +348,50 @@ test('diffBaseline billing slope needs both abs and relative drift', () => {
     ),
     undefined,
   );
+});
+
+const PRICING_SNAPSHOT = {
+  origin: 'https://relay.example.com',
+  capturedAt: '2026-01-01T00:00:00Z',
+  quotaPerUnit: null,
+  group: null,
+  models: { 'gpt-4o': { modelRatio: 2, completionRatio: 2 } },
+  groupRatio: {},
+} as const satisfies NonNullable<BaselineFile['pricing']>;
+
+test('diffBaseline pricing：null↔快照不崩溃，显式降级为 note（旧基线兼容）', () => {
+  const withPricing = baselineOf({ pricing: PRICING_SNAPSHOT });
+  const withoutPricing = baselineOf({});
+  for (const [oldB, newB] of [
+    [withoutPricing, withPricing],
+    [withPricing, withoutPricing],
+    // 键缺失（极旧基线）与 null 同等对待：补 null 后进同一条降级 note 分支
+    [{ ...withoutPricing, pricing: undefined } as unknown as BaselineFile, withPricing],
+  ] as Array<[BaselineFile, BaselineFile]>) {
+    const diff = diffBaseline(oldB, newB);
+    assert.equal(diff.comparable, true);
+    assert.deepEqual(diff.items, []);
+    assert.ok(
+      diff.notes.some((n) => n.includes('缺少公示价快照') && n.includes('价格账本')),
+      `notes=${diff.notes.join('|')}`,
+    );
+  }
+});
+
+test('diffBaseline pricing：两侧快照倍率变化 → note；一致 → 无 note', () => {
+  const oldB = baselineOf({ pricing: PRICING_SNAPSHOT });
+  const changed = diffBaseline(
+    oldB,
+    baselineOf({
+      pricing: { ...PRICING_SNAPSHOT, models: { 'gpt-4o': { modelRatio: 3, completionRatio: 2 } } },
+    }),
+  );
+  assert.deepEqual(changed.items, []);
+  const note = changed.notes.find((n) => n.includes('公示倍率相对基线变化'));
+  assert.ok(note, `notes=${changed.notes.join('|')}`);
+  assert.ok(note?.includes('gpt-4o 2/2 → 3/2'));
+  assert.ok(note?.includes('价格账本'), 'note 必须注明权威判定在 billing 探针的账本对比');
+  // 倍率无变化 → 不产任何 pricing note
+  const same = diffBaseline(oldB, baselineOf({ pricing: { ...PRICING_SNAPSHOT, capturedAt: '2026-02-02T00:00:00Z' } }));
+  assert.ok(!same.notes.some((n) => n.includes('公示倍率')));
 });

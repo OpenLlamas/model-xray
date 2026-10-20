@@ -17,8 +17,15 @@ export interface BuildCommandInput {
   priceInput2: string;
   priceOutput2: string;
   priceCachedRead2: string;
+  /** 公示倍率锚点与网页兜底页（可选；空串 = 不传，由 CLI 自动探测 /api/pricing）。 */
+  expectModelRatio?: string;
+  expectCompletionRatio?: string;
+  quotaPerUsd?: string;
+  declaredPricePage?: string;
   seed: string;
   timeout: string;
+  /** 429/5xx 网关拒绝的重试预算（0-6，空串=CLI 默认 2）。 */
+  httpRetries?: string;
   out: string;
   baseline: string;
   deep: boolean;
@@ -50,6 +57,12 @@ export interface WebApp {
   buildModelPrices(entries: ModelPriceEntry[]): BuildModelPricesResult;
   formatCostUsd(value: unknown): string;
   classifyLogLine(text: string): string;
+  /** 归一化页面注入的会话 token（48 位小写十六进制）；形态不符/占位符未替换 → null。 */
+  normalizeInjectedToken(raw: unknown): string | null;
+  /** 从控制台首页 HTML 中提取服务端当前注入的会话 token；取不到 → null。 */
+  extractTokenFromHtml(html: unknown): string | null;
+  /** 响应是否为「会话 token 不可用」（403 且 token 相关）→ 允许换 token 重试一次。 */
+  isTokenAuthError(status: number, data: unknown): boolean;
 }
 
 /** 价格编辑行（字段均为字符串，空串=未填）；alias 行来自模型清单。 */

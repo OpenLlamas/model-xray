@@ -156,3 +156,15 @@ test('webui 接线：favicon 为无脚本/无外链的静态 SVG，head 中声�
   assert.ok(!/https?:\/\//i.test(stripped), 'favicon 不得引用外部资源');
   assert.match(html, /<link rel="icon" href="\/favicon\.svg">/, 'index.html head 必须声明 favicon 链接');
 });
+
+test('web/app.js：token 可续期（403 只重试一次），服务不可达时诚实报错', () => {
+  assert.ok(app.includes('export function normalizeInjectedToken'), '缺少 normalizeInjectedToken（页面占位符必须视为未连接）');
+  assert.ok(app.includes('export function extractTokenFromHtml'), '缺少 extractTokenFromHtml（无法从首页换新 token）');
+  assert.ok(app.includes('export function isTokenAuthError'), '缺少 isTokenAuthError（无法区分可重试的 403）');
+  assert.ok(app.includes("code === 'token_stale' || code === 'token_missing'"), '仅 token 缺失/过期允许重试');
+  assert.ok(app.includes("fetch('/', { cache: 'no-store' })"), '换 token 必须绕过缓存');
+  assert.ok(app.includes('let token = normalizeInjectedToken'), 'token 必须可变（否则重启后页面永久失效）');
+  assert.ok(app.includes('if (!(await resyncToken())) return first;'), '换不到新 token 时必须返回首次结果，不得死循环重试');
+  assert.ok(app.includes('return send(token);'), '重试必须使用刷新后的 token，且只重试一次');
+  assert.ok(app.includes('本地服务不可达'), '服务不可达必须如实告知，不得伪装成其他错误');
+});

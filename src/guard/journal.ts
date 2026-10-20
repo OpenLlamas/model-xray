@@ -7,6 +7,8 @@ import type { Usage, UsageRejection } from '../types.js';
  * guard 审计日志条目（JSONL，每行一个 JSON 对象）。
  * 脱敏红线：仅元数据——不含对话内容、不含任何凭证（key/Authorization/token 值）、
  * errors 只允许 {code, status}，禁止落上游错误体；path 不含 query。
+ * 对外消费契约（含 reconcile 金额口径与旧数据兼容规则）见 docs/guard-journal-schema.md，
+ * 条目字段变更须与该文档同步。
  */
 export interface RequestEntry {
   type: 'request';
@@ -53,7 +55,19 @@ export interface ReconcileEntry {
   cost: number;
   balanceBefore: BalanceSnapshot | null;
   balanceAfter: BalanceSnapshot | null;
+  /**
+   * 差值（单位见 deltaUnit）：可换算/校准时为换算后的美元值；单位无法换算（skipped）时
+   * 原样落 raw 读数差值。展示圆整到 6 位小数（判定均在圆整前的内存值上完成）。
+   */
   spendDelta: number | null;
+  /** 未换算、不圆整的原始余额差值（与读数同单位，保号）；聚合按 deltaUnit 归一时以它为准 */
+  rawDelta?: number | null;
+  /**
+   * 同行 spendDelta 值的单位：'USD' = 已换算美元口径；其他字符串 = raw 原始单位（如
+   * 'total_usage_raw'/'quota'，不得与 USD 聚合）。兼容契约：本字段为增量可选字段，旧 journal
+   * 行缺失时按「与读数同单位」理解（旧版 spendDelta 恒与读数同单位），无需版本迁移。
+   */
+  deltaUnit?: string | null;
   ratio: number | null;
   /** ok / warn / fail 为 ratio 分级；skipped（证据不足）/ skipped_recharge（Δ<0 充值混入）不出 ratio */
   verdict: 'ok' | 'warn' | 'fail' | 'skipped' | 'skipped_recharge';

@@ -1,10 +1,41 @@
 import type { TokenReference } from './token-reference.js';
+import type { DeclaredPricing, PricingSource, QuotaPerUnitSource } from './pricing.js';
+import type { PricingLedgerEntry, PricingLedgerWriteResult } from './pricing-ledger.js';
 
 export type ProbeId = 'identity' | 'context' | 'billing' | 'capability' | 'quality' | 'ttft' | 'decoy';
 
 export type ProbeStatus = 'ok' | 'insufficient' | 'error';
 
 export type Level = 'pass' | 'warn' | 'fail' | 'unknown';
+
+/** 基线中保存的公示价条目（只保留漂移检测需要的倍率字段，控制基线体积）。 */
+export interface DeclaredPricingSnapshotModel {
+  modelRatio: number;
+  completionRatio: number;
+  /** 缓存读取倍率（旧基线/旧账本条目没有该列 → undefined 或 null，对比时按缺字段处理）。 */
+  cacheRatio?: number | null;
+  /** 按次计费单价（原始字段，不做单位假设）。 */
+  modelPrice?: number | null;
+  /** new-api quota_type（0/缺省 = 按 token；1 = 按次）。 */
+  quotaType?: number | null;
+}
+
+/**
+ * 基线中的公示倍率快照：下一轮审计据此检测「站点把倍率调高」。
+ * 只存可复核的最小事实（来源 origin、抓取时间、换算率、模型与分组倍率）；不存 API key。
+ */
+export interface DeclaredPricingSnapshot {
+  origin: string;
+  capturedAt: string;
+  /** 快照来源；旧基线/旧账本缺省表示来源未知（legacy，不冒充 api）。 */
+  source?: PricingSource;
+  quotaPerUnit: number | null;
+  /** quotaPerUnit 的来源；旧基线/旧账本缺省表示来源未知（无法区分站点改价与用户换口径）。 */
+  quotaPerUnitSource?: QuotaPerUnitSource;
+  group: string | null;
+  models: Record<string, DeclaredPricingSnapshotModel>;
+  groupRatio: Record<string, number>;
+}
 
 export interface Usage {
   prompt_tokens: number;
@@ -258,6 +289,15 @@ export interface RunConfig {
   priceInput2?: number | null;
   priceOutput2?: number | null;
   priceCachedRead2?: number | null;
+  /** 站点分组（new-api group 参数；仅用于挑选展示的 group_ratio，不改变换算口径） */
+  group?: string | null;
+  /** 用户声明的 model_ratio / completion_ratio（与站点公示值相对差 >5% → fail） */
+  expectModelRatio?: number | null;
+  expectCompletionRatio?: number | null;
+  /** $1 = N quota（new-api status.quota_per_unit）；用于 quota 单位余额与应缴 quota 的换算 */
+  quotaPerUsd?: number | null;
+  /** 公示价抓取失败时的网页兜底：价格页路径或同源绝对 URL（仅当 /api/pricing 不可用时使用） */
+  declaredPricePage?: string | null;
   /** 指纹基线对比：输入基线文件 / 本轮基线输出路径 */
   baselineIn?: string | null;
   baselineOut?: string | null;
@@ -280,6 +320,32 @@ export interface ProbeCtx {
   cfg: RunConfig;
   rng: Rng;
   evidence: EvidenceRecorder;
+  /**
+   * 历史公示倍率快照（主对照源；优先级：--baseline 显式基线快照 > 本地价格账本最新条目；都没有为 null）。
+   * runner 在探针执行前注入。
+   */
+  previousPricing?: DeclaredPricingSnapshot | PricingLedgerEntry | null;
+  /** previousPricing 的来源：baseline=显式基线快照，ledger=本地价格账本。 */
+  previousPricingSource?: 'baseline' | 'ledger' | null;
+  /**
+   * 次对照源：--baseline 与本地账本同时存在时，未作为主源的那个快照（否则 null）。
+   * 两个来源都参与 billing 漂移对比——显式基线不得遮蔽账本中更近的跳变。
+   */
+  previousPricingAlt?: DeclaredPricingSnapshot | PricingLedgerEntry | null;
+  /** previousPricingAlt 的来源：baseline=显式基线快照，ledger=本地价格账本。 */
+  previousPricingAltSource?: 'baseline' | 'ledger' | null;
+  /** 价格账本读取失败原因（账本读取出错时非 null）：如实披露，不阻止审计。 */
+  pricingLedgerError?: string | null;
+  /** 账本尾部扫描跳过的损坏行数（仅 kind=ok 时透出；>0 时 billing 披露 warn，不封顶分数）。 */
+  pricingLedgerCorruptLines?: number | null;
+  /** 尾部损坏（更新的位置有坏行/未终止半行）：对照基线可能不是最新快照，billing 披露须明示。 */
+  pricingLedgerTailCorrupt?: boolean | null;
+  /** 账本文件路径（损坏行披露文案引用）。 */
+  pricingLedgerPath?: string | null;
+  /** 账本条目 origin 与当前 origin 路径不一致时的披露文案（同一主机不同路径前缀）。 */
+  pricingLedgerOriginNote?: string | null;
+  /** runner 注入的账本写入回调：抓到公示快照后由 billing 落盘（失败绝不影响审计结论）。 */
+  onPricingSnapshot?: (declared: DeclaredPricing) => PricingLedgerWriteResult;
 }
 
 export interface ScoreEntry {
