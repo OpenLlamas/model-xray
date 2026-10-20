@@ -1,5 +1,6 @@
 import { readFileSync } from 'node:fs';
-import type { ProbeId, ProbeOutcome } from './types.js';
+import { PRICING_SOURCES, type PricingSource } from './pricing.js';
+import type { DeclaredPricingSnapshot, DeclaredPricingSnapshotModel, ProbeId, ProbeOutcome } from './types.js';
 
 export interface BaselineFile {
   version: 1;
@@ -13,6 +14,9 @@ export interface BaselineFile {
   quality: { accuracy: number; mainCorrect: number; mainTotal: number; metricVersion?: string } | null;
   capability: Record<string, string> | null;
   billing: { slopeEn: number | null; slopeZh: number | null } | null;
+  /** 公示倍率快照（本轮起写入）：下一轮经 --baseline 注入 billing 的倍率漂移检测；
+   * 旧基线无该字段 → loadBaseline 补 null（视为无公示价快照，不做倍率漂移对比）。 */
+  pricing: DeclaredPricingSnapshot | null;
 }
 
 export interface BaselineMeta {
@@ -64,6 +68,7 @@ export function buildBaseline(outcomes: ProbeOutcome[], meta: BaselineMeta): Bas
     quality: buildQuality(find('quality')),
     capability: buildCapability(find('capability')),
     billing: buildBilling(find('billing')),
+    pricing: buildPricing(find('billing')),
   };
 }
 
@@ -121,6 +126,84 @@ function buildBilling(outcome: ProbeOutcome | undefined): BaselineFile['billing'
   return { slopeEn, slopeZh };
 }
 
+/** 从 billing outcome 的 metrics 提取公示倍率快照：只有 billing 实际抓到 /api/pricing 时产出；
+ * 任何字段缺失/JSON 损坏都返回 null（无快照 → 下一轮不做倍率漂移检测，不影响其余漂移对比）。 */
+function buildPricing(outcome: ProbeOutcome | undefined): BaselineFile['pricing'] {
+  if (!outcome) return null;
+  const origin = outcome.metrics['declared_origin'];
+  const capturedAt = outcome.metrics['declared_captured_at'];
+  const modelsJson = outcome.metrics['declared_models_json'];
+  if (typeof origin !== 'string' || origin === '') return null;
+  if (typeof capturedAt !== 'string' || capturedAt === '') return null;
+  if (typeof modelsJson !== 'string') return null;
+  let rawModels: unknown;
+  try {
+    rawModels = JSON.parse(modelsJson);
+  } catch {
+    return null;
+  }
+  if (typeof rawModels !== 'object' || rawModels === null || Array.isArray(rawModels)) return null;
+  const models: DeclaredPricingSnapshot['models'] = {};
+  for (const [name, value] of Object.entries(rawModels)) {
+    // 紧凑格式：name → [modelRatio, completionRatio]（旧账本）或
+    // [modelRatio, completionRatio, cacheRatio, modelPrice, quotaType]（本轮起，尾部可空）
+    if (!Array.isArray(value) || value.length < 2) continue;
+    const modelRatio = value[0];
+    const completionRatio = value[1];
+    if (typeof modelRatio !== 'number' || !Number.isFinite(modelRatio) || modelRatio < 0) continue;
+    if (typeof completionRatio !== 'number' || !Number.isFinite(completionRatio) || completionRatio < 0) continue;
+    const model: DeclaredPricingSnapshotModel = { modelRatio, completionRatio };
+    if (value.length >= 5) {
+      // 旧账本只有两个倍率：缺的列保持 undefined，不额外生成键（深比较/序列化都保持旧形状）
+      model.cacheRatio = nullableFinite(value[2]);
+      model.modelPrice = nullableFinite(value[3]);
+      model.quotaType = nullableFinite(value[4]);
+    }
+    models[name] = model;
+  }
+  if (Object.keys(models).length === 0) return null;
+  const groupRatio: Record<string, number> = {};
+  const groupRatioJson = outcome.metrics['declared_group_ratio_json'];
+  if (typeof groupRatioJson === 'string') {
+    try {
+      const parsed: unknown = JSON.parse(groupRatioJson);
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        for (const [group, ratio] of Object.entries(parsed)) {
+          if (typeof ratio === 'number' && Number.isFinite(ratio) && ratio > 0) groupRatio[group] = ratio;
+        }
+      }
+    } catch {
+      // 分组倍率损坏不致命：丢弃分组维度，保留模型倍率快照
+    }
+  }
+  const quotaRaw = outcome.metrics['quota_per_unit'];
+  const quotaPerUnit = typeof quotaRaw === 'number' && Number.isFinite(quotaRaw) && quotaRaw > 0 ? quotaRaw : null;
+  const quotaSourceRaw = outcome.metrics['quota_per_unit_source'];
+  const quotaPerUnitSource =
+    quotaSourceRaw === 'site' || quotaSourceRaw === 'cli' || quotaSourceRaw === 'none' ? quotaSourceRaw : undefined;
+  const groupRaw = outcome.metrics['declared_group'];
+  const group = typeof groupRaw === 'string' && groupRaw !== '' ? groupRaw : null;
+  const sourceRaw = outcome.metrics['declared_source'];
+  const source =
+    typeof sourceRaw === 'string' && (PRICING_SOURCES as readonly string[]).includes(sourceRaw)
+      ? (sourceRaw as PricingSource)
+      : undefined;
+  return {
+    origin,
+    capturedAt,
+    ...(source !== undefined ? { source } : {}),
+    quotaPerUnit,
+    ...(quotaPerUnitSource !== undefined ? { quotaPerUnitSource } : {}),
+    group,
+    models,
+    groupRatio,
+  };
+}
+
+function nullableFinite(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 /** 读取并校验基线文件；version!==1 或结构非法直接抛错（错误含字段路径；cli fail-fast，runner 决定是否降级）。 */
 export function loadBaseline(path: string): BaselineFile {
   const raw = readFileSync(path, 'utf8');
@@ -138,7 +221,13 @@ export function loadBaseline(path: string): BaselineFile {
     throw new Error(`不支持的基线版本：${String(version)}（仅支持 version=1）。`);
   }
   validateBaseline(parsed as Record<string, unknown>);
-  return parsed as BaselineFile;
+  const baseline = parsed as BaselineFile;
+  // 旧基线（本轮新增 pricing 字段之前生成）没有该字段：补 null 表示「无公示价快照」，
+  // 与「有快照但站点没提供公示价」区分不必要——两种情况下倍率漂移检测都不执行。
+  if (baseline.pricing === undefined) {
+    baseline.pricing = null;
+  }
+  return baseline;
 }
 
 /** 基线运行时形状校验：畸形基线绝不能静默流入对比逻辑（否则可能制造假漂移、冤枉端点）。错误信息一律含字段路径。 */
@@ -199,6 +288,73 @@ function validateBaseline(b: Record<string, unknown>): void {
       if (value !== null && (typeof value !== 'number' || !Number.isFinite(value))) {
         throw fieldError(`baseline.billing.${key}`, '数字或 null', value);
       }
+    }
+  }
+
+  const pricingRaw = b['pricing'];
+  if (pricingRaw !== undefined && pricingRaw !== null) {
+    if (typeof pricingRaw !== 'object' || Array.isArray(pricingRaw)) {
+      throw fieldError('baseline.pricing', '对象或 null', pricingRaw);
+    }
+    validatePricingSnapshot(pricingRaw as Record<string, unknown>);
+  }
+}
+
+/** 公示倍率快照的字段级校验（错误信息含完整字段路径，畸形快照绝不能流入倍率漂移对比）。 */
+function validatePricingSnapshot(p: Record<string, unknown>): void {
+  for (const key of ['origin', 'capturedAt'] as const) {
+    const value = p[key];
+    if (typeof value !== 'string' || value.length === 0) {
+      throw fieldError(`baseline.pricing.${key}`, '非空字符串', value);
+    }
+  }
+  const quotaPerUnit = p['quotaPerUnit'];
+  if (quotaPerUnit !== null && (typeof quotaPerUnit !== 'number' || !Number.isFinite(quotaPerUnit) || quotaPerUnit <= 0)) {
+    throw fieldError('baseline.pricing.quotaPerUnit', '正数或 null', quotaPerUnit);
+  }
+  const group = p['group'];
+  if (group !== null && typeof group !== 'string') {
+    throw fieldError('baseline.pricing.group', '字符串或 null', group);
+  }
+  const quotaPerUnitSource = p['quotaPerUnitSource'];
+  if (
+    quotaPerUnitSource !== undefined &&
+    quotaPerUnitSource !== null &&
+    (typeof quotaPerUnitSource !== 'string' || !['site', 'cli', 'none'].includes(quotaPerUnitSource))
+  ) {
+    throw fieldError('baseline.pricing.quotaPerUnitSource', 'null 或 site/cli/none', quotaPerUnitSource);
+  }
+  const source = p['source'];
+  if (
+    source !== undefined &&
+    source !== null &&
+    (typeof source !== 'string' || !(PRICING_SOURCES as readonly string[]).includes(source))
+  ) {
+    throw fieldError('baseline.pricing.source', `null 或 ${PRICING_SOURCES.join('/')}`, source);
+  }
+  const models = p['models'];
+  if (typeof models !== 'object' || models === null || Array.isArray(models)) {
+    throw fieldError('baseline.pricing.models', '对象', models);
+  }
+  for (const [name, entry] of Object.entries(models)) {
+    if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+      throw fieldError(`baseline.pricing.models.${name}`, '对象', entry);
+    }
+    const record = entry as Record<string, unknown>;
+    for (const key of ['modelRatio', 'completionRatio'] as const) {
+      const value = record[key];
+      if (typeof value !== 'number' || !Number.isFinite(value) || value < 0) {
+        throw fieldError(`baseline.pricing.models.${name}.${key}`, '不小于 0 的数字', value);
+      }
+    }
+  }
+  const groupRatio = p['groupRatio'];
+  if (typeof groupRatio !== 'object' || groupRatio === null || Array.isArray(groupRatio)) {
+    throw fieldError('baseline.pricing.groupRatio', '对象', groupRatio);
+  }
+  for (const [name, value] of Object.entries(groupRatio)) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
+      throw fieldError(`baseline.pricing.groupRatio.${name}`, '正数', value);
     }
   }
 }
@@ -352,6 +508,42 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
         });
       }
     }
+  }
+
+  // 公示倍率快照：两侧都非空才逐模型对比（null↔对象/键缺失一律显式降级为 note，绝不静默漏报
+  // 也不崩溃）。权威漂移判定在 billing 探针（逐轮对照价格账本、warn 封顶），这里只做补充披露，
+  // 记 note 不产 item，避免与账本漂移双重惩罚。
+  const oldPricing = oldBaseline.pricing;
+  const newPricing = current.pricing;
+  const previousSource = oldPricing?.source;
+  const currentSource = newPricing?.source;
+  const sameSource =
+    (previousSource === undefined && currentSource === undefined) ||
+    (previousSource !== undefined && currentSource !== undefined && previousSource === currentSource);
+  if (oldPricing && newPricing && !sameSource) {
+    notes.push(
+      `跨来源快照跳过漂移比对（上次来源 ${previousSource ?? '未知（legacy）'}，本轮来源 ${currentSource ?? '未知（legacy）'}）：不同来源的公示价口径不可互换。`,
+    );
+  } else if (oldPricing && newPricing) {
+    const names = [...new Set([...Object.keys(oldPricing.models), ...Object.keys(newPricing.models)])].sort();
+    const changed: string[] = [];
+    for (const name of names) {
+      const before = oldPricing.models[name];
+      const after = newPricing.models[name];
+      if (!before || !after) {
+        changed.push(`${name}（${!before ? '本次新增' : '基线后下架'}）`);
+      } else if (before.modelRatio !== after.modelRatio || before.completionRatio !== after.completionRatio) {
+        changed.push(`${name} ${before.modelRatio}/${before.completionRatio} → ${after.modelRatio}/${after.completionRatio}`);
+      }
+    }
+    if (changed.length > 0) {
+      const digest = changed.length > 5 ? `${changed.slice(0, 5).join('；')} 等 ${changed.length} 项` : changed.join('；');
+      notes.push(`公示倍率相对基线变化：${digest}（权威判定见 billing 探针的价格账本漂移对比）。`);
+    }
+  } else if (oldPricing || newPricing) {
+    notes.push(
+      '基线或本次运行缺少公示价快照（旧格式基线，或站点未提供公示价接口），公示倍率漂移对比已跳过；该判定由 billing 探针对照价格账本执行。',
+    );
   }
 
   return { comparable: true, skipReason: null, items, notes };

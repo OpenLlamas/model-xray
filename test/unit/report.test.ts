@@ -1,5 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { existsSync, readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { renderJson } from '../../src/report/json.js';
 import { renderMarkdown } from '../../src/report/markdown.js';
 import { renderHtml } from '../../src/report/html.js';
@@ -435,3 +438,89 @@ test('console/markdown：C0/C1 控制字符（终端转义注入）在渲染边�
   // 正文内容保留（只剥控制字节；残留的 "[31m" 是惰性文本，无 ESC 前缀不会被终端解释）
   assert.ok(md.includes('被注入[31m红色'), JSON.stringify(md.slice(md.indexOf('被注入') - 20, md.indexOf('被注入') + 20)));
 });
+
+// ---------------------------------------------------------------------------
+// 计费与倍率摘要块：倍率必须一眼可见（不许只埋在几十行原始指标表里）
+// ---------------------------------------------------------------------------
+
+function billingOutcome(metrics: Record<string, number | string | null> = {}): ProbeOutcome {
+  return {
+    id: 'billing',
+    status: 'ok',
+    score: 85,
+    level: 'pass',
+    headline: 'usage 计数核验通过，未发现造假证据（未做绝对对账，扣费金额真实性未验证）',
+    findings: [],
+    metrics: {
+      pricing_state: 'ok',
+      declared_origin: 'https://relay.example.com',
+      declared_model_ratio: 2,
+      declared_completion_ratio: 5,
+      measured_ratio: 'N/A',
+      money_check_state: 'not_applicable',
+      balance_probe_reason: '候选余额接口均不可用（origin https://relay.example.com）',
+      evidence_level: 'shape-only',
+      ...metrics,
+    },
+  };
+}
+
+test('markdown：计费维度输出「计费与倍率」摘要块（公示倍率 / 实测倍率 / 为何没有倍率的原因）', () => {
+  const md = renderMarkdown(reportWith([], [billingOutcome()]));
+  assert.ok(md.includes('**计费与倍率**'), '计费维度必须有中文标签的倍率摘要块');
+  assert.ok(md.includes('| 公示输入倍率 | 2 |'), `缺公示输入倍率：${md}`);
+  assert.ok(md.includes('| 公示输出倍率 | 5 |'), `缺公示输出倍率：${md}`);
+  assert.ok(md.includes('| 实测倍率 | N/A |'), `缺实测倍率：${md}`);
+  assert.ok(md.includes('| 余额探测原因 | 候选余额接口均不可用（origin https://relay.example.com） |'), '缺「为什么没有倍率」的原因字段');
+  assert.ok(md.includes('| 证据等级 | shape-only |'), '缺证据等级（形状证据 vs 绝对对账）');
+});
+
+test('html：计费维度输出「计费与倍率」摘要块（与 markdown 同口径）', () => {
+  const html = renderHtml(reportWith([], [billingOutcome()]));
+  assert.ok(html.includes('<h4>计费与倍率</h4>'), 'HTML 计费维度缺倍率摘要块');
+  assert.ok(html.includes('公示输入倍率'), 'HTML 缺公示输入倍率标签');
+  assert.ok(html.includes('实测倍率'), 'HTML 缺实测倍率标签');
+  assert.ok(html.includes('余额探测原因'), 'HTML 缺余额探测原因');
+});
+
+test('console：终端输出带倍率摘要行（实测 / 公示 / 金额核验状态）', () => {
+  const out = renderConsole(reportWith([], [billingOutcome()]), { color: false });
+  assert.match(out, /倍率: 实测 N\/A · 公示 输入 2 \/ 输出 5 · 金额核验 not_applicable/);
+});
+
+test('无计费探针的报告不出现倍率摘要块（老报告不炸）', () => {
+  assert.ok(!renderMarkdown(sampleReport('x')).includes('计费与倍率'));
+  assert.ok(!renderHtml(sampleReport('x')).includes('计费与倍率'));
+  assert.ok(!renderConsole(sampleReport('x'), { color: false }).includes('倍率: '));
+});
+
+test('漂移钉子：控制台与 CLI 报告的倍率标签表同口径（键、中文标签、顺序一致）', () => {
+  const reportLabels = extractBillingLabels(readFileSync(join(repoRoot(), 'src', 'report', 'markdown.ts'), 'utf8'), 'export const BILLING_METRIC_LABELS');
+  const consoleLabels = extractBillingLabels(readFileSync(join(repoRoot(), 'web', 'app.js'), 'utf8'), 'const BILLING_METRIC_LABELS');
+  assert.ok(reportLabels.length > 0 && consoleLabels.length > 0, '标签表不得为空');
+  assert.deepEqual(consoleLabels, reportLabels, '控制台与报告的倍率标签表漂移了（web/app.js vs src/report/markdown.ts）');
+  // 关键标签必须在册（用户诉求：公示倍率 / 实测倍率 / 原因 / 证据等级）
+  for (const key of ['declared_model_ratio', 'declared_completion_ratio', 'measured_ratio', 'balance_probe_reason', 'evidence_level', 'money_check_state']) {
+    assert.ok(reportLabels.some(([k]) => k === key), `标签表缺少关键指标 ${key}`);
+  }
+});
+
+function repoRoot(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let depth = 0; depth < 8; depth += 1) {
+    if (existsSync(join(dir, 'src', 'report', 'markdown.ts'))) return dir;
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  throw new Error('未找到 src/report/markdown.ts：请在仓库根目录下构建并运行测试。');
+}
+
+function extractBillingLabels(source: string, marker: string): Array<[string, string]> {
+  const start = source.indexOf(marker);
+  assert.ok(start !== -1, `未找到标签表标记 ${marker}`);
+  const end = source.indexOf('];', start);
+  assert.ok(end > start, '标签表结束边界异常');
+  const region = source.slice(start, end);
+  return [...region.matchAll(/\['([a-z0-9_]+)', '([^']+)'\]/g)].map((m) => [m[1]!, m[2]!] as [string, string]);
+}

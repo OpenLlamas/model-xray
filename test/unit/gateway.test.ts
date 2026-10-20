@@ -855,7 +855,12 @@ function findRepoRoot(): string {
 const REPO_ROOT = findRepoRoot();
 const SERVE_URL = pathToFileURL(join(REPO_ROOT, 'scripts', 'serve.mjs')).href;
 const serveModule = (await import(SERVE_URL)) as {
-  createConsoleServer(options: { port: number; repoRoot: string; gatewayEnabled?: boolean }): Promise<{
+  createConsoleServer(options: {
+    port: number;
+    repoRoot: string;
+    gatewayEnabled?: boolean;
+    tokenFile?: string | null;
+  }): Promise<{
     port: number;
     token: string;
     close(): Promise<void>;
@@ -866,7 +871,7 @@ function manageHeaders(token: string): Record<string, string> {
 }
 
 test('管理面：无 token 一律 403（GET 亦要求 token）', async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -883,7 +888,7 @@ test('管理面：无 token 一律 403（GET 亦要求 token）', async () => {
 });
 
 test('管理面：API 聚合默认停用（后需迭代上线）——携合法 token 亦回 503，token 校验仍先于停用判定', async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -899,7 +904,7 @@ test('管理面：API 聚合默认停用（后需迭代上线）——携合法 
 });
 
 test('管理面：start（随机回环端口）→ running；重复 start → 409；渠道 CRUD/删除/停用语义成立', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -984,7 +989,7 @@ test('管理面：start（随机回环端口）→ running；重复 start → 40
 });
 
 test('管理面：未运行时渠道端点仍可用（持久 store 预配置），虚拟 key 端点 400 引导启动（非 500 崩溃）', async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1002,7 +1007,7 @@ test('管理面：未运行时渠道端点仍可用（持久 store 预配置）�
 });
 
 test('管理面：启动前预配置渠道 → 启动后数据面 /v1/models 即可见（store 注入回归），停止再启动仍保留', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1033,7 +1038,7 @@ test('管理面：启动前预配置渠道 → 启动后数据面 /v1/models 即
 });
 
 test('管理面：并发 start 只允许一个成功（另一个 409，不泄漏第二个监听实例）', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1050,7 +1055,7 @@ test('管理面：并发 start 只允许一个成功（另一个 409，不泄漏
 });
 
 test('管理面：start 参数非法（400）后 starting 已复位，可立即正常启动（finally 复位回归）', { timeout: 20000 }, async () => {
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: REPO_ROOT, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
   });
@@ -1069,7 +1074,7 @@ test('管理面：start 参数非法（400）后 starting 已复位，可立即�
 
 test('管理面：未构建 → start 503 引导；复制 dist 后免重启重试成功（加载失败不缓存为永久 null）', { timeout: 20000 }, async () => {
   const tempRoot = mkdtempSync(join(tmpdir(), 'mx-serve-root-'));
-  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: tempRoot, gatewayEnabled: true });
+  const server = await serveModule.createConsoleServer({ port: 0, repoRoot: tempRoot, gatewayEnabled: true, tokenFile: null });
   CLEANUPS.push(async () => {
     await server.close().catch(() => undefined);
     rmSync(tempRoot, { recursive: true, force: true, maxRetries: 3 });
@@ -1420,7 +1425,9 @@ function delayedTtftSse(delayMs: number): { status: number; sse: string; delayMs
 
 test('TTFT 告警⑭：默认阈值边界——19 样本不报；第 20 样本恰 1 条 ttft_high（observed=p95≥300）；冷却抑制只见计数；client_ttft 独立口径落库', { timeout: 25000 }, async () => {
   const fixture = makeLedgerFixture();
-  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0 });
+  // 本用例只验「n=20 边界」：把 loop-lag 污染阈值抬到不可达，避免全量测试并行时把样本判污染后
+  // clean 样本不足 20 而漏告警（污染剔除本身由 ⑪-⑬ 专项覆盖）。
+  const stack = await startGatewayStack({ ledger: fixture.ledger, alertSilenceMs: 0, loopLagThresholdMs: 1_000_000 });
   const { gateway, mock } = stack;
   CLEANUPS.push(() => stack.cleanup());
   CLEANUPS.push(async () => fixture.cleanup());
@@ -1431,6 +1438,8 @@ test('TTFT 告警⑭：默认阈值边界——19 样本不报；第 20 样本�
   assert.equal(gateway.events().filter((alert) => alert.kind === 'ttft_high').length, 0, 'n<20 绝不告警（低样本抖动防误报）');
   await sendStreamChat(gateway, 1);
   await waitFor(() => fixture.settlementRows().length === 20);
+  // 结算行先落库、告警在响应收尾路径评估：两者有先后，等事件出现再做断言（避免负载下读早一步的假红）。
+  await waitFor(() => gateway.events().length >= 1);
   const alerts = gateway.events();
   assert.equal(alerts.length, 1, '第 20 个未污染样本恰触发一条 ttft_high');
   assert.equal(alerts[0]!.kind, 'ttft_high');
@@ -1443,6 +1452,7 @@ test('TTFT 告警⑭：默认阈值边界——19 样本不报；第 20 样本�
   // 冷却抑制披露：窗口继续累积高样本 → 规则再触发只计数，不生成第二条事件
   await sendStreamChat(gateway, 3);
   await waitFor(() => fixture.settlementRows().length === 23);
+  await waitFor(() => gateway.status().alertSuppressed >= 1);
   assert.equal(gateway.events().length, 1, '冷却期内不重复生成 ttft_high 事件');
   assert.ok(gateway.status().alertSuppressed >= 1, '冷却抑制必须计数披露（持续故障不得被一条旧告警掩盖）');
   // 双口径：client_ttft 是「进网关→响应首字节（含状态行）」，upstream_ttft 是「发出上游请求→首个内容帧」；

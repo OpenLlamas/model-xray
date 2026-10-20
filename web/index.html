@@ -3,7 +3,12 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>model-xray 控制台</title>
+<title>model-xray 控制台 — LLM 中转站真实性审计</title>
+<meta name="description" content="model-xray：实证审计 OpenAI 兼容 LLM 中转站，检测换壳模型、降智、截断上下文、token 计数灌水与隐藏计费倍率，产出可分享的红绿报告。">
+<meta name="keywords" content="LLM 审计, 中转站检测, 模型真伪, 换壳模型检测, token 计费, OpenAI 兼容, API 中转, 降智检测, llm audit, fake model detection, relay audit, model-xray">
+<meta property="og:title" content="model-xray — X-ray your LLM endpoints">
+<meta property="og:description" content="Audit OpenAI-compatible LLM relays for fake or watered-down models. One command, one shareable report.">
+<meta property="og:type" content="website">
 <link rel="icon" href="/favicon.svg">
 <style>
   :root { color-scheme: dark; font-family: Inter, ui-sans-serif, system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; background: #0a0c10; color: #e8eaf0; font-synthesis: none; }
@@ -121,6 +126,15 @@
   .badge-unknown { background: #ffffff0c; color: #a3a5b0; }
   .scorecard-head { display: flex; align-items: center; gap: 12px; margin-top: 16px; }
   .scorecard-head .total { color: #f1edf8; font-size: 16px; font-weight: 600; }
+  .scorecard h4 { margin: 16px 0 6px; color: #8e909c; font-size: 11px; font-weight: 600; letter-spacing: .04em; }
+  .metrics-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(240px, 1fr)); gap: 6px 14px; margin-top: 6px; }
+  .metrics-grid > div { display: flex; gap: 8px; align-items: baseline; min-width: 0; }
+  .metrics-grid .k { flex: 0 0 auto; color: #747885; font-size: 11px; }
+  .metrics-grid .v { flex: 1 1 auto; min-width: 0; color: #d8d4e2; font-size: 11px; word-break: break-word; }
+  details.metrics-detail { margin: 10px 0; }
+  details.metrics-detail > summary { color: #8e909c; font-size: 11px; cursor: pointer; }
+  details.metrics-detail[open] > summary { margin-bottom: 6px; }
+  details.metrics-detail > summary:focus-visible { outline: 1px solid #6d5ce7; outline-offset: 2px; }
   ul.findings, ul.notes { margin: 7px 0; padding-left: 19px; color: #b3b2be; }
   ul.findings li, ul.notes li { margin: 6px 0; line-height: 1.55; }
   .report-links { display: flex; gap: 14px; flex-wrap: wrap; }
@@ -214,7 +228,7 @@ button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8;
         </div>
         <div class="row"><div><label for="f-base-url">API 端点 *</label><input id="f-base-url" type="text" placeholder="https://relay.example.com/v1"></div><div><label for="f-model">模型 ID *</label><input id="f-model" type="text" placeholder="gpt-4o"></div></div>
         <div class="row"><div><label for="f-claimed-context">宣称上下文窗口（tokens，可选）</label><input id="f-claimed-context" type="text" inputmode="numeric" placeholder="例如 128000"></div><div><label>该端点宣称支持的能力</label><div class="checks"><label><input id="f-expect-vision" type="checkbox">视觉</label><label><input id="f-expect-tool" type="checkbox">工具调用</label><label><input id="f-expect-thinking" type="checkbox">推理</label></div></div></div>
-        <fieldset class="optional"><legend>计费校验 · 可选</legend><div class="hints">同时填写输入与输出单价后才会核验账单倍率（不填不显示误导性的 $0）。缓存读不填按输入价；二档阶梯须同时填写阈值、二档输入与二档输出，二档缓存不填按二档输入价；单次请求 prompt tokens 超过阈值时整单按二档价计。</div><div class="row"><div><label for="f-price-input">输入单价（$/百万 tokens）</label><input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-price-output">输出单价（$/百万 tokens）</label><input id="f-price-output" type="text" inputmode="decimal" placeholder="10"></div></div><div class="row"><div><label for="f-price-cached-read">缓存读单价（$/百万 tokens，可选）</label><input id="f-price-cached-read" type="text" inputmode="decimal" placeholder="留空 = 按输入价"></div><div><label for="f-price-threshold">长上下文二档阈值（prompt tokens）</label><input id="f-price-threshold" type="text" inputmode="numeric" placeholder="例如 1000000"></div></div><div class="row"><div><label for="f-price-input2">二档输入单价（$/百万 tokens）</label><input id="f-price-input2" type="text" inputmode="decimal" placeholder="6"></div><div><label for="f-price-output2">二档输出单价（$/百万 tokens）</label><input id="f-price-output2" type="text" inputmode="decimal" placeholder="22.5"></div><div><label for="f-price-cached-read2">二档缓存读单价（可选）</label><input id="f-price-cached-read2" type="text" inputmode="decimal" placeholder="留空 = 按二档输入价"></div></div></fieldset>
+        <fieldset class="optional"><legend>计费校验 · 可选</legend><div class="hints">同时填写输入与输出单价后才会核验账单倍率（不填不显示误导性的 $0）。单价直接照抄站方价目表上的数字即可：币种不限，工具只做「同单位比值」判定、不做币种换算（把价格换算成另一种币种会让倍率整体偏移一个汇率）；单位只需与该站余额显示单位一致。缓存读不填按输入价；二档阶梯须同时填写阈值、二档输入与二档输出，二档缓存不填按二档输入价；单次请求 prompt tokens 超过阈值时整单按二档价计。</div><div class="row"><div><label for="f-price-input">输入单价（每百万 tokens）</label><input id="f-price-input" type="text" inputmode="decimal" placeholder="2.5"></div><div><label for="f-price-output">输出单价（每百万 tokens）</label><input id="f-price-output" type="text" inputmode="decimal" placeholder="10"></div></div><div class="row"><div><label for="f-price-cached-read">缓存读单价（每百万 tokens，可选）</label><input id="f-price-cached-read" type="text" inputmode="decimal" placeholder="留空 = 按输入价"></div><div><label for="f-price-threshold">长上下文二档阈值（prompt tokens）</label><input id="f-price-threshold" type="text" inputmode="numeric" placeholder="例如 1000000"></div></div><div class="row"><div><label for="f-price-input2">二档输入单价（每百万 tokens）</label><input id="f-price-input2" type="text" inputmode="decimal" placeholder="6"></div><div><label for="f-price-output2">二档输出单价（每百万 tokens）</label><input id="f-price-output2" type="text" inputmode="decimal" placeholder="22.5"></div><div><label for="f-price-cached-read2">二档缓存读单价（可选）</label><input id="f-price-cached-read2" type="text" inputmode="decimal" placeholder="留空 = 按二档输入价"></div></div><div class="hints">下面四项用于「站点公示倍率」核验：填写后会额外 GET 同源 /api/pricing、/api/status 读取公示倍率与 quota 系数（免鉴权、不带 key），与你的应缴额对账；不填则只用宣称价形状核验。</div><div class="row"><div><label for="f-expect-model-ratio">公示输入倍率 model_ratio（可选）</label><input id="f-expect-model-ratio" type="text" inputmode="decimal" placeholder="例如 1.5"></div><div><label for="f-expect-completion-ratio">公示输出倍率 completion_ratio（可选）</label><input id="f-expect-completion-ratio" type="text" inputmode="decimal" placeholder="例如 4"></div></div><div class="row"><div><label for="f-quota-per-usd">quota 每美元（可选）</label><input id="f-quota-per-usd" type="text" inputmode="decimal" placeholder="new-api 默认 500000"></div><div><label for="f-declared-price-page">价格网页兜底（可选）</label><input id="f-declared-price-page" type="text" placeholder="/pricing（同源路径）"></div></div></fieldset>
         <div class="row"><div><label for="f-seed">随机种子（可选，复测时固定）</label><input id="f-seed" type="text" inputmode="numeric" placeholder="12345"></div><div><label for="f-timeout">单次请求超时（秒）</label><input id="f-timeout" type="text" inputmode="numeric" placeholder="60"></div></div>
         <div class="row"><div><label for="f-http-retries">网关拒绝重试次数（429/5xx，可选）</label><input id="f-http-retries" type="text" inputmode="numeric" placeholder="默认 2，0-6"></div><div></div></div>
         <div class="row"><div><label for="f-out">报告目录</label><input id="f-out" type="text" placeholder="reports"></div><div><label for="f-baseline">对照基线（可选）</label><input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json"></div></div>

@@ -6,6 +6,9 @@ import { createRng } from './random.js';
 import { ASSETS_VERSION, DECOYS, PROBESET_VERSION } from './assets.js';
 import { computeTotal } from './scoring.js';
 import { buildBaseline, diffBaseline, loadBaseline, type BaselineDiff, type BaselineFile } from './baseline.js';
+import { deriveOrigin } from './pricing.js';
+import { redactUrl } from './redact.js';
+import { buildLedgerEntry, readLastPricingSnapshot, withLedgerLock } from './pricing-ledger.js';
 import { probeIdentity } from './probes/identity.js';
 import { probeContext } from './probes/context.js';
 import { probeBilling } from './probes/billing.js';
@@ -106,7 +109,98 @@ export async function runAudit(
             activity(formatRequestActivity(currentPhase, event, cfg.timeoutMs));
           },
   });
-  const ctx: ProbeCtx = { client, cfg, rng, evidence };
+  // 基线必须在探针执行前确定（注释见 baselineRef 参数说明）：billing 的公示倍率漂移检测也需要历史快照，
+  // 先烧钱再重读磁盘会静默丢掉倍率对比；加载失败在此记下原因，探针照跑、对比环节如实披露。
+  let baselineForRun: BaselineFile | null = null;
+  let baselineLoadError: string | null = null;
+  if (cfg.baselineIn) {
+    try {
+      baselineForRun = baselineRef ?? loadBaseline(cfg.baselineIn);
+    } catch (error) {
+      baselineLoadError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  // 历史公示快照：显式基线与本地价格账本都读取——两者同时存在时都参与 billing 漂移对照，
+  // 否则显式 --baseline 会遮蔽账本中更新的跳变（基线时间与现在之间的上涨被漏检）。
+  // 主源优先 baseline，账本作为 previousPricingAlt；没有基线时账本即主源（无需 --baseline 也能自动检测）。
+  // 账本读取在锁内进行：并发追加者写一半时裸读会把半行误计为损坏（喂给尾部损坏告警路径）；
+  // 锁等待超时（价格账本被占用）等失败一律降级为如实披露（pricingLedgerError），审计绝不因本地归档锁而失败。
+  // 账本归档键需要站点 origin；baseUrl 非法时不能让整个审计崩掉（库调用方可能绕过 CLI 校验），
+  // 退化为「无账本对照」并如实披露，探针照跑。
+  let origin: string;
+  try {
+    origin = deriveOrigin(cfg.baseUrl);
+  } catch (error) {
+    origin = '';
+  }
+  const baselinePricing = baselineForRun?.pricing ?? null;
+  let ledgerPricing: ReturnType<typeof readLastPricingSnapshot>['entry'] = null;
+  let pricingLedgerError: string | null = null;
+  let pricingLedgerPath: string | null = null;
+  let pricingLedgerCorruptLines: number | null = null;
+  let pricingLedgerTailCorrupt: boolean | null = null;
+  let pricingLedgerOriginNote: string | null = null;
+  if (origin === '') {
+    pricingLedgerError = `baseUrl 无法解析为 URL（${redactUrl(cfg.baseUrl)}）：本轮未对比本地价格账本`;
+  } else {
+    try {
+      const read = withLedgerLock(cfg.outDir, origin, () => readLastPricingSnapshot(cfg.outDir, origin));
+      pricingLedgerPath = read.path;
+      if (read.kind === 'ok') {
+        ledgerPricing = read.entry;
+        pricingLedgerCorruptLines = read.corruptLines;
+        pricingLedgerTailCorrupt = read.tailCorrupt;
+        pricingLedgerOriginNote = read.originNote;
+      } else if (read.kind === 'error') {
+        pricingLedgerError = read.error ?? '价格账本读取失败';
+      }
+    } catch (error) {
+      pricingLedgerError = error instanceof Error ? error.message : String(error);
+    }
+  }
+  const previousPricing = baselinePricing ?? ledgerPricing;
+  const previousPricingSource = baselinePricing !== null ? ('baseline' as const) : ledgerPricing !== null ? ('ledger' as const) : null;
+  const previousPricingAlt = baselinePricing !== null && ledgerPricing !== null ? ledgerPricing : null;
+  const previousPricingAltSource = previousPricingAlt !== null ? ('ledger' as const) : null;
+  const ctx: ProbeCtx = {
+    client,
+    cfg,
+    rng,
+    evidence,
+    previousPricing,
+    previousPricingSource,
+    previousPricingAlt,
+    previousPricingAltSource,
+    pricingLedgerError,
+    pricingLedgerCorruptLines,
+    pricingLedgerTailCorrupt,
+    pricingLedgerPath,
+    pricingLedgerOriginNote,
+    // 账本写入回调：billing 抓到公示快照后落盘；失败折叠成结果对象披露，绝不抛出打断审计。
+    // 写入同样在文件锁内完成（与 watch/其他审计进程互斥），并在锁内重读尾部：
+    // 尾部损坏（坏行/未终止半行）时拒绝追加——盲写会让新行粘在半行后一起损坏，账本永远无法恢复。
+    onPricingSnapshot: (declared) => {
+      try {
+        const entry = buildLedgerEntry(declared, cfg.model);
+        return withLedgerLock(cfg.outDir, entry.origin, (appendLocked) => {
+          const latest = readLastPricingSnapshot(cfg.outDir, entry.origin);
+          if (latest.kind === 'error') {
+            return { ok: false, path: null, error: `${latest.error ?? '价格账本读取失败'}（本轮未写入）` };
+          }
+          if (latest.tailCorrupt) {
+            return {
+              ok: false,
+              path: null,
+              error: '价格账本尾部损坏（存在无法解析的坏行或未终止半行），本轮未写入；请先检查账本文件',
+            };
+          }
+          return { ok: true, path: appendLocked(entry), error: null };
+        });
+      } catch (error) {
+        return { ok: false, path: null, error: error instanceof Error ? error.message : String(error) };
+      }
+    },
+  };
 
   const runPhase = async (id: ProbeId, fn: () => Promise<ProbeOutcome>): Promise<ProbeOutcome> => {
     currentPhase = id;
@@ -174,8 +268,10 @@ export async function runAudit(
     assetsVersion: ASSETS_VERSION,
   });
   if (cfg.baselineIn) {
-    try {
-      const reference = baselineRef ?? loadBaseline(cfg.baselineIn);
+    if (baselineForRun === null) {
+      notes.push(`基线加载失败，已跳过指纹对比：${baselineLoadError ?? '原因未知'}`);
+    } else {
+      const reference = baselineForRun;
       const diff = diffBaseline(reference, currentBaseline);
       if (!diff.comparable) {
         notes.push(`基线不可比（${diff.skipReason}），已跳过指纹对比。`);
@@ -192,8 +288,6 @@ export async function runAudit(
           notes.push(`基线 seed=${reference.seed} 与本次不同，quality 题集不一致，该项漂移对比已跳过。`);
         }
       }
-    } catch (error) {
-      notes.push(`基线加载失败，已跳过指纹对比：${error instanceof Error ? error.message : String(error)}`);
     }
   } else {
     // 无基线提示：如实披露本次审计的检测边界（同族换壳/静默降级不可检测）
@@ -213,7 +307,8 @@ export async function runAudit(
       probesetVersion: PROBESET_VERSION,
       assetsVersion: ASSETS_VERSION,
       model: cfg.model,
-      baseUrl: cfg.baseUrl,
+      // 报告是可分享产物：baseUrl 里的 userinfo/query 可能夹带凭据，回显前先脱敏。
+      baseUrl: redactUrl(cfg.baseUrl),
       seed: cfg.seed,
       startedAt,
       durationMs: Date.now() - startedMs,

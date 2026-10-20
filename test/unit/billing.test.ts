@@ -51,8 +51,9 @@ test('decideRatio N/A: two readings from different sources', () => {
   assert.match(decision?.finding.message ?? '', /不同源/);
 });
 
-test('decideRatio N/A: non-USD balance unit (one-api quota) cannot compare with USD expectedCost', () => {
-  // 2026-10-18 真机：/api/user/self 返回 quota 单位余额，quota 差值 ÷ 美元应缴会产出天文倍率误报
+test('decideRatio N/A: quota balance unit without a published conversion rate cannot be compared', () => {
+  // 2026-10-18 真机：/api/user/self 返回 quota 单位余额且站点未公示换算率，quota 差值 ÷ 应缴额
+  // 会产出天文倍率误报；有 quota_per_unit 时走换算分支（见下方换算用例）。
   const decision = decideRatio(
     args({
       before: reading({ value: 5_000_000, kind: 'balance', unit: 'quota', endpoint: '/api/user/self' }),
@@ -64,7 +65,7 @@ test('decideRatio N/A: non-USD balance unit (one-api quota) cannot compare with 
   assert.equal(decision?.verdict, 'N/A');
   assert.equal(decision?.ratio, null);
   assert.equal(decision?.cap, null);
-  assert.match(decision?.finding.message ?? '', /非美元口径/);
+  assert.match(decision?.finding.message ?? '', /与宣称价不是同一单位/);
 });
 
 test('decideRatio N/A: delta below 3x reading resolution is precision noise', () => {
@@ -118,7 +119,7 @@ test('decideRatio: 0.5x-0.8x underpayment is warn, not "consistent with price"',
   assert.equal(decision?.verdict, 'warn');
   assert.equal(decision?.ratio, 0.6);
   assert.equal(decision?.cap, null);
-  assert.match(decision?.finding.message ?? '', /少计|单位错配|抵扣/);
+  assert.match(decision?.finding.message ?? '', /少计|不同单位|抵扣/);
 });
 
 test('decideRatio N/A: zero delta (granularity / delayed billing)', () => {
@@ -156,7 +157,7 @@ test('decideRatio N/A: negative expectedCost (defensive, prices are validated no
 test('decideRatio underflow: ratio rounds to 0, pinned to unit-mismatch warn (not N/A)', () => {
   const decision = decideRatio(args({ spendDelta: 1e-308, expectedCost: 1e308 }));
   assert.equal(decision?.verdict, 'warn');
-  assert.match(decision?.finding.message ?? '', /单位错配/);
+  assert.match(decision?.finding.message ?? '', /宣称价与余额读数不同单位/);
 });
 
 test('decideRatio masked dual-code: dropped usage masks an underlying fail, surfaced via maskedVerdict', () => {
@@ -210,7 +211,7 @@ test('decideRatio four tiers on healthy regression', () => {
   assert.equal(low?.verdict, 'warn');
   assert.equal(low?.cap, null);
   assert.equal(low?.finding.level, 'warn');
-  assert.match(low?.finding.message ?? '', /单位错配/);
+  assert.match(low?.finding.message ?? '', /宣称价与余额读数不同单位/);
 });
 
 test('decideRatio tier boundaries: 1.5 stays warn, 1.1/0.8 stay ok, 0.79 warn', () => {
@@ -621,8 +622,237 @@ test('probeBilling: 线性形状正常但无绝对对账 → usage 判定通过�
   );
 });
 
-test('probeBilling: 非空正文但 completion_tokens=0 → warn 70（输出侧计数不可信）', async () => {
-  // prompt 回归只覆盖输入；输出侧伪造必须由 completion_tokens 与正文/上限的矛盾来抓。
+// ---------- 公开价表兜底（/public/model-prices → 模型级 anchor，2026-10-20） ----------
+
+async function withPublicPricing(
+  items: unknown[],
+  run: (baseUrl: string) => Promise<void>,
+): Promise<void> {
+  const server = createServer((req, res) => {
+    if (req.url === '/public/model-prices') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ items }));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${address.port}/v1`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+function publicPricingCtx(baseUrl: string, input: number, output: number): ProbeCtx {
+  const client: OpenAIClient = {
+    baseUrl,
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      return usageResult(estimateMessageTokens(req.messages));
+    },
+  };
+  const base = billingCtx(client);
+  return { ...base, cfg: { ...base.cfg, priceInput: input, priceOutput: output } };
+}
+
+const PUBLIC_GPT4O = {
+  code: 'gpt-4o',
+  price_input_usd: '0.2400',
+  price_output_usd: '0.8400',
+  price_cached_usd: '0.0690',
+  price_list_input_usd: '0.8000',
+  price_list_output_usd: '2.8000',
+};
+
+test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline 含公示单价与实测 N/A', async () => {
+  await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
+    const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+    assert.equal(outcome.status, 'ok');
+    assert.equal(outcome.score, 85);
+    assert.equal(outcome.level, 'pass');
+    assert.equal(outcome.metrics['declared_source'], 'public-json');
+    assert.equal(outcome.metrics['pricing_state'], 'not_applicable');
+    assert.equal(outcome.metrics['public_price_state'], 'ok');
+    assert.equal(outcome.metrics['public_price_page'], '/public/model-prices');
+    assert.equal(outcome.metrics['public_price_entries'], 1);
+    assert.equal(outcome.metrics['public_price_matched'], 'gpt-4o');
+    assert.equal(outcome.metrics['public_price_input_usd_per_m'], 0.24);
+    assert.equal(outcome.metrics['public_price_output_usd_per_m'], 0.84);
+    // 公开价表锚：应缴只以 USD 披露，quota 单位未知（合成 500000 不得冒充站点单位写进报告）
+    assert.equal(outcome.metrics['expected_quota_declared'], null);
+    const expectedUsd = outcome.metrics['expected_cost_usd_declared'];
+    assert.ok(typeof expectedUsd === 'number' && expectedUsd > 0, `应缴 USD 应为正数：${String(expectedUsd)}`);
+    assert.equal(outcome.metrics['money_check_state'], 'declared_only');
+    assert.match(outcome.headline, /公示 输入 \$0\.24\/M · 输出 \$0\.84\/M/);
+    assert.match(outcome.headline, /实测倍率 N\/A（余额端点不可用）/);
+    assert.match(outcome.headline, /未与实收对账/);
+    assert.ok(!outcome.headline.includes('仅验证 usage 与输入长度线性'), outcome.headline);
+    assert.ok(
+      outcome.findings.some(
+        (f) => f.level === 'info' && /公开价表无分组概念，按倍率 1 折算，分组口径未核验/.test(f.message),
+      ),
+      JSON.stringify(outcome.findings),
+    );
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'info' && /站点公开价与宣称价一致，无可归因的加价/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+  });
+});
+
+test('probeBilling: 公开价低于宣称价 → 仅 info，不产生 warn/fail', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '0.2000', price_output_usd: '0.6000' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.score, 85);
+      assert.equal(outcome.level, 'pass');
+      assert.ok(
+        outcome.findings.some((f) => f.level === 'info' && /站点公开价低于宣称价，无可归因的加价/.test(f.message)),
+        JSON.stringify(outcome.findings),
+      );
+      assert.ok(!outcome.findings.some((f) => f.level === 'warn' || f.level === 'fail'), JSON.stringify(outcome.findings));
+    },
+  );
+});
+
+test('probeBilling: 公开价与宣称价约 1000× 量级差 → 仅 info 披露单位口径，不判罚', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '240', price_output_usd: '840' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.score, 85);
+      assert.equal(outcome.level, 'pass');
+      assert.equal(outcome.metrics['public_price_input_usd_per_m'], 240);
+      assert.match(outcome.headline, /公示 输入 \$240\/M · 输出 \$840\/M/);
+      assert.ok(
+        outcome.findings.some(
+          (f) => f.level === 'info' && /单位口径不同|相差约 1000×/.test(f.message),
+        ),
+        JSON.stringify(outcome.findings),
+      );
+      assert.ok(!outcome.findings.some((f) => f.level === 'warn' || f.level === 'fail'), JSON.stringify(outcome.findings));
+    },
+  );
+});
+
+test('probeBilling: 公开价高于宣称价 >50% → fail 70（方向性加价，不因站更便宜误报）', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '0.4800', price_output_usd: '1.6800' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.score, 70);
+      assert.equal(outcome.level, 'fail');
+      assert.match(outcome.headline, /虚标价格嫌疑/);
+      assert.ok(
+        outcome.findings.some((f) => f.level === 'fail' && /公开价表输入价 \$0\.48\/M vs 宣称 \$0\.24\/M/.test(f.message)),
+        JSON.stringify(outcome.findings),
+      );
+    },
+  );
+});
+
+test('probeBilling: 公开价高于宣称价 20%-50% → warn 且不封顶到 fail', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '0.3000', price_output_usd: '1.0500' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.level, 'warn');
+      assert.ok(outcome.score !== null && outcome.score > 70, `warn 不应封顶到 fail 档：${outcome.score}`);
+      assert.ok(
+        outcome.findings.some((f) => f.level === 'warn' && /公开价高于宣称价，存在加价嫌疑/.test(f.message)),
+        JSON.stringify(outcome.findings),
+      );
+    },
+  );
+});
+
+test('probeBilling: 公开价不足宣称价一半 → warn 披露「低价表引流」假设，不判 fail', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '0.1000', price_output_usd: '0.3500' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.level, 'warn');
+      assert.ok(outcome.score !== null && outcome.score > 0, String(outcome.score));
+      assert.ok(
+        outcome.findings.some((f) => f.level === 'warn' && /低价表引流、高价结算/.test(f.message)),
+        JSON.stringify(outcome.findings),
+      );
+      assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+    },
+  );
+});
+
+test('probeBilling: 公开价快照 quotaPerUnit 只写真实源，不落合成 500000', async () => {
+  await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
+    const base = publicPricingCtx(baseUrl, 0.24, 0.84);
+    const captured: Array<{ quotaPerUnit: number | null; source?: string }> = [];
+    const withLedger = {
+      ...base,
+      onPricingSnapshot: (declared: { quotaPerUnit: number | null; source?: string }) => {
+        captured.push(declared);
+        return { ok: true, path: null, error: null };
+      },
+    };
+    const outcome = await probeBilling(withLedger);
+    assert.equal(outcome.metrics['declared_source'], 'public-json');
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0]?.quotaPerUnit, null);
+    assert.equal(captured[0]?.source, 'public-json');
+  });
+});
+
+test('probeBilling: 公开价快照沿用用户声明的真实 quotaPerUnit', async () => {
+  await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
+    const base = publicPricingCtx(baseUrl, 0.24, 0.84);
+    const captured: Array<{ quotaPerUnit: number | null }> = [];
+    const outcome = await probeBilling({
+      ...base,
+      cfg: { ...base.cfg, quotaPerUsd: 123_456 },
+      onPricingSnapshot: (declared: { quotaPerUnit: number | null }) => {
+        captured.push(declared);
+        return { ok: true, path: null, error: null };
+      },
+    });
+    assert.equal(outcome.metrics['declared_source'], 'public-json');
+    assert.equal(captured[0]?.quotaPerUnit, 123_456);
+  });
+});
+
+test('probeBilling: 公开价表 anchor 与 API 基线跨来源 → 跳过漂移并披露', async () => {
+  await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
+    const base = publicPricingCtx(baseUrl, 0.24, 0.84);
+    const outcome = await probeBilling({
+      ...base,
+      previousPricing: {
+        origin: 'https://api.example.com',
+        capturedAt: '2026-10-01T00:00:00.000Z',
+        source: 'api',
+        quotaPerUnit: 500_000,
+        group: null,
+        models: { 'gpt-4o': { modelRatio: 1, completionRatio: 4 } },
+        groupRatio: {},
+      },
+      previousPricingSource: 'baseline',
+    });
+    assert.equal(outcome.status, 'ok');
+    assert.equal(outcome.level, 'pass');
+    assert.equal(outcome.metrics['declared_drift_count'], 0);
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'info' && /跨来源快照跳过漂移比对/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+    assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /漂移/.test(f.message)), JSON.stringify(outcome.findings));
+  });
+});
+
+test('probeBilling: 非空正文但 completion_tokens=0 → warn 70（输出侧计数不可信）', async () => {  // prompt 回归只覆盖输入；输出侧伪造必须由 completion_tokens 与正文/上限的矛盾来抓。
   const client: OpenAIClient = {
     baseUrl: 'http://127.0.0.1:0/v1',
     async chat(req: ChatRequest): Promise<ChatResult> {

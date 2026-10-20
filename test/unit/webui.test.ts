@@ -22,8 +22,18 @@ function locateWebApp(): string {
 }
 
 const webApp = (await import(pathToFileURL(locateWebApp()).href)) as WebApp;
-const { buildCommand, renderScorecard, escapeHtml, scrubSecrets, buildModelPrices, formatCostUsd, classifyLogLine } =
-  webApp;
+const {
+  buildCommand,
+  renderScorecard,
+  escapeHtml,
+  scrubSecrets,
+  buildModelPrices,
+  formatCostUsd,
+  classifyLogLine,
+  normalizeInjectedToken,
+  extractTokenFromHtml,
+  isTokenAuthError,
+} = webApp;
 const dashboardHtml = readFileSync(join(dirname(locateWebApp()), 'index.html'), 'utf8');
 
 const BASE = 'https://relay.example.com/v1';
@@ -41,6 +51,10 @@ function fullInput() {
     priceInput2: '6',
     priceOutput2: '22.5',
     priceCachedRead2: '0.75',
+    expectModelRatio: '1.5',
+    expectCompletionRatio: '4',
+    quotaPerUsd: '500000',
+    declaredPricePage: '/pricing',
     seed: '12345',
     timeout: '60',
     out: 'reports-out',
@@ -64,6 +78,10 @@ function minimalInput() {
     priceInput2: '',
     priceOutput2: '',
     priceCachedRead2: '',
+    expectModelRatio: '',
+    expectCompletionRatio: '',
+    quotaPerUsd: '',
+    declaredPricePage: '',
     seed: '',
     timeout: '',
     out: '',
@@ -112,6 +130,10 @@ const ALLOWED_FLAGS = [
   '--price-input2',
   '--price-output2',
   '--price-cached-read2',
+  '--expect-model-ratio',
+  '--expect-completion-ratio',
+  '--quota-per-usd',
+  '--declared-price-page',
   '--seed',
   '--timeout',
   '--out',
@@ -178,6 +200,11 @@ test('buildCommand：全参数——含全部 flag，字符串参数单引号包
   assert.ok(command.includes('--price-output2 22.5'), command);
   assert.ok(command.includes('--price-cached-read2 0.75'), command);
   assert.ok(command.includes('--seed 12345'), command);
+  // 公示价锚点：数值 flag 不加引号，网页兜底页按字符串参数引用
+  assert.ok(command.includes('--expect-model-ratio 1.5'), command);
+  assert.ok(command.includes('--expect-completion-ratio 4'), command);
+  assert.ok(command.includes('--quota-per-usd 500000'), command);
+  assert.ok(command.includes("--declared-price-page '/pricing'"), command);
   assert.ok(command.includes('--timeout 60'), command);
   assert.ok(command.includes('--deep'), command);
   assert.ok(command.includes('--dry-run'), command);
@@ -304,6 +331,92 @@ test('buildCommand：seed / timeout 非正整数 → error', () => {
   assert.ok(buildCommand({ ...minimalInput(), timeout: '60' }).error === null);
 });
 
+test('buildCommand：公示价锚点校验——倍率/quota 系数必须为正数，兜底页必须形似路径或 URL', () => {
+  for (const bad of ['0', '-1.5', '1.5x', 'abc', ' ']) {
+    const trimmed = bad.trim();
+    if (trimmed === '') {
+      // 纯空白按「未填」处理：省略该 flag，不报错
+      const blank = buildCommand({ ...minimalInput(), expectModelRatio: bad });
+      assert.equal(blank.error, null);
+      assert.ok(!blank.command.includes('--expect-model-ratio'), blank.command);
+      continue;
+    }
+    assert.ok(
+      buildCommand({ ...minimalInput(), expectModelRatio: bad }).error !== null,
+      `expect-model-ratio=${bad} 应报错`,
+    );
+  }
+  assert.ok(buildCommand({ ...minimalInput(), expectCompletionRatio: '0' }).error !== null);
+  assert.ok(buildCommand({ ...minimalInput(), quotaPerUsd: '-1' }).error !== null);
+  // 0 对倍率类是非法值（公示倍率不可能为 0），但必须给出点名 flag 的提示
+  const zero = buildCommand({ ...minimalInput(), quotaPerUsd: '0' });
+  assert.ok(zero.error !== null && zero.error.includes('--quota-per-usd'), String(zero.error));
+  for (const badPage of ['pricing', 'ftp://x/pricing', '/pricing extra', 'https://']) {
+    assert.ok(
+      buildCommand({ ...minimalInput(), declaredPricePage: badPage }).error !== null,
+      `declared-price-page=${badPage} 应报错`,
+    );
+  }
+  for (const okPage of ['/pricing', '/pricing?group=default', 'https://relay.example.com/pricing']) {
+    const ok = buildCommand({ ...minimalInput(), declaredPricePage: okPage });
+    assert.equal(ok.error, null, `${okPage} 应通过：${String(ok.error)}`);
+    assert.ok(ok.command.includes('--declared-price-page'), ok.command);
+  }
+  // 跨域绝对 URL 提前拒绝（pricing-scrape 会 fail-closed 成 not_applicable，用户看不到原因）
+  const crossOrigin = buildCommand({ ...minimalInput(), declaredPricePage: 'https://other.example.net/pricing' });
+  assert.equal(crossOrigin.command, '');
+  assert.ok(crossOrigin.error !== null && crossOrigin.error.includes('同源'), String(crossOrigin.error));
+  assert.ok(crossOrigin.error !== null && crossOrigin.error.includes('other.example.net'), String(crossOrigin.error));
+  // baseUrl 非法时不抢答（留给 CLI 报 base-url 错误）
+  const badBase = buildCommand({ ...minimalInput(), baseUrl: 'not-a-url', declaredPricePage: 'https://x.example.com/pricing' });
+  assert.ok(!String(badBase.error).includes('同源'), String(badBase.error));
+  // 最小参数样例不因新增字段变形（旧命令串有精确断言）
+  assert.equal(
+    buildCommand(minimalInput()).command,
+    `model-xray test --base-url '${BASE}' --model 'gpt-4o' --expect 'none'`,
+  );
+});
+
+test('buildCommand：cmd.exe 模式下兜底页按双引号包裹（与其它字符串参数同口径）', () => {
+  const result = buildCommand({ ...minimalInput(), shell: 'cmd', declaredPricePage: '/pricing' });
+  assert.equal(result.error, null);
+  assert.ok(result.command.includes('--declared-price-page "/pricing"'), result.command);
+});
+
+test('buildCommand：cmd.exe 模式下拒绝 !（延迟展开 /v:on 时双引号不设防）', () => {
+  for (const bad of ['/pricing!x', '/pri!cing']) {
+    const result = buildCommand({ ...minimalInput(), shell: 'cmd', declaredPricePage: bad });
+    assert.ok(result.error !== null, `cmd 模式 declaredPricePage=${JSON.stringify(bad)} 应报错`);
+    assert.match(String(result.error), /!/);
+  }
+  // posix 模式下 ! 是普通字面量，不必误伤
+  assert.equal(buildCommand({ ...minimalInput(), shell: 'posix', declaredPricePage: '/pricing' }).error, null);
+});
+
+test('buildCommand：quota-per-usd 按 1~1e12 有效域校验（与 CLI/站点公示口径同一域）', () => {
+  for (const bad of ['0', '0.5', '-1', '1e13', 'abc', '1e400']) {
+    const result = buildCommand({ ...minimalInput(), quotaPerUsd: bad });
+    assert.ok(result.error !== null, `quotaPerUsd=${bad} 应报错`);
+    assert.match(String(result.error), /quota-per-usd/);
+  }
+  for (const ok of ['1', '500000', '1000000000']) {
+    const result = buildCommand({ ...minimalInput(), quotaPerUsd: ok });
+    assert.equal(result.error, null, `${ok} 应通过：${String(result.error)}`);
+    assert.ok(result.command.includes('--quota-per-usd 500000') || result.command.includes(`--quota-per-usd ${ok}`));
+  }
+});
+
+test('buildCommand：兜底页与其它字符串参数同口径做引用健全性检查（cmd.exe 闭合引号即可注入命令）', () => {
+  for (const bad of ['/pricing"&calc&"', '/pricing%PATH%', '/pricing"']) {
+    const result = buildCommand({ ...minimalInput(), shell: 'cmd', declaredPricePage: bad });
+    assert.ok(result.error !== null, `cmd 模式 declaredPricePage=${JSON.stringify(bad)} 应报错`);
+    assert.equal(result.command, '', '出错时不得产出命令串');
+  }
+  // posix 模式同样拒绝单引号（各 shell 转义规则不一致，宁可拒绝）
+  const posix = buildCommand({ ...minimalInput(), shell: 'posix', declaredPricePage: "/pricing'x" });
+  assert.ok(posix.error !== null, "posix 模式含单引号的兜底页应报错");
+});
+
 test('buildCommand：claimed-context 非整数 → error；合法则原样输出', () => {
   assert.ok(buildCommand({ ...minimalInput(), claimedContext: '32abc' }).error !== null);
   assert.ok(buildCommand({ ...minimalInput(), claimedContext: '0' }).error !== null);
@@ -383,6 +496,90 @@ test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / f
   }
   assert.ok(result.html.includes('warn 线索'));
   assert.ok(result.html.includes('note 一'));
+});
+
+test('renderScorecard：计费探针的公示倍率/实测倍率/金额核验指标必须可见（中文标签 + 原值）', () => {
+  const report = sampleReport({
+    outcomes: [
+      sampleOutcome('identity'),
+      sampleOutcome('billing', {
+        metrics: {
+          pricing_state: 'declared',
+          declared_group: 'vip',
+          declared_group_ratio: 0.28,
+          declared_model_ratio: 2,
+          declared_completion_ratio: 8,
+          measured_ratio: 0.56,
+          ratio_verified: true,
+          money_check_state: 'verified',
+          quota_to_usd: 500000,
+          spend_delta: 0.5,
+          balance_unit: 'total_usage_raw',
+          balance_calibrated_unit: 'USD',
+          expected_cost_usd_declared: 0.42,
+          expected_quota_declared: 210000,
+          cost_is_upper_bound: 1,
+          calibration_confidence: 'high',
+          declared_models_json: '{"x":1}',
+          declared_group_ratio_json: '{"y":2}',
+          scraped_price_matched_json: '{"z":3}',
+          unknown_metric: null,
+        },
+      }),
+    ],
+  });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  // 公示价与倍率
+  assert.ok(result.html.includes('计费与倍率'), result.html);
+  assert.ok(result.html.includes('公示输入倍率'), result.html);
+  assert.ok(result.html.includes('公示输出倍率'), result.html);
+  assert.ok(result.html.includes('实测倍率'), result.html);
+  assert.ok(result.html.includes('分组折扣倍率'), result.html);
+  // 金额核验
+  assert.ok(result.html.includes('金额核验状态'), result.html);
+  assert.ok(result.html.includes('verified'), result.html);
+  assert.ok(result.html.includes('balance_unit') || result.html.includes('余额读数单位'), result.html);
+  assert.ok(result.html.includes('total_usage_raw'), result.html);
+  assert.ok(result.html.includes('500000'), result.html);
+  // 公示价应缴额与校准置信度也在摘要块（倍率结论的可复核依据）
+  assert.ok(result.html.includes('按公示价应缴（USD）'), result.html);
+  assert.ok(result.html.includes('按公示价应缴（quota）'), result.html);
+  assert.ok(result.html.includes('210000'), result.html);
+  assert.ok(result.html.includes('单位校准置信度'), result.html);
+  // 布尔值读作是/否（不是裸 true）
+  assert.ok(result.html.includes('>是<'), result.html);
+  assert.ok(!result.html.includes('>true<'), result.html);
+  // 大型 *_json 指标只进折叠明细也不能漏转义风险：key 不应出现在摘要块
+  const gridRegion = result.html.slice(result.html.indexOf('metrics-grid'), result.html.indexOf('</div>', result.html.indexOf('metrics-grid')));
+  assert.ok(!gridRegion.includes('_json'), `摘要块不得渲染大型 JSON 指标：${gridRegion}`);
+  // 每个有指标的探针都有可折叠明细
+  assert.ok(result.html.includes('指标明细'), result.html);
+  assert.ok(result.html.includes('declared_model_ratio'), result.html);
+});
+
+test('renderScorecard：指标值里的 HTML 被转义（指标通道不得成为 XSS 入口）', () => {
+  const report = sampleReport({
+    outcomes: [sampleOutcome('billing', { metrics: { declared_group: '<img src=x onerror=alert(1)>' } })],
+  });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  assert.ok(!result.html.includes('<img'), result.html);
+  assert.ok(!result.html.includes('onerror='), result.html);
+  assert.ok(result.html.includes('&lt;img'), result.html);
+});
+
+test('renderScorecard：无 metrics / 无 billing 探针时不渲染倍率块与明细（老报告不炸）', () => {
+  const report = sampleReport({ outcomes: [sampleOutcome('identity'), sampleOutcome('quality')] });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  assert.ok(!result.html.includes('计费与倍率'), result.html);
+  assert.ok(!result.html.includes('指标明细'), result.html);
+  // metrics 字段类型异常（老报告/手改）也只降级不失败
+  const broken = sampleReport({ outcomes: [{ id: 'billing', level: 'pass', score: 1, headline: 'x', findings: [], metrics: 'oops' }] });
+  const brokenResult = renderScorecard(JSON.stringify(broken));
+  assert.equal(brokenResult.error, null);
+  assert.ok(!brokenResult.html.includes('计费与倍率'), brokenResult.html);
 });
 
 test('renderScorecard：XSS 钉子——headline 注入脚本/事件处理器被转义', () => {
@@ -611,4 +808,60 @@ test('scrubSecrets：抹掉命中的密钥并对 sk- 形态兜底打码', () => 
   assert.equal(scrubSecrets('上游拒绝：sk-abcdef123456789 无效', ['sk-abcdef123456789']), '上游拒绝：*** 无效');
   assert.equal(scrubSecrets('裸串 sk-zzzz9999yyyy8888x', []), '裸串 sk-***');
   assert.equal(scrubSecrets('无命中 plain text', ['other-secret-key']), '无命中 plain text');
+});
+
+test('normalizeInjectedToken：只认 48 位小写 hex，占位符/空/形态不符 → null（= 未连上本地服务）', () => {
+  const token = 'a1'.repeat(24);
+  assert.equal(normalizeInjectedToken(token), token);
+  assert.equal(normalizeInjectedToken('__MX_TOKEN__'), null, '未替换的占位符不得当凭据');
+  assert.equal(normalizeInjectedToken(''), null);
+  assert.equal(normalizeInjectedToken('A1'.repeat(24)), null, '大写不得接受（服务端只生成小写）');
+  assert.equal(normalizeInjectedToken('a'.repeat(47)), null);
+  assert.equal(normalizeInjectedToken(null), null);
+  assert.equal(normalizeInjectedToken(123), null);
+});
+
+test('extractTokenFromHtml：从服务端渲染的首页取 token，静态副本/非字符串 → null', () => {
+  const token = 'b2'.repeat(24);
+  assert.equal(extractTokenFromHtml(`<script>window.MX_TOKEN = '${token}';</script>`), token);
+  assert.equal(extractTokenFromHtml("<script>window.MX_TOKEN = '__MX_TOKEN__';</script>"), null);
+  assert.equal(extractTokenFromHtml('<html>无 token</html>'), null);
+  assert.equal(extractTokenFromHtml(null), null);
+});
+
+test('isTokenAuthError：仅 403 且 token 缺失/过期才允许重试；Host/Origin 等 403 不得重试', () => {
+  assert.equal(isTokenAuthError(403, { code: 'token_stale' }), true);
+  assert.equal(isTokenAuthError(403, { code: 'token_missing' }), true);
+  assert.equal(isTokenAuthError(403, { error: '缺少 x-model-xray-token：请从控制台页面发起请求' }), true, '缺 code 时按文案兜底');
+  assert.equal(isTokenAuthError(403, { error: 'Forbidden: Host 不被允许' }), false);
+  assert.equal(isTokenAuthError(403, { error: 'Forbidden: Origin 不被允许' }), false);
+  assert.equal(isTokenAuthError(400, { code: 'token_stale' }), false);
+  assert.equal(isTokenAuthError(403, null), false);
+  assert.equal(isTokenAuthError(500, { code: 'token_stale' }), false);
+});
+
+test('renderScorecard：倍率摘要块必须给出「公示倍率 / 实测倍率 / 为什么没有倍率的原因 / 证据等级」', () => {
+  const report = sampleReport({
+    outcomes: [
+      sampleOutcome('billing', {
+        metrics: {
+          pricing_state: 'ok',
+          declared_model_ratio: 2,
+          declared_completion_ratio: 5,
+          measured_ratio: 'N/A',
+          money_check_state: 'not_applicable',
+          balance_probe_reason: '候选余额接口均不可用（origin https://relay.example.com）',
+          evidence_level: 'shape-only',
+        },
+      }),
+    ],
+  });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  const html = result.html ?? '';
+  for (const label of ['公示输入倍率', '公示输出倍率', '实测倍率', '余额探测原因', '金额核验状态', '证据等级']) {
+    assert.ok(html.includes(label), `倍率摘要块缺标签「${label}」`);
+  }
+  assert.ok(html.includes('候选余额接口均不可用'), '倍率摘要块必须带「为什么没有倍率」的原因原文');
+  assert.ok(html.includes('shape-only'), '倍率摘要块必须显示证据等级');
 });

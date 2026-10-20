@@ -9,7 +9,10 @@ import { writeReports, makeFileStamp } from './report/files.js';
 import { renderConsole } from './report/console.js';
 import { supportsColor } from './color.js';
 import { runGuard } from './guard/cli.js';
+import { runPricingWatch } from './pricing-watch/cli.js';
 import { parsePriceFlags } from './price-flags.js';
+import { redactUrl } from './redact.js';
+import { isPlausibleQuotaPerUnit, QUOTA_PER_UNIT_MAX, QUOTA_PER_UNIT_MIN } from './pricing.js';
 import type { AuditReport, RunConfig } from './types.js';
 
 const HELP = `model-xray — audit OpenAI-compatible endpoints for fake or watered-down models
@@ -20,6 +23,9 @@ Usage:
   model-xray guard --base-url <url> [options]
       常驻监控：本地透明转发代理，逐请求监听真实流量（模型一致性/token 统计/余额滚动对账），
       异常即时告警并写 JSONL 审计日志；详见 model-xray guard --help。
+  model-xray pricing-watch --base-url <url> [options]
+      公示倍率看门狗：只读公开价接口（零模型消耗），按周期比对本地价格账本，
+      站点倍率被改动即告警；详见 model-xray pricing-watch --help。
 
 test Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
@@ -34,6 +40,12 @@ test Options:
   --price-input2 <n>        Claimed input price per 1M tokens above the tier threshold, must be > 0
   --price-output2 <n>       Claimed output price per 1M tokens above the tier threshold, must be > 0
   --price-cached-read2 <n>  Claimed cache-read price above the tier threshold, must be >= 0 (default: input2 price)
+  --group <name>            Site group name used to display group_ratio from the declared price table, e.g. default
+  --expect-model-ratio <n>  Your declared model_ratio (site public value at /api/pricing); mismatch > 5% fails the billing probe
+  --expect-completion-ratio <n>  Your declared completion_ratio; mismatch > 5% fails the billing probe
+  --quota-per-usd <n>       Quota units per $1 (new-api status.quota_per_unit); overrides /api/status, enables quota-unit reconciliation
+  --declared-price-page <path>  Price web page fallback when /api/pricing is unavailable: origin-relative path
+                            (e.g. /pricing) or same-origin absolute URL; scraped price is a low-trust hint, warn-only
   --retries <n>             Retries per request on 200 empty bodies, integer in [0, 3] (default: 1)
   --http-retries <n>        Retries per request on 408/409/429/5xx gateway rejections (not billed, safe to retry), integer in [0, 6] (default: 2)
                             注意：每次重试都会真实计费；默认重试 1 次以应对瞬时 5xx/空流，重试会令实测倍率判定作废（防重复计费污染）
@@ -56,7 +68,10 @@ test Options:
   --version                 Print version
 
 Notes:
-  价格为「每百万 tokens 的宣称价格」，核心输入/输出必须成对且为正数；缓存读可留空（按输入价），二档阶梯须同时提供阈值/二档输入/二档输出，二档缓存读留空按二档输入价。单位需与该站余额显示单位一致（美元/quota 均可），工具只算比值，不做单位换算。
+  价格为「每百万 tokens 的宣称价格」，核心输入/输出必须成对且为正数；缓存读可留空（按输入价），二档阶梯须同时提供阈值/二档输入/二档输出，二档缓存读留空按二档输入价。单位只需与该站余额显示单位一致，币种不限：直接照抄站方价目表上的数字，不要换算成另一种币种（会把倍率整体偏移一个汇率）。quota 单位余额由工具按 --quota-per-usd（或站点 /api/status 公示的 quota_per_unit）自行折算成计价单位后再与应缴额对账，缺换算率时该项保持 N/A 并给出原因。
+  计费审计会额外 GET 同源 /api/pricing 与 /api/status 读取站点公示倍率（免鉴权、绝不携带 API key）；站点未提供该接口时，若提供了 --price-* 会尝试抓取 --declared-price-page（或默认候选页）的网页价格作低信任参照（仅 warn 级提示，不产生 fail 判罚）；两者都不可得时明示「未核验金额/倍率」，不会伪造绝对值结论。
+  倍率漂移对照同时使用 --baseline 快照与本地价格账本快照（两者都存在时任一来源显著变化即告警并封顶 85，findings 逐项标注来源）；无 --baseline 时只对照本地账本。
+  账本按「主机+端口」归档：同一上游的反代路径别名（/v1 与 /relay/v1）共享同一账本与漂移历史，对照到不同路径的历史快照时以 info 披露。
   数值参数均按严格整数校验（不接受 "12abc"、前导空白等）；非法输入立即 exit 2 并给出正确示例。
   guard 子命令只读环境变量 MODEL_XRAY_KEY 作为密钥，且不提供 --key 旗标。
 
@@ -67,6 +82,10 @@ async function main(argv: string[]): Promise<number> {
   // guard 子命令顶层分流：guard 有专属参数集（--port 等），用独立 parseArgs，避免顶层严格解析误伤
   if (argv[0] === 'guard') {
     return runGuard(argv.slice(1));
+  }
+  // pricing-watch 同样有专属参数集（--interval 等），独立解析。
+  if (argv[0] === 'pricing-watch') {
+    return runPricingWatch(argv.slice(1));
   }
 
   let parsed;
@@ -90,6 +109,11 @@ async function main(argv: string[]): Promise<number> {
         'price-input2': { type: 'string' },
         'price-output2': { type: 'string' },
         'price-cached-read2': { type: 'string' },
+        group: { type: 'string' },
+        'expect-model-ratio': { type: 'string' },
+        'expect-completion-ratio': { type: 'string' },
+        'quota-per-usd': { type: 'string' },
+        'declared-price-page': { type: 'string' },
         baseline: { type: 'string' },
         'baseline-out': { type: 'string' },
         'token-reference': { type: 'string' },
@@ -123,7 +147,7 @@ async function main(argv: string[]): Promise<number> {
   }
   if (positionals[0] !== 'test') {
     console.error(
-      `未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..."（一次性审计）或 "model-xray guard ..."（常驻监控），或 --help。`,
+      `未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..."（一次性审计）、"model-xray guard ..."（常驻监控）或 "model-xray pricing-watch ..."（公示倍率看门狗），或 --help。`,
     );
     return 2;
   }
@@ -140,7 +164,8 @@ async function main(argv: string[]): Promise<number> {
   try {
     new URL(baseUrl);
   } catch {
-    console.error(`--base-url 不是合法 URL：${baseUrl}`);
+    // 回显前脱敏：非法 URL 里也可能有 user:pass@，直接打印等于把凭据写进终端日志。
+    console.error(`--base-url 不是合法 URL：${redactUrl(baseUrl)}`);
     console.error('示例：--base-url https://relay.example.com/v1（通常以 /v1 结尾）');
     return 2;
   }
@@ -191,6 +216,46 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
   const price = priceFlags.price;
+
+  // --group：站点分组名（new-api group 参数），仅用于挑选公示价格表里的 group_ratio 做展示对比
+  const group = values.group !== undefined ? values.group.trim() : null;
+  if (group !== null && group === '') {
+    console.error('--group 不能为空字符串。示例：--group default');
+    return 2;
+  }
+  let expectModelRatio: number | null = null;
+  if (values['expect-model-ratio'] !== undefined) {
+    expectModelRatio = strictPositiveNumber(values['expect-model-ratio'], 'expect-model-ratio', '1.5');
+    if (expectModelRatio === null) return 2;
+  }
+  let expectCompletionRatio: number | null = null;
+  if (values['expect-completion-ratio'] !== undefined) {
+    expectCompletionRatio = strictPositiveNumber(values['expect-completion-ratio'], 'expect-completion-ratio', '4');
+    if (expectCompletionRatio === null) return 2;
+  }
+  let quotaPerUsd: number | null = null;
+  if (values['quota-per-usd'] !== undefined) {
+    quotaPerUsd = strictPositiveNumber(values['quota-per-usd'], 'quota-per-usd', '500000');
+    if (quotaPerUsd === null) return 2;
+    // 与站点公示口径同一有效域（1~1e12）：用户覆盖值若落在域外，会与「站点公示值被作废」产生两种结论。
+    if (!isPlausibleQuotaPerUnit(quotaPerUsd)) {
+      console.error(
+        `--quota-per-usd 必须是 ${QUOTA_PER_UNIT_MIN}~${QUOTA_PER_UNIT_MAX} 之间的数（每 1 美元对应的 quota 单位数）。收到：${quotaPerUsd}。示例：--quota-per-usd 500000`,
+      );
+      return 2;
+    }
+  }
+  // --declared-price-page：/api/pricing 不可用时的网页价格兜底页（同源相对路径或同源绝对 URL）；
+  // 同源与协议校验在 pricing-scrape 内 fail-closed（不符契约报 not_applicable，不会带 key 发请求）。
+  const declaredPricePageRaw = values['declared-price-page'];
+  let declaredPricePage: string | null = null;
+  if (declaredPricePageRaw !== undefined) {
+    declaredPricePage = declaredPricePageRaw.trim();
+    if (declaredPricePage === '') {
+      console.error('--declared-price-page 不能为空字符串。示例：--declared-price-page /pricing');
+      return 2;
+    }
+  }
 
   // --context-budget-usd fail-fast：须为有限正数，且必须与 --price-input/--price-output 成对提供
   // （预算单位与价格一致，逐请求按「估算输入×输入价+输出预算×输出价」预扣）。
@@ -301,6 +366,11 @@ async function main(argv: string[]): Promise<number> {
     priceInput2: price?.input2 ?? null,
     priceOutput2: price?.output2 ?? null,
     priceCachedRead2: price?.cachedRead2 ?? null,
+    group,
+    expectModelRatio,
+    expectCompletionRatio,
+    quotaPerUsd,
+    declaredPricePage,
     baselineIn: values.baseline ?? null,
     baselineOut: values['baseline-out'] ?? null,
     tokenReference,
@@ -474,6 +544,19 @@ export function strictInt(raw: string, min: number, max: number, name: string, e
   if (!/^[+-]?\d+$/.test(raw)) return fail();
   const value = Number(raw);
   if (!Number.isSafeInteger(value) || value < min || value > max) return fail();
+  return value;
+}
+
+/** 严格正数解析（倍率 / quota 换算率，允许小数与科学计数）：拒绝 NaN、0、负数与尾部垃圾字符。 */
+export function strictPositiveNumber(raw: string, name: string, example: string): number | null {
+  const fail = (): null => {
+    console.error(`--${name} 必须为正数。收到：${JSON.stringify(raw)}。`);
+    console.error(`示例：--${name} ${example}`);
+    return null;
+  };
+  if (!/^\+?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?$/.test(raw)) return fail();
+  const value = Number(raw);
+  if (!Number.isFinite(value) || value <= 0) return fail();
   return value;
 }
 
