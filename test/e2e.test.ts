@@ -170,7 +170,8 @@ test('e2e silently truncating endpoint fails context probe (deep)', async () => 
     const headline = headlineOf(report, 'context');
     assert.ok(/截断|回显|窗口不实/.test(headline), headline);
     assert.ok(report.total !== null && report.total <= 45);
-    assert.equal(report.overall, 'fail');
+    // 上下文 fail 只压分数（硬红线封顶）：整体不通过仅由计费/身份实锤触发 → 内部 warn，展示层只出分数
+    assert.equal(report.overall, 'warn');
   } finally {
     mock.server.close();
   }
@@ -946,7 +947,7 @@ test('cli: honest audit without price/balance still concludes on usage (exit 0, 
     assert.ok(billing);
     assert.equal(billing.status, 'ok');
     assert.equal(billing.score, 85);
-    assert.match(billing.headline, /未做绝对对账/);
+    assert.match(billing.headline, /未与外部硬证据比对/);
     assert.notEqual(report.total, null);
   } finally {
     mock.server.close();

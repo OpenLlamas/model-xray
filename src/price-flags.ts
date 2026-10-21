@@ -28,11 +28,11 @@ function parsePositive(values: PriceFlagValues, name: PriceFlagName, example: st
   const raw = values[name];
   if (raw === undefined) return { value: null, error: null };
   if (!DECIMAL.test(raw)) {
-    return { value: null, error: invalid(name, raw, '必须为正数（每百万 tokens 宣称价格，0 与负数无效）', example).error };
+    return { value: null, error: invalid(name, raw, '必须为正数（每百万 tokens 录入价，0 与负数无效）', example).error };
   }
   const value = Number(raw);
   if (!Number.isFinite(value) || value <= 0) {
-    return { value: null, error: invalid(name, raw, '必须为正数（每百万 tokens 宣称价格，0 与负数无效）', example).error };
+    return { value: null, error: invalid(name, raw, '必须为正数（每百万 tokens 录入价，0 与负数无效）', example).error };
   }
   return { value, error: null };
 }

@@ -1042,7 +1042,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 「身份探针未见异常」与 warn finding——既自相矛盾，也会误导人工复核。
   if (level === 'warn' && headline === '身份探针未见异常') {
     const warnCount = findings.filter((f) => f.level === 'warn').length;
-    headline = `身份探针存在 ${warnCount} 项可疑信号（未达定罪线，见明细）`;
+    headline = `身份探针存在 ${warnCount} 项未达实锤标准的信号（见明细）`;
   }
   return { id: 'identity', status: 'ok', score, level, headline, findings, metrics };
 }

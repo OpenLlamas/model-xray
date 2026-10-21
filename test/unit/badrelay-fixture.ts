@@ -15,7 +15,7 @@
  * - persona-inject  → identity warn 80（人格污染，不足以定论）；
  * - 组合（usage-scale×relabel×truncate）→ billing pass 85（截断抵消了输出侧 ratio 信号的
  *   真实遮蔽：正文被截 7000 后 visible 下降，ratio 0.733 落入正常带；shape-only 契约下不定论，
- *   但必须披露「全量等比缩放不可见 + 未做绝对对账」——测试断言披露存在，不是默认无监督放行）、
+ *   但必须披露「全量等比缩放不可见 + 未与外部硬证据比对」——测试断言披露存在，不是默认无监督放行）、
  *   identity fail、context warn。
  */
 import { runAudit } from '../../src/runner.js';

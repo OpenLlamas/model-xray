@@ -1,5 +1,5 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome } from '../types.js';
-import { levelLabel, statusTag } from '../scoring.js';
+import { statusTag, verdictLabel } from '../scoring.js';
 import { colorize } from '../color.js';
 import { collectAnomalies } from './summary.js';
 import { billingSummaryRows } from './markdown.js';
@@ -35,8 +35,8 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
   }
 
   lines.push('');
-  // 倍率摘要：终端输出也要一眼看到「价格倍率 / 实测倍率 / 金额核验状态」，否则用户只看到
-  // "usage 计数核验通过" 这类文字，看不到任何倍率数字。
+  // 倍率摘要：终端输出也要一眼看到「你填的单价÷站点现价 / 实扣倍率 / 金额核验状态」，
+  // 否则用户只看到 "token 计数核验通过" 这类文字，看不到任何倍率数字。
   const billing = report.outcomes.find((outcome) => outcome.id === 'billing');
   if (billing !== undefined) {
     const values = new Map(billingSummaryRows(billing.metrics).map(([key, , value]) => [key, value]));
@@ -47,6 +47,7 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
       measured !== undefined ||
       declaredModel !== undefined ||
       declaredCompletion !== undefined ||
+      values.has('claimed_price_ratio_input') ||
       values.has('public_price_ratio_input') ||
       values.has('expected_cost_usd_declared')
     ) {
@@ -56,6 +57,16 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
         return Number.isFinite(parsed) ? `${Math.round(parsed * 1000) / 1000}×` : null;
       };
       const measuredText = fmtRatio(measured);
+      const claimedInValue = values.get('claimed_price_ratio_input');
+      const claimedOutValue = values.get('claimed_price_ratio_output');
+      const claimedIn = fmtRatio(claimedInValue);
+      const claimedOut = fmtRatio(claimedOutValue);
+      const claimedEqual =
+        claimedIn !== null &&
+        claimedOut !== null &&
+        Number.isFinite(Number(claimedInValue)) &&
+        Number.isFinite(Number(claimedOutValue)) &&
+        Math.abs(Number(claimedInValue) - Number(claimedOutValue)) < 1e-9;
       const listInValue = values.get('public_price_ratio_input');
       const listOutValue = values.get('public_price_ratio_output');
       const listIn = fmtRatio(listInValue);
@@ -66,17 +77,47 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
         Number.isFinite(Number(listInValue)) &&
         Number.isFinite(Number(listOutValue)) &&
         Math.abs(Number(listInValue) - Number(listOutValue)) < 1e-9;
+      const pairText = (
+        input: string | null,
+        output: string | null,
+        equal: boolean,
+        equalNote = '输入/输出一致',
+        note = '',
+      ): string => {
+        if (equal) return `${input}（${equalNote}）`;
+        const text = `输入 ${input ?? '-'} / 输出 ${output ?? '-'}`;
+        return note !== '' ? `${text}（${note}）` : text;
+      };
       let ratioText: string;
       if (measuredText !== null) {
-        ratioText = `实测 ${measuredText}`;
+        ratioText = `实扣倍率 ${measuredText}`;
+      } else if (claimedIn !== null || claimedOut !== null) {
+        // 用户直觉里的倍率：录入价 ÷ 官方公示价。用户与官方一致时应为 1×。
+        // 列表价折扣是另一个口径（站内促销），只作为附注，不能抢主位。
+        // 只比两张价目表，不含实收证据，必须显式标「未看实扣」。
+        ratioText = `你填的单价÷站点现价 ${pairText(
+          claimedIn,
+          claimedOut,
+          claimedEqual,
+          '输入/输出一致；只比价目，未看实扣',
+          '只比价目，未看实扣',
+        )}`;
+        if (listIn !== null || listOut !== null) {
+          ratioText += ` · 站点现价÷官方列表价 ${pairText(listIn, listOut, listEqual, '输入/输出一致，仅披露', '仅披露')}`;
+        }
+        if (measured !== undefined) ratioText += ' · 实际扣款未核对';
       } else if (listIn !== null || listOut !== null) {
-        // 价格核验模式（缺省）直接用公示价/列表价倍率；显式余额对账模式下才附加「实收未实测」。
-        const listText = listEqual
-          ? `${listIn}（输入/输出一致；公示价÷列表价）`
-          : `输入 ${listIn ?? '-'} / 输出 ${listOut ?? '-'}（公示价÷列表价）`;
-        ratioText = measured !== undefined ? `列表价 ${listText} · 实收未实测` : listText;
+        // 没有宣称价可比时才退回列表价折扣，并明确它不代表计费倍率。
+        ratioText = `站点现价÷官方列表价 ${pairText(
+          listIn,
+          listOut,
+          listEqual,
+          '输入/输出一致；站点现价÷官方列表价，仅披露',
+          '站点现价÷官方列表价，仅披露',
+        )}`;
+        if (measured !== undefined) ratioText += ' · 实际扣款未核对';
       } else {
-        ratioText = measured !== undefined ? `实测 ${measured ?? '-'}` : '不可得（无列表价）';
+        ratioText = measured !== undefined ? `实扣 ${measured ?? '-'}` : '不可得（缺录入价或站点现价）';
       }
       const totalCostRaw = values.get('expected_cost_usd_declared');
       const totalCost =
@@ -86,7 +127,7 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
       const costText =
         totalCost === null
           ? null
-          : `计费探针费用 $${Math.round(totalCost * 1000) / 1000}（按公示价估算${
+          : `本轮测试按价目应扣 $${Math.round(totalCost * 1000) / 1000}（估算${
               values.get('cost_is_upper_bound') === '1' ? '，上界' : ''
             }）`;
       const lineParts = [`倍率: ${ratioText}`];
@@ -112,14 +153,18 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
   lines.push('='.repeat(56));
   if (report.total === null) {
     const reason =
-      report.overall === 'fail'
-        ? '存在失败项，结论：不通过'
-        : report.overall === 'warn'
-          ? '存在可疑项，结论：可疑'
-          : '证据不足，无法得出结论';
+      verdictLabel(report.overall) === '不通过'
+        ? '存在乱收费/换壳实锤（计费或身份维度不通过），结论：不通过'
+        : '证据不足，无法得出结论';
     lines.push(`可信度总分 未判定 — ${reason}`);
   } else {
-    lines.push(colorize(`可信度总分 ${report.total}/100 — ${levelLabel(report.overall)}`, report.overall, color));
+    const verdict = verdictLabel(report.overall);
+    lines.push(
+      verdict === null
+        ? // 非实锤不设结论档：只展示分数（「可疑」结论档已移除）
+          `可信度总分 ${report.total}/100`
+        : colorize(`可信度总分 ${report.total}/100 — ${verdict}`, report.overall, color),
+    );
   }
   for (const note of report.notes) lines.push(`· ${note}`);
   lines.push('');

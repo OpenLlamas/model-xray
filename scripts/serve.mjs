@@ -753,6 +753,15 @@ export async function createConsoleServer(options = {}) {
       }
       args.push('--baseline', baseline);
     }
+    if (body.readBalance === true) {
+      // 余额对账（实扣倍率）依赖录入价算应缴分母：未填价格时 CLI 会静默忽略该开关，这里直接拦下避免「勾了却没生效」。
+      if (priceIn === '') {
+        throw new Error(
+          'read-balance 需要先填写价格（priceInput/priceOutput）：实扣倍率 = 实际扣费 ÷（录入价×自报 usage），没有录入价就算不出应缴分母。示例：priceInput=2.5, priceOutput=10',
+        );
+      }
+      args.push('--read-balance');
+    }
     if (body.deep === true) args.push('--deep');
     if (body.dryRun === true) args.push('--dry-run');
     else args.push('--yes');

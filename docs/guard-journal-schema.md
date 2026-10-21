@@ -41,7 +41,7 @@ guard 的审计日志为 JSONL（每行一个 JSON 对象），文件名随运�
 
 ### verdict 语义
 
-- `ok` / `warn` / `fail`：实测倍率分级（gradeRatio：|ratio-1| 同时超绝对 0.05 与相对 0.2 → warn；ratio > 1.5 → fail）。
+- `ok` / `warn` / `fail`：实扣倍率分级（gradeRatio：|ratio-1| 同时超绝对 0.05 与相对 0.2 → warn；ratio > 1.5 → fail）。
 - `skipped`：证据不足（余额不可得 / 不同源 / 单位口径无法校准 / 窗口无有效 usage / 分母不完整 / 计算越界 / NaN 差值）。
 - `skipped_recharge`：窗口内余额上升超过读数最小刻度（`spendDelta < -max(resolution)`），疑充值/退款混入——不出 ratio。
 

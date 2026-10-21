@@ -149,7 +149,7 @@ export function calibrateSpendDelta(args: CalibrateSpendDeltaArgs): CalibrationO
       resolution,
       confidence: null,
       hypotheses: [],
-      message: '无有效 usage 记录，无法估算应缴金额，实测倍率无法计算。',
+      message: '无有效 usage 记录，无法估算应缴金额，实扣倍率无法计算。',
     };
   }
   const candidates: CalibrationCandidate[] = [

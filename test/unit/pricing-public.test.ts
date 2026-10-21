@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
+import { gzipSync } from 'node:zlib';
 import { fetchPublicPricing } from '../../src/pricing-public.js';
 
 function closeTo(actual: number | null, expected: number, epsilon = 1e-12): boolean {
@@ -53,7 +54,8 @@ test('fetchPublicPricing: 字符串 USD 单价 → 倍率、原始价与元数�
       assert.equal(result.truncated, 0);
       assert.equal(result.unusable, 0);
       assert.equal(result.pricing?.source, 'public-json');
-      assert.equal(result.pricing?.quotaPerUnit, 500_000);
+      assert.equal(result.pricing?.quotaPerUnit, null);
+      assert.equal(result.pricing?.quotaPerUnitSource, 'none');
       const model = result.pricing?.models['glm-5.3-flash'];
       assert.ok(model);
       assert.ok(closeTo(model.modelRatio, 0.12));
@@ -326,6 +328,43 @@ test('fetchPublicPricing: 同源二次重定向 → failed（不无限跟随）'
       const result = await fetchPublicPricing(baseUrl, { timeoutMs: 1000 });
       assert.equal(result.state, 'failed');
       assert.match(result.reason ?? '', /重定向/);
+    },
+  );
+});
+
+test('fetchPublicPricing: 同源重定向 Location 含 userinfo → 不跟随', async () => {
+  const paths: string[] = [];
+  await withServer(
+    (req, res) => {
+      paths.push(req.url ?? '');
+      if (req.url === '/public/model-prices') {
+        res.writeHead(301, {
+          location: `http://user:secret@${req.headers.host ?? '127.0.0.1'}/public/model-prices/a`,
+        }).end();
+        return;
+      }
+      json(res, { items: [{ code: 'm', price_input_usd: '2', price_output_usd: '4' }] });
+    },
+    async (baseUrl) => {
+      const result = await fetchPublicPricing(baseUrl, { timeoutMs: 1000 });
+      assert.equal(result.state, 'failed');
+      assert.match(result.reason ?? '', /重定向/);
+      assert.deepEqual(paths, ['/public/model-prices']);
+    },
+  );
+});
+
+test('fetchPublicPricing: gzip 解压后超过 512KB → failed（按解压字节限流）', async () => {
+  const payload = gzipSync(Buffer.from('x'.repeat(512 * 1024 + 1)));
+  await withServer(
+    (_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json', 'content-encoding': 'gzip' });
+      res.end(payload);
+    },
+    async (baseUrl) => {
+      const result = await fetchPublicPricing(baseUrl, { timeoutMs: 5000 });
+      assert.equal(result.state, 'failed');
+      assert.match(result.reason ?? '', /超过上限/);
     },
   );
 });

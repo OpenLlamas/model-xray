@@ -344,7 +344,7 @@ test('guard e2e：换模型 → model_mismatch 告警（stderr + journal anomaly
 
 test('guard e2e：对账 k=1.3（可编程余额倍率）→ ratio≈1.3 verdict=warn', async () => {
   // mock usage 固定 {10,2,12}，价格 4000/5000 → 单请求成本 (10×4000+2×5000)/1e6=0.05，两请求 0.1；
-  // balanceRate=1.3 → 余额扣减 0.13 USD（整数美分 13），guard 实测倍率恰为 1.3 → DRIFT warn 档。
+  // balanceRate=1.3 → 余额扣减 0.13 USD（整数美分 13），guard 实扣倍率恰为 1.3 → DRIFT warn 档。
   const mock = await createMockServer({ mode: 'honest', balanceBase: 1000, balanceRate: 1.3, priceInput: 4000, priceOutput: 5000 });
   const port = await findFreePort();
   const outDir = makeTempDir('guard-e2e-k13-');

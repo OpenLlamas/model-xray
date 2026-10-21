@@ -145,6 +145,10 @@ test('serve.mjs：buildTestArgs 透传公示价锚点四参数（倍率/quota �
   assert.ok(region.includes('/["\\u0000-\\u001f]/'), '兜底页缺双引号/控制字符拒绝（控制台渲染的命令会被终端引用规则破坏）');
   assert.ok(region.includes('declared-price-page 必须与 baseUrl 同源'), '兜底页缺跨域提前拦截（否则用户只看到 not_applicable）');
   assert.ok(!region.includes('--group'), '控制台未登记 --group（未在表单暴露的 flag 不得偷偷透传）');
+  // 余额对账 opt-in：勾选后透传 --read-balance；未填价格时必须 400（CLI 会静默忽略缺价格的余额对账）。
+  assert.ok(region.includes('body.readBalance'), 'buildTestArgs 未读取 body.readBalance（勾选余额对账不会生效）');
+  assert.ok(region.includes("'--read-balance'"), 'buildTestArgs 未透传 --read-balance');
+  assert.ok(region.includes('read-balance 需要先填写价格'), 'readBalance 缺「未填价格」前置校验（会出现勾了却无实扣倍率的静默失效）');
 });
 
 test('serve.mjs：WebUI 任务启用逐请求进度，且 /log 下发 startedAt（运行中状态条依赖）', () => {

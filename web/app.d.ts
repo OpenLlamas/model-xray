@@ -22,6 +22,8 @@ export interface BuildCommandInput {
   expectCompletionRatio?: string;
   quotaPerUsd?: string;
   declaredPricePage?: string;
+  /** 余额对账（实扣倍率）opt-in：必须与 priceInput/priceOutput 同时填写，否则 buildCommand 报错。 */
+  readBalance?: boolean;
   seed: string;
   timeout: string;
   /** 429/5xx 网关拒绝的重试预算（0-6，空串=CLI 默认 2）。 */

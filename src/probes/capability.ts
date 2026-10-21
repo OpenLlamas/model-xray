@@ -296,7 +296,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   }
   findings.push({
     level: 'warn',
-    message: `vision 可疑：${detail}（8 色随机，全部正确且无失败才通过；部分错误按部分证据处理）。`,
+    message: `vision 未全对：${detail}（8 色随机，全部正确且无失败才通过；部分错误按部分证据处理）。`,
     evidenceIds,
   });
   return { state: 'partial' };

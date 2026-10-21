@@ -103,22 +103,24 @@ test('non-finite scores (NaN/Infinity) are unscorable, never washed into the log
   assert.ok(result.notes.some((n) => n.includes('identity') && n.includes('context')), JSON.stringify(result.notes));
 });
 
-test('fewer than 2 scorable entries: total stays null, overall follows worst observed level', () => {
+test('fewer than 2 scorable entries: total stays null, unknown unless billing/identity hard fail', () => {
   const singlePass = computeTotal([outcome('identity', 100)]);
   assert.equal(singlePass.total, null);
   assert.equal(singlePass.overall, 'unknown');
 
+  // warn 不再作为结论档派生（无总分且无实锤 → 一律 unknown，展示层只给分数）
   const singleWarn = computeTotal([outcome('identity', 70)]);
   assert.equal(singleWarn.total, null);
-  assert.equal(singleWarn.overall, 'warn');
+  assert.equal(singleWarn.overall, 'unknown');
 
+  // 身份维度 fail（明显换壳）= 实锤：即使无总分也判不通过
   const singleFail = computeTotal([outcome('identity', 10)]);
   assert.equal(singleFail.total, null);
   assert.equal(singleFail.overall, 'fail');
   assert.ok(singleFail.notes.some((n) => n.includes('可评分项不足')));
 });
 
-// ---------- capability 被证伪罚（fail 级 finding → 总分上限 60 + overall fail） ----------
+// ---------- capability 被证伪罚（fail 级 finding → 总分上限 60，只压分数不触发不通过） ----------
 
 /** capability outcome 携带指定级别 finding（其余探针默认满分）。 */
 function withCapabilityFinding(level: 'warn' | 'fail', score: number): ProbeOutcome[] {
@@ -128,17 +130,18 @@ function withCapabilityFinding(level: 'warn' | 'fail', score: number): ProbeOutc
     outcome('billing', 100),
     {
       ...outcome('capability', score),
-      findings: [{ level, message: 'vision 可疑：仅 2/3 次识别正确', evidenceIds: [] }],
+      findings: [{ level, message: 'vision 未全对：仅 2/3 次识别正确', evidenceIds: [] }],
     },
     outcome('quality', 100),
     outcome('ttft', null, 'insufficient'),
   ];
 }
 
-test('capability with a fail finding caps total at 60 and forces overall fail', () => {
+test('capability with a fail finding caps total at 60 (score-only, no overall fail)', () => {
   const result = computeTotal(withCapabilityFinding('fail', 100));
   assert.ok(result.total !== null && result.total <= 60, `total=${result.total}`);
-  assert.equal(result.overall, 'fail');
+  // 计费/身份均 pass：证伪只封顶分数，不触发整体不通过（60 < 75 → 内部 warn，展示层只出分数）
+  assert.equal(result.overall, 'warn');
   assert.ok(result.notes.some((n) => n.includes('标称能力被证伪') && n.includes('60')), JSON.stringify(result.notes));
 });
 
@@ -163,10 +166,10 @@ test('capability falsified penalty takes min with existing low scores (never rai
     outcome('ttft', null, 'insufficient'),
   ]);
   assert.ok(result.total !== null && result.total < 60, `total=${result.total}`);
-  assert.equal(result.overall, 'fail');
+  assert.equal(result.overall, 'warn');
 });
 
-test('capability fail finding forces fail even when total is already capped by hard red', () => {
+test('billing hard fail forces overall fail even when total is already capped by hard red', () => {
   const result = computeTotal([
     outcome('identity', 100),
     outcome('context', 100),
@@ -180,7 +183,74 @@ test('capability fail finding forces fail even when total is already capped by h
   ]);
   // 硬红线 45 与 capability 证伪 60 并列取 min → 45
   assert.equal(result.total, 45);
+  // 计费维度 fail（乱收费实锤）→ 整体不通过
   assert.equal(result.overall, 'fail');
+});
+
+// ---------- 整体不通过的唯一触发面：计费/身份维度 fail（乱收费/明显换壳） ----------
+
+test('non-billing/non-identity dim fails (context/quality) stay score-only, never overall fail', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 30),
+    outcome('billing', 100),
+    outcome('capability', 100),
+    outcome('quality', 10),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  // 上下文/质量双双跌破 40 → 硬红线封顶 45，但不通过不触发（仅计费/身份实锤触发）
+  assert.ok(result.total !== null && result.total <= 45, `total=${result.total}`);
+  assert.equal(result.overall, 'warn');
+});
+
+test('identity hard fail (明显换壳) forces overall fail', () => {
+  const result = computeTotal([
+    outcome('identity', 0),
+    outcome('context', 100),
+    outcome('billing', 100),
+    outcome('capability', 100),
+    outcome('quality', 100),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  assert.equal(result.overall, 'fail');
+});
+
+// ---------- 实锤封顶：定罪维度不保留及格分 ----------
+
+test('实锤 fail 维度分项分与总分均封顶 45（换芯实锤时 billing 残余 70 → 45）', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    // 真机口径：换芯回显 fail 由 billing.ts 封顶 PRICING_FAILED_SCORE=70，档位 fail；
+    // 70 是及格分，违反「定罪维度不保留及格分」的常理，必须在聚合层压到 45。
+    { ...outcome('billing', 70), level: 'fail' as const },
+    outcome('capability', 100),
+    outcome('quality', 100),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  const billing = result.scores.find((s) => s.id === 'billing');
+  assert.equal(billing?.level, 'fail');
+  assert.equal(billing?.score, 45, `定罪维度分项分必须封顶 45，实得 ${billing?.score}`);
+  assert.equal(result.total, 45, `hardFail 时总分同样封顶 45（不通过不得配及格区总分），实得 ${result.total}`);
+  assert.equal(result.overall, 'fail');
+  assert.ok(result.notes.some((n) => n.includes('实锤封顶')), JSON.stringify(result.notes));
+  assert.ok(result.notes.some((n) => n.includes('可信度总分上限 45')), JSON.stringify(result.notes));
+});
+
+test('非实锤维度 fail（context/quality）不受实锤总分封顶影响（硬红线 45 照旧）', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 30),
+    outcome('billing', 100),
+    outcome('capability', 100),
+    outcome('quality', 10),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  // context/quality 已跌破 40：分项分本身 ≤45 不触发封顶，总分走硬红线 45（非 hardFail 路径）；
+  // 几何聚合实值 43 < 45，封顶取 min 不抬分
+  assert.ok(result.total !== null && result.total <= 45, `total=${result.total}`);
+  assert.equal(result.overall, 'warn');
+  assert.ok(!result.notes.some((n) => n.includes('可信度总分上限 45')), JSON.stringify(result.notes));
 });
 
 // ---------- 覆盖率门槛：核心维度不可测 / 覆盖不足时不得出总分 ----------
@@ -197,7 +267,8 @@ test('核心维度 quality 未判定时总分不出（billing+identity 高分不
     { claimedContext: false, expectedCapabilities: [] },
   );
   assert.equal(result.total, null, '真机实证：quality 全空 + billing 100 曾报 96，必须改为未判定');
-  assert.equal(result.overall, 'warn');
+  // warn 不再作为结论档：无总分且无计费/身份实锤 → 一律 unknown（展示层只给分数）
+  assert.equal(result.overall, 'unknown');
   assert.ok(result.notes.some((n) => n.includes('核心维度 quality')), JSON.stringify(result.notes));
 });
 

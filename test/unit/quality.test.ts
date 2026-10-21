@@ -398,7 +398,7 @@ test('quality scoring: 8/12 correct → warn 67 with wrong-topic list', async ()
   const outcome = await probeQuality(qualityCtx(client));
   assert.equal(outcome.level, 'warn');
   assert.equal(outcome.score, 67);
-  assert.match(outcome.headline, /质量可疑：首答 8\/12，错误集中在/);
+  assert.match(outcome.headline, /质量未达通过线：首答 8\/12，错误集中在/);
 });
 
 test('quality scoring: accuracy carries a 95% Wilson CI disclosure (metrics + info finding, thresholds unchanged)', async () => {

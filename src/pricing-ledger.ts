@@ -261,13 +261,20 @@ function parseLedgerLine(line: string): PricingLedgerEntry | null {
   const quotaSourceRaw = record['quotaPerUnitSource'];
   const quotaPerUnitSource =
     quotaSourceRaw === 'site' || quotaSourceRaw === 'cli' || quotaSourceRaw === 'none' ? quotaSourceRaw : undefined;
+  // 旧版公开价表路径曾把标准基价 500000 写进账本；来源不是 site/cli 时按未知清洗，
+  // 避免历史条目被当成站点真实 quota 参与漂移/金额换算。
+  const legacyPublicSyntheticQuota =
+    source === 'public-json' &&
+    quotaParsed === 500_000 &&
+    quotaPerUnitSource !== 'site' &&
+    quotaPerUnitSource !== 'cli';
   return {
     schemaVersion: PRICING_LEDGER_SCHEMA,
     origin,
     capturedAt,
     ...(source !== undefined ? { source } : {}),
     model,
-    quotaPerUnit: quotaParsed !== null && quotaParsed > 0 ? quotaParsed : null,
+    quotaPerUnit: legacyPublicSyntheticQuota ? null : quotaParsed !== null && quotaParsed > 0 ? quotaParsed : null,
     ...(quotaPerUnitSource !== undefined ? { quotaPerUnitSource } : {}),
     group: typeof groupRaw === 'string' && groupRaw !== '' ? groupRaw : null,
     models,

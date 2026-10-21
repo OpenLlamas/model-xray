@@ -96,7 +96,7 @@ export interface ChatRequest {
   tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
   /**
    * 内部开关：本次请求是否允许 client 在 HTTP 200 空正文时重试（默认 true）。
-   * billing 置 false：空响应已带 usage，重发只会重复计 prompt 并污染实测倍率。
+   * billing 置 false：空响应已带 usage，重发只会重复计 prompt 并污染实扣倍率。
    * 该字段仅用于本地重试决策，不会序列化进上游请求体。
    */
   retryEmpty?: boolean;
@@ -283,7 +283,7 @@ export interface RunConfig {
   /** 宣称价格（每百万 tokens）；启用价格核验与公示价倍率，不读取账户余额 */
   priceInput?: number | null;
   priceOutput?: number | null;
-  /** 库内显式开启余额前后对账（实测倍率）；CLI 不暴露此开关，缺省 false：只按公示价折算，不读余额 */
+  /** 余额前后对账（实扣倍率 = 实际扣费 ÷ 应缴金额）显式 opt-in；缺省 false：只按公示价折算，不读余额 */
   readBalance?: boolean;
   /** 缓存读命中价（缺省 = 按输入价）；二档阶梯：prompt > priceThreshold 时整单按二档价 */
   priceCachedRead?: number | null;

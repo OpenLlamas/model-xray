@@ -1,301 +1,38 @@
 # model-xray
 
-**X-ray your LLM endpoints. One command, one report.**
+**给 LLM 中转站拍 X 光：一条命令，一份报告，真伪立见。**
 
-`model-xray` is an open CLI that audits OpenAI-compatible LLM endpoints for **fake or watered-down models** — relabeled models, quietly shortened context, padded token billing, inflated latency. It never asks you to trust a vendor's word: it probes the endpoint empirically and produces a shareable red/green report.
+`model-xray` 是一个开源 CLI，用实证手段检测兼容 OpenAI 协议的 LLM 接入点是否存在**模型真伪 / 掺水**问题（换壳、降智、截断上下文、虚标 token 计数等中转站常见套路）。它不要求你相信任何厂商的话：直接探测端点行为，产出可分享的红绿报告（`.md` 看结论、`.html` 浏览器打开、`.json` 存原始证据）。
 
-[English](#english) | [中文](#中文)
+[中文](#中文) | [English](#english) | [完整文档（全部参数、边界、案例细节）](docs/README-detailed.md)
 
 ---
 
-## English
-
-### Quick start: web console, 3 steps (recommended)
-
-Form-driven and visual — nothing to memorize, nothing to mis-type. Requires **Node.js ≥ 22** (`node --version` to check).
-
-```bash
-git clone https://github.com/OpenLlamas/model-xray.git
-cd model-xray
-npm install
-npm run build
-npm run ui       # auto-opens http://127.0.0.1:8620 (loopback only)
-```
-
-In the page's **One-shot test** tab:
-
-1. **Paste** the station's base URL and model name.
-2. **Tick** what the station claims — capabilities (vision / tool calls / reasoning), claimed context window, claimed prices (enter prices only if you want the cost/rate checks; the more you declare, the deeper the probes run).
-3. **Paste** your API key into the key bar (kept in the local server process only, never echoed) and click **Start**: the CLI runs locally, the log streams live, and the scorecard renders in place.
-
-Reports land in `reports/` as `report-<model>-<YYYY-MM-DD_HH-mm-ss>` (local time) in three formats: `.md` (read this one), `.html` (open in a browser), `.json` (raw evidence). A full run typically costs a cent or two. This path needs no `npm link` and no environment variable.
-
-### CLI usage (optional)
-
-Prefer the terminal:
-
-- **Interactive wizard** (`npm run ask`, Windows): it asks for the endpoint / model / key, previews with a dry-run, confirms, then runs and prints the report path.
-- **Bare command** — set your API key once (`test` and `guard` both read it; the key never enters the command line or shell history):
-
-```powershell
-# PowerShell
-$env:MODEL_XRAY_KEY = 'sk-your-key'
-```
-
-```bash
-# bash / zsh
-export MODEL_XRAY_KEY='sk-your-key'
-```
-
-```bash
-model-xray test \
-  --base-url https://your-relay.example.com/v1 \
-  --model gpt-4o \
-  --yes
-```
-
-`npm link` (optional, after `npm run build`) gives you the short `model-xray` command; if npm refuses due to permissions, replace `model-xray` with `node dist/src/cli.js` everywhere. Exit code: `0` pass/warn · `1` fail · `2` usage error or inconclusive run (no scorable conclusion).
-
-Know something about the station? Add it — unknown extras are simply skipped (the same fields are form fields in the web console):
-
-| You know | Add to the command |
-|---|---|
-| advertised context window (e.g. 128000) | `--claimed-context 128000` — enables the needle test |
-| advertised capabilities | `--expect vision,tool,thinking` (default `vision,tool`; use `--expect none` if none claimed) |
-| advertised price per 1M tokens | `--price-input 0.2 --price-output 0.7` — enables the measured-rate probe |
-| your group's public ratios | `--expect-model-ratio 1.5 --expect-completion-ratio 4` — anchors the declared ratios read from `/api/pricing` (a > 5% mismatch fails billing) |
-| a price page when `/api/pricing` is missing | `--declared-price-page /pricing` — same-origin path or same-origin absolute URL; the scraped price is a low-trust hint (warn-only, never a fail) |
-| a non-new-api station (no `/api/pricing`) | automatic: the probe falls back to the same-origin public price table (`/public/model-prices`, then `/public/models`) and anchors the declared USD prices; this is a declared-price anchor, never proof of actual billing |
-
-Preview without spending: add `--dry-run` (it prints the planned requests and token estimate, sends nothing).
-
-**Re-audit later, or catch a silent model swap** — keep the `baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json` written by the first run and pass it back:
-
-```bash
-model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes \
-  --baseline reports/baseline-gpt-4o-2026-10-11_10-09-23.json
-```
-
-**Always-on monitoring (`guard`, CLI-only)** — a local transparent proxy that watches your real client traffic and scores it live (the console no longer starts or stops it):
-
-```powershell
-# 1) key via environment variable only (guard has no --key flag by design)
-$env:MODEL_XRAY_KEY = 'sk-your-key'
-# 2) start the proxy (listens on 127.0.0.1:8621 by default)
-model-xray guard --base-url https://your-relay.example.com/v1 `
-  --price-input 0.2 --price-output 0.7 --reconcile-minutes 15
-# 3) point your client at http://127.0.0.1:8621/v1
-#    with the client's API key set to the SAME value as MODEL_XRAY_KEY
-```
-
-What it scores per request is detailed in "Guard: local always-on monitor" below.
-
-**Free rate watch (`pricing-watch`, CLI-only)** — reads the station's public rate interfaces only (no model requests, no billing, no API key needed) and flags any silent markup change:
-
-```bash
-model-xray pricing-watch --base-url https://your-relay.example.com/v1            # watch every hour
-model-xray pricing-watch --base-url https://your-relay.example.com/v1 --once     # one shot
-model-xray pricing-watch --base-url https://your-relay.example.com/v1 --model gpt-4o --interval 600
-```
-
-### How to read the result
-
-- **Verdict** (also the exit code): 通过 pass (0) · 可疑 warn (0) · 不通过 fail (1) · usage error / 未得出结论 (2).
-- Dimensions without enough evidence are marked `N/A` and excluded from scoring — never counted as 0.
-- **Scoring**: a weighted geometric credibility total (0–100): billing 25 / quality 25 / identity 15 / context 15 / capability 10; TTFT is observation-only and never scored. Any dimension at `fail`, or a credibility total < 40 → overall fail. Billing / capability / context / quality below 40 hit a **hard red line** (credibility total capped at 45); a falsified capability (advertised capability measured wrong or explicitly refused) caps the credibility total at 60. Credibility total < 75 or any warn dimension → 可疑 (warn).
-- **Quality caliber (probeset v0.2.2+, metricVersion pass1)**: the primary metric is **pass@1** (first-answer accuracy) — a resample at temperature 0.7 is kept as evidence only ("main" = pass@1, "main_recovered" = two chances). A `fail` verdict additionally requires that the resample did NOT recover to the 0.6 line (first-answer collapse + resample still broken is solid evidence; a one-off first-answer miss is not). A whitewash pattern — first answer below 0.6 but rescued by the resample — is reported as warn with score capped at 80. Baseline carries `metricVersion: 'pass1'`; comparing against an older-caliber baseline skips the quality delta with a note (other dimensions still compare) — regenerate old baselines before comparing.
-- Every finding carries its evidence: per-request findings link the exact `evidenceIds`; aggregate verdict findings link all contributing sample `evidenceIds`.
-- **Run it more than once before concluding.** A single run can be skewed by transient endpoint anomalies (empty bodies / empty streams, 429/503 throttling, network hiccups) — failed samples leave dimensions `N/A` or force scoring via stream fallback. For any target that matters, run the audit 2–3 times (fixed `--seed` with `--baseline`/`--baseline-out` keeps the probeset comparable) and compare the reports. Intermittent failures usually indicate endpoint instability, not a model change.
-
-### What it checks
-
-| Check | What it does |
-|---|---|
-| Identity & fingerprint | 5 self-ID questions (8 in `--deep`, incl. 1 exact model-name-and-version question) + behavioral fingerprints catch relabeled/guardrail-swapped models (e.g.自称 Claude 却答 "我是 GLM"); a "brand name + assistant" persona in self-description (e.g. "I am NovaRelay assistant") → warn with score capped at 80; same family but a different variant suffix (claimed `glm-5.3`, self-reports `glm-5.3-flash`) → variant conflict, warn capped at 80; different family → fail 0 |
-| Context length (needle test) | Bursts needles at claim-depth to verify the advertised window is real, not truncated silently; endpoint-reported `prompt_tokens` is cross-checked against the actually-sent volume, and a pass whose usage cannot be calibrated is downgraded to undetermined. Depths run from deepest to shallowest; when the 90% tier gets ≥2 valid needle samples, all hit, usage calibrates and the tier is clean, shallower depths are early-stopped and disclosed (not counted as missing). With `--context-samples ≥2` this saves ~75% of the needle volume |
-| Token counting | Runs a within-run linearity regression of endpoint-reported `prompt_tokens` against a conservative local estimate (not an official tokenizer) and checks `completion_tokens` for hard contradictions (non-empty body reported as 0, or a count above the request's `max_tokens`). The output side is additionally cross-checked in total: Σ(visible completion = completion − reasoning_tokens, `finish=stop` only) ÷ Σ(local estimate of the body) above 1.35 → suspected output-token inflation, warn capped at 70; below 0.6 → informational only. A nonzero constant offset in the regression (finite r²≥0.9, intercept above 120 tokens) is also suspected inflation → warn. Linear shape alone is **not** a pass: without an absolute cross-check (`--token-reference` or the measured-rate check) the dimension is reported as *undetermined* — no score, no total — because uniform rescaling or a constant offset is invisible to the regression. Partial/failed samples, potentially-billed retries (not gateway-rejected 429/503, which never entered inference and are usually not billed), and completion anomalies cap the score at 70 instead of passing |
-| Measured rate (balance delta) | Snapshots the billing balance before/after the billing series. Both snapshots are **stabilized** — re-reads until two consecutive readings agree — and the pre-series snapshot must be stable on the **first comparison**: unsettled charges from before the window would land inside Δ and smear an honest station into a false overcharge verdict, so a still-moving pre-snapshot voids the ratio (non-attributable, info — never a fail). new-api style stations are supported: `GET /api/usage/token` (Bearer; key-level `total_used`/`total_available`) for the balance and `GET /api/status` (`quota_per_unit`) to calibrate the unit — calibration that is unreachable does not count for or against the score; a `baseUrl` ending in `/v1` is stripped automatically for console APIs. one-api style `/api/user/self` (user-level quota) is also calibrated into the station's pricing unit when `/api/status` is reachable, but a **user-level source can never produce a fail verdict** — other keys of the same user share the balance, so >1.5× readings are reported as warn with the underlying fail recorded in `metrics.ratio_masked_verdict` (definitive fails require a key-level source). Δspend ÷ expected cost (claimed price × self-reported usage) reveals the real multiplier behind "cheap" sticker prices. Rate > 1.5 → fail; (1.1, 1.5] or [0.5, 0.8) → warn; [0.8, 1.1] → consistent. A spend or Δ below 3× the balance's smallest step is N/A — when the expected cost alone is below that floor, the audit **auto-tops-up** with up to 8 extra large-prompt samples (budget-capped at 3× the target cost, skipped entirely if even 8 samples cannot reach the floor, stopped on the first unattributable event) to lift Δ into the measurable range instead of giving up. A ratio >10 cannot be attributed to this window (shared-account traffic/unit mismatch) and is reported as unverifiable, not a fail. Any potentially-billed retry (408/409/5xx/timeout after the first attempt — gateway-rejected 429/503 retries are exempt) or failed request inside the window voids the ratio. The numbers are surfaced in a dedicated **Ratio & billing** block (console scorecard, Markdown/HTML report, terminal summary): the station's declared input/output ratios, the measured ratio, the money-reconciliation state, and — when a ratio is unavailable — the exact reason (which balance endpoint failed, or that the station exposes no pricing API) |
-| Token-count reference (`--token-reference`) | Compares per-tier prompt_tokens against a prior audit report of the SAME model (same probeset version): ratio > 1.25 → fail (score capped 30); 1.1–1.25 or < 0.8 → warn (capped 70); 0.8–1.1 → ok — the only check that catches uniform usage rescaling (invisible to the regression). Limitations: prompt_tokens only; trust of the reference report is on you; fetching official token counts automatically is still missing (TODO) |
-| Fingerprint baseline | Saves/compares a versioned baseline (model family, quality, capability, billing slopes) across runs to catch silent model swaps |
-| Capability gates | vision / tool-calling / thinking flags actually exercised, not just advertised |
-| Fixed question bank | A versioned, reproducible set scored against reference answers for quality drift; reports disclose a 95% Wilson confidence interval for accuracy (informational only, thresholds unchanged) |
-| Streaming first-token latency | p50/p95 TTFT sampled under load, useful for spotting "queue-stretched" relays |
-
-### Key options
-
-| Flag | Meaning |
-|---|---|
-| `--key <key>` | API key; alternatively set `MODEL_XRAY_KEY` / `OPENAI_API_KEY` (recommended: keeps the key out of shell history; guard only supports the env var) |
-| `--claimed-context <n>` | Advertised context window; enables the needle test |
-| `--context-samples <n>` | Needle samples per depth, 1–5 (default 1; `--deep` 5). Use 3 for statistical confirmation resampling |
-| `--context-budget-usd <n>` | Soft spending cap for the context probe, estimated in the same unit as `--price-input/--price-output` (the flag name is historical; no FX conversion happens); requires `--price-input/--price-output`. Requests are skipped once the running estimate would exceed the cap, the tail echo is marked `budget-stopped`, and a pass proven only before the cap is downgraded to undetermined with the estimated spend disclosed. The estimate covers planned needle volume, not retries/stream fallbacks |
-| `--expect <list>` | Claimed capabilities from `vision,tool,thinking` (or `none`; default `vision,tool`) |
-| `--price-input <n>` / `--price-output <n>` | Claimed price per 1M tokens, must appear as a pair; enables the measured-rate probe |
-| `--price-cached-read <n>` | Optional cached-input price per 1M tokens (≥0; defaults to the input price) |
-| `--price-threshold <n>` / `--price-input2 <n>` / `--price-output2 <n>` | Optional long-context tier: above this prompt-token threshold the whole request is billed at tier-2 prices (all three required together) |
-| `--price-cached-read2 <n>` | Optional tier-2 cached-input price (≥0; defaults to the tier-2 input price; requires the tier group) |
-| `--expect-model-ratio <n>` | Your declared `model_ratio` (site public value at `/api/pricing`); a mismatch > 5% fails the billing probe |
-| `--expect-completion-ratio <n>` | Your declared `completion_ratio`; a mismatch > 5% fails the billing probe |
-| `--quota-per-usd <n>` | Quota units per $1 (new-api `status.quota_per_unit`); overrides `/api/status` and enables quota-unit reconciliation. Must be in 1–1e12 — the same validity window the station's own value gets (below 1 means one quota unit is worth more than $1; above 1e12 is not a conversion factor at all) |
-| `--declared-price-page <path>` | Price-page fallback when `/api/pricing` is unavailable: origin-relative path (warn-only, never fails the probe) |
-| `--baseline <path>` | Compare fingerprints against a baseline file; its seed is reused unless `--seed` is explicit |
-| `--baseline-out <path>` | Write this run's baseline file (defaults to `reports/baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json`) |
-| `--token-reference <path>` | Compare per-tier prompt token counts against a prior audit report of the same model and probeset version — catches uniform usage inflation; model/version mismatch skips the comparison with a note |
-| `--yes` | Skip the interactive token-cost confirmation on remote endpoints (required in scripts / non-TTY) |
-| `--dry-run` | Print the planned requests and token estimate, then exit without sending anything |
-| `--deep` | More samples per probe (slower, costs more) |
-| `--http-retries <n>` | Per-request retries on gateway-rejected 429/503 responses (integer in [0, 6], default 2) — separate from `--retries` (200-empty-body retries). Such requests never entered inference and are usually not billed, so they do **not** contaminate billing evidence; other retryable statuses (408/409/500/502/504/timeout/network) still count as potentially-billed contamination and invalidate the measured rate. A run-level retry budget (24) bounds retry amplification when the endpoint is globally overloaded |
-| `--out <dir>` | Report output directory (default `reports`) |
-
-### Troubleshooting
-
-| Symptom | Fix |
-|---|---|
-| `exit 2` / a cost confirmation appears | add `--yes` (required in scripts, CI, non-TTY terminals) |
-| guard: client receives `401` | the client's API key must EXACTLY equal `MODEL_XRAY_KEY`; mismatched requests are rejected locally, never forwarded |
-| guard: port already in use | `--port 8622` (default 8621) |
-| cost dimension shows `N/A` / `skipped` | the station has no one-api style balance endpoint, or no `--price-input/--price-output` was given — reconciliation degrades to token-only stats, which is normal |
-| a capability item fails but the station never claimed it | only put capabilities the station actually advertises into `--expect` (default `vision,tool`); drop the rest or use `--expect none` |
-| the endpoint answers 400 mentioning `temperature` | some gateways/models reject the parameter; the client automatically re-sends once without it and discloses `temperatureDropped` in the evidence — the audit proceeds normally and the param-validation rejection is not billed, so it never contaminates billing evidence |
-| several dimensions *undetermined* with a headline mentioning "端点/网关拒绝" (endpoint/gateway rejected) | the endpoint was overloaded or rate-limited at that moment (e.g. HTTP 503 system cpu overloaded) — requests never entered inference; the report notes aggregate the failure share. Re-run at a quieter time; the tool does not disguise endpoint failures as model problems |
-| web console: saving the key returns `403` mentioning `x-model-xray-token` | the page's session token no longer matches the server (the console was restarted). The console recovers by itself: it re-fetches `/`, takes the new token and retries the request once. If it still fails, refresh the page (Ctrl+R). The token is persisted in `tmp/console-token` (gitignored) so a normal restart keeps already-open tabs working |
-| want a cheaper / faster run | omit `--price-*` and `--claimed-context`; try `--dry-run` first |
-| `cmd.exe` rejects a command copied from the web shell | web-shell commands use single quotes — run them in PowerShell or bash |
-| build fails / `node` not found | install Node.js ≥ 22 from https://nodejs.org |
-
-### Boundaries & caveats
-
-- **One unit, not one currency.** The measured-rate check is a ratio (Δspend ÷ expected cost), so the *currency* never enters the verdict — copy the numbers straight off the station's price table and do **not** convert them into another currency: a ¥-price entered next to a $-balance (or the reverse) shifts the ratio by the FX rate and yields a bogus "under-reported"/"overcharged" reading. The one real requirement is that the claimed price uses the **same unit as the balance reading**: quota-unit stations are converted for you with the station's own published `quota_per_unit` (`GET /api/status`, or `--quota-per-usd`), and `total_usage` readings with an undeclared unit are calibrated against the expected cost (cents / same-unit / quota candidates). Only a unit that cannot be converted at all is voided, with the reason stated. **Precision floor:** a spend or Δspend below 3× the reading's smallest step is rounding noise and voided too — the step follows the reading's own unit (1 cent, or 1 quota unit = 1/`quota_per_unit`), so the floor scales with the conversion automatically. A ratio above 10× cannot be attributed to the audit window (shared-account traffic, recharge/refund, or a unit mismatch): it is reported as unverifiable with the raw ratio and a masked fail for review, not as a fail.
-- **No concurrent traffic.** During the measured-rate window, keep the audited key idle — parallel requests inflate Δspend and bias the ratio upward. (Under `guard`, all traffic through the proxy is accounted per request, so the caveat shrinks to: don't use the same key outside the proxy.)
-- **Recharge interference.** A top-up between the two balance reads voids the measurement (Δ<0 is discarded); a recharge concurrent with spend remains undetectable — cross-check the station's billing log manually when in doubt.
-- **Same-origin assumption.** The two balance reads assume the relay routes them to the same backend and returns fresh (non-cached) values; multi-backend gateways or cached balances can distort Δ.
-- **Billing verifies self-reported usage.** The billing dimension judges the endpoint's *self-reported* token counts: linearity across input lengths (EN + ZH regression), internal consistency (`total = prompt + completion`, no negative values), output-side checks (`completion_tokens` vs the response body / requested `max_tokens`), an output-side total cross-check (visible completion ≈ local estimate of the body: above 1.35 → warn capped at 70, below 0.6 → informational only), a nonzero constant offset in the regression (intercept above 120 tokens with r²≥0.9 → warn), and constant-usage detection. When all of these pass with no absolute reconciliation available (no `--token-reference`, no claimed price + usable balance endpoint), billing reports **pass at 85**: no evidence of usage falsification was found, but a uniform rescaling (e.g. ×1.3), a constant offset, or inflated *charges* cannot be excluded by shape evidence alone — the headline and findings disclose this explicitly (`evidence_level: shape-only`). Absolute reconciliation that passes raises the score to 100; contradicting evidence (non-linear counts, constant usage, measured ratio >1.5, reference drift) still fails the dimension.
-- **Heuristic thresholds.** Drift thresholds (quality 15%/30%, billing slope 0.05/20%, rate 0.8–1.1–1.5) are versioned heuristic initial values so reports stay comparable across versions.
-- **Baseline seed reuse.** `--baseline` reuses the baseline's seed to keep the question set fixed — a relay could theoretically special-case seeded probes; the trade-off is disclosed by design.
-- **Baseline format.** Baseline files are `version: 1` only; mismatched versions/models/probeset versions skip comparison with a note. A baseline holds aggregate fingerprints only (model families, accuracy, capability flags, billing slopes, seed) — never API keys, prompts, or balance values. Quality carries `metricVersion`: comparing against an older (non-pass@1) baseline skips the quality delta with a rebuild note; other dimensions still compare.
-
-### Principles
-
-- **Platform-agnostic.** The tool has no "our own station" to favor. If you operate an endpoint, publish your own reports and let others verify — the credibility comes from third parties running the same command, not from shipped rankings.
-- **No leaderboard.** Maintainers publish reports, not rankings, to keep the tool out of "hit piece" territory.
-- **Evidence over verdicts.** Every finding carries `evidenceIds` into the raw request/response transcripts in the report (aggregate verdict findings link every contributing sample).
-- **Versioned test sets.** Question banks and needles carry versions so a report is reproducible.
-
-### Guard: local always-on monitor (P2)
-
-`guard` runs a transparent local forwarding proxy that watches **real traffic** instead of firing one-shot probes (startup commands are under "CLI usage" above). What it watches per request:
-
-- **Model consistency** — request `model` vs the model the endpoint actually answers with; a mismatch alerts immediately (`model_mismatch`). Ids are compared after canonicalization (lowercase, separators `. _ - /` removed), because relays commonly re-spell the same id (`glm-5.3-flash` → `glm-5-3-flash`); a different family or version still alerts.
-- **Token accounting** — SSE/JSON responses are parsed for `usage` (bytes pass through untouched); negative or inconsistent token counts raise `usage_invalid`. Reported `cached_tokens` / `reasoning_tokens` details are captured when present.
-- **Rolling billing reconciliation** — with claimed prices given, the balance is sampled at window boundaries: Δspend ÷ expected cost = measured rate. Rate > 1.5 alerts as fail; outside the drift band (|ratio−1| > 0.05 and > 0.2) warns; a top-up during the window (`Δ<0`) voids the window (`skipped_recharge`) instead of producing a bogus ratio.
-- **JSONL audit log** — one line per request plus reconcile/anomaly/fingerprint/score events under `--out` (default `reports/guard`), rotated daily. **Metadata only**: no conversation content, no credentials, no upstream error bodies, no query strings — verified by dedicated redaction tests.
-- **Truncation / disconnects** — `finish_reason=length` is recorded; client disconnects mid-stream mark the request `aborted`.
-- **Live scorecard** — every 20 forwarded requests a one-line multi-dimension score is printed (availability / accounting / identity / latency / cost), plus a final card on exit; rolling window = last 100 forwarded requests (locally rejected 401/403 never enter the window); the `观测` (observed) counters — truncation rate / missing usage / aborts — are informational and never affect the grade; with tiny windows a single request can pull the overall grade red, which is normal jitter.
-
-Optional: `--fingerprint-minutes 60` re-runs the identity-family probe periodically and alerts when the model-family fingerprint drifts (the probe sends real requests and costs real money — off by default).
-
-Boundaries: only `chat/completions`, `completions`, and `embeddings` get deep inspection; other paths are forwarded untouched with a basic log line. HTTP/1.1 only; upstream responses are requested with `Accept-Encoding: identity` on deep-inspected endpoints (the only byte-level rewrite besides credential replacement). The balance probe polls the one-api style usage endpoint (`total_usage`) and resolves its unit without assuming a currency: integer-cent readings keep the cent scale as a verifiable candidate, non-integer readings are calibrated against the expected cost (cents / same-unit / quota), and `quota` readings are converted with the station's published `quota_per_unit` when one is available in the reading context — a unit that cannot be resolved at all skips that window with the reason disclosed, and stations without a usable endpoint degrade reconciliation to token-only stats with a `skipped` note. Local auth uses a constant-time comparison; `Ctrl+C` (or closing stdin) stops guard and settles the final window before flush.
-
-### Price ledger & rate watch (free, no model spend)
-
-Every `test` run appends the station's public rate snapshot to a local **price ledger** (`reports/pricing/<host>-<hash>.jsonl`, append-only, one JSON object per line). The next run compares the freshly fetched public rates against the newest snapshot **automatically — no `--baseline` needed**: a significant change (> 5%) is reported as a drift warning and caps the billing dimension at 85. The ledger is archived per **host + port**, so switching a relay's path alias (`/v1` → `/relay/v1`) does not erase its history.
-
-`model-xray pricing-watch` is the free, always-on counterpart: it only reads the station's public rate interfaces (`/api/pricing`, `/api/status`, public price tables) — **no model requests, no billing, no API key** — appends each snapshot to the same ledger, and flags any change:
-
-```bash
-model-xray pricing-watch --base-url https://relay.example.com/v1            # watch every hour
-model-xray pricing-watch --base-url https://relay.example.com/v1 --once     # one shot
-model-xray pricing-watch --base-url https://relay.example.com/v1 --model gpt-4o --interval 600
-```
-
-Exit codes: `0` no drift · `1` significant drift detected · `2` fetch failed / ledger untrustworthy / bad arguments. Sources are not interchangeable: if the station switches between the API table and the public price table, the watch refuses to conclude "no change" instead of reporting a false all-clear; a corrupted ledger tail is likewise never read as "no change" (and is never appended to).
-
-**Billing caliber is compared before numbers are.** A rate means something only together with *how* the station charges for it: a per-token model publishes `model_ratio` / `completion_ratio`, a per-call model publishes `model_price`, and the two are never the same currency — so a model that switches from per-token to per-call yields a **basis change** (significant, no number comparison at all) rather than a pile of bogus ratio drift. The same applies to the quota conversion factor: a `quota_per_unit` that the *station itself* published changing is drift evidence (rates unchanged, real spend changed), while a change that only comes from your `--quota-per-usd` override or from an older ledger row is disclosed but never scored. When either side has no explicit `quota_type` (an older ledger row, or a station that doesn't publish it), the watch discloses the unknown caliber and compares on the known side instead of asserting a basis change it cannot prove.
-
-### Common relay tricks: faking & hidden rate markups (audit via the web console)
-
-Two problems dominate the relay market, and both are designed to be invisible:
-
-- **Faking (model swap / lighter variant)** — the relay serves a lighter sibling from the same family in place of the flagship: e.g. `glm-5.3-flash` standing in for `glm-5.3`. The docs, the self-reported model name, and everyday answers all look right, so it is nearly impossible to notice in normal use; only probes that compare the requested model against the endpoint's self-described identity / answer fingerprints catch it.
-- **Hidden rate markup** — sticker prices look normal while the billing backend quietly applies a modest multiplier (e.g. 1.5×): no single bill looks alarming, so eyeballing statements never catches it; only an absolute check — measured spend ÷ (claimed price × self-reported usage) — produces a verdict.
-
-Best run from the web console (see "Web console" below): tick the claimed capabilities and enter the claimed prices in the form — the more you declare, the deeper the probes run, and page checkboxes avoid the CLI format mistakes (missing items, typos, wrong separators) that can skew the audit: a wrongly-ticked or missing capability makes its probes pass as "unclaimed" or misfire. Cost verification only turns on once you enter the claimed prices; catching a rate markup requires them.
-
-Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): a relay served `glm-5.3-flash` in place of `glm-5.3` and set the rate to 1.5×. One "Start test" run caught it: all 6 identity probes echoed back a different model (requested `glm-5.3`, upstream echoed `glm-5.3-flash` — suspected swap/channel change), the measured rate came out 1.5 > 1.5 claimed (fail, capped at 30), plus 32/62 empty non-streaming bodies as further evidence — final score 45 · fail (billing hard red line caps the total). The sticker prices on the page looked perfectly normal; without entering them and actually measuring, nothing would have surfaced.
-
-![Case: `glm-5.3-flash` standing in for `glm-5.3` with a 1.5× markup — score 45/100, fail](docs/audit-case-glm-5.3.png)
-
-Same case audited from the web console (form with claimed prices entered, in-place scorecard): ![Web console: glm-5.3-flash standing in for glm-5.3, claimed prices entered, score 45/100 fail](docs/audit-case-glm-5.3-webui.png)
-
-### Web console (local, executable)
-
-`npm run ui` starts a local server on <http://127.0.0.1:8620> (loopback only; auto-opens the browser) and turns the page into a real detection entry point with two tabs (the API aggregation tab is temporarily hidden — pending a later iteration; see below):
-
-1. **One-shot test** — set every parameter in the page (endpoint / model / claimed context / expected capabilities / seed / baseline …), enter your API key in the key bar inside this tab (kept in the server's memory only, never echoed; typing it and hitting start is enough), then click start: the CLI runs locally and its log streams into the page; when it finishes the scorecard renders in place with links to the md/html/json artifacts. Model detection is on by default (identity / quality / capability / context / TTFT); cost reconciliation is optional and only enabled when you enter the station's claimed prices. The billing section of the form also takes your group's public `model_ratio` / `completion_ratio`, the site's `quota_per_unit`, and a same-origin price page for stations without `/api/pricing`; the rendered scorecard then shows a **billing & ratios** block (declared vs measured ratio, group discount, quota→USD factor, spend delta, money-check state) plus a collapsible full metrics table per probe, so `N/A` is explained rather than silently blank.
-2. **API aggregation & live monitoring — temporarily disabled in this version (pending a later iteration)** — the tab is hidden and every console `/api/gateway/*` endpoint returns 503; the implementation stays in place behind a feature flag. Designed behavior for when it ships: start a local multi-channel gateway in four steps: ① configure channels (name / protocol — Unified relay, OpenAI-compatible, or Anthropic Messages — / base URL / API key) and build each channel's model list by one-click probing the upstream `/models` endpoint (the request is made by the local server; the key never leaves your machine) or adding model rows manually (upstream model + optional public alias); optionally attach per-model prices (input/output per million tokens, optional cached-read rate, optional >threshold second tier) to track per-model cost; ② click **Start local API** to get the access address and the page-issued virtual client key; ③ watch every channel's live usage (requests, prompt/completion/cached tokens, cost) and anomaly alerts; ④ point your client at the address with the virtual key. Channel configuration lives in the console process, so it survives gateway stops/starts and can be prepared before starting (still lost if the console process itself exits). Data plane: OpenAI-compatible channels serve `chat/completions` + `responses` + `models`; Anthropic-compatible channels serve `messages` + `messages/count_tokens` (auth via `x-api-key` or Bearer); Unified-relay channels accept all of the above and forward each request in the format the client used — ideal for relays that speak both OpenAI and Anthropic formats, no need to distinguish them. One alias routes to exactly one channel with no retry/fallback/failover; a 3xx upstream response is rejected, and channel keys never touch disk or logs. Every forwarded request is recorded in a local ledger (`reports/gateway-ledger.db`, metadata only) and the console shows live usage plus anomaly alerts (model self-ID mismatch / error rate / truncation / usage anomalies / high TTFT) — see "API gateway: observability & data guarantees" below.
-3. **Historical reports** — list everything under `reports/`, render any `report-*.json` scorecard in-page, open md/html in a new tab.
-
-Notes:
-
-- The `guard` transparent proxy is CLI-only (see "Guard" above): it requires the client key to equal `MODEL_XRAY_KEY` exactly and keeps running outside the console; the console no longer starts or stops it. It is also the only live-monitoring path for now: API aggregation (and the in-console live usage/alert panels) is temporarily disabled in this version.
-- The server binds to 127.0.0.1 only; every mutating API call requires a session token injected into the page (persisted in `tmp/console-token`, gitignored, so a restart keeps already-open tabs working). Report files are served from `reports/` with an extension whitelist, path-traversal protection, a 32 MB size cap, and a sandboxed CSP (a report is same-origin with the console, so it must not be able to script or read the console's token).
-- The console's `baseline` field only accepts a `.json` file inside this repository (relative path or in-repo absolute path; UNC/network paths are refused) — the console hands the path to a local subprocess, so it must never be able to point at arbitrary files on the machine.
-- The key lives in the local server process (or your env `MODEL_XRAY_KEY`); it is never written to logs (secrets are masked) and never appears in any command preview. The key bar lives in the one-shot-test tab only.
-- The old purely-static shell is gone; the page still degrades to a read-only notice (with a copyable command preview) if opened without the local server.
-
-### API gateway: observability & data guarantees
-
-The local API gateway (Web console tab 2) records every forwarded request into a local SQLite ledger and watches channels for anomalies in real time. **It is temporarily disabled in this version** — the tab is hidden and all console `/api/gateway/*` endpoints return 503 (a request without a valid session token is still rejected with 403 first). The guarantees below describe the implemented behavior that ships when the feature is re-enabled; the verification scripts remain runnable because they exercise the gateway modules directly:
-
-- **Ledger** — `reports/gateway-ledger.db`: structure metadata only (origin / channel / alias / status / tokens / cost / TTFT — no message content; channel keys are never written). Runtime data, gitignored.
-- **Retention** — nothing is cleaned up automatically in this version: archive or delete the whole file when needed. Don't delete single rows — that breaks the hash chain by design; archiving means moving/renaming the whole database.
-- **Hash chain** — every ledger row carries `row_hash = sha256(prev row_hash + canonical row JSON)`, chained per table (`requests`, `settlements`); `verifyChain()` reports the first broken row and counts rows predating the chain as legacy. It detects partial tampering (accidental edits, single-row rewrites); it is not keyed, so it cannot stop someone who rewrites the whole file.
-- **Crash recovery** — on gateway start, requests without a settlement are closed as `interrupted` / `error_source=gateway` (the gateway restarted — never blamed on the relay); repeated recovery is idempotent.
-- **Degraded, never blocking** — if a ledger write fails, forwarding continues unchanged; the observation gap is disclosed (console banner + `status().degraded`), never silently absorbed.
-- **Anomaly alerts** — per-channel rolling window of the last 100 observations: model-name mismatch ≥ 2, error rate > 50% (n ≥ 5), any truncated response (n ≥ 3),  malformed `usage` > 30% (n ≥ 10), TTFT too high (uncontaminated samples n ≥ 20 and p95 ≥ 300 ms — an absolute floor, not a history comparison).  The same (channel, kind) alerts at most once per 30 min (suppressed repeats are counted and disclosed via `status().alertSuppressed`); all alerts stay silent  for the first 5 min after gateway start (`status().alertSilenceRemainingMs`; sticky `alertSilenceWasActive` discloses that the silence window was in effect).  Each event carries up to 10 evidence request ids to drill into via the ledger.
-- **TTFT dual gauge + contamination guard** — each settlement carries two independent clocks:  `ttft_upstream_ms` (request sent → first content frame from upstream; for **non-streaming** responses there is no intermediate frame, so the clock measures to full-body arrival — compare TTFT only between same-mode samples) and `ttft_client_ms` (request accepted → first byte written to the client;  recorded for error relays too, NULL only when nothing was ever written — never a fake 0).  An event-loop delay ≥ 50 ms during a sample window marks the upstream sample contaminated: still recorded in the ledger (`ttft_contaminated = 1`, raw value kept)  but excluded from p50/p95, so a stalled machine cannot pollute the latency stats.
-- **Console endpoints (token required)** — `GET /api/gateway/status`, `GET /api/gateway/usage`, `GET /api/gateway/events`, channel CRUD under `/api/gateway/channels`, and `POST /api/gateway/probe-models` (one-click upstream model-list probe) exist on the console port (8620) only; the data plane runs on a separate loopback port (random by default, configurable) and exposes no management endpoints.
-- **Verification scripts** — each guarantee above maps to a runnable check (`npm run <script>`):
-  `verify:sse` (byte-sliced SSE replay + UTF-8 boundary + usage rejection), `verify:usage` (usage validation matrix: the four rejection reasons of the usage validator),
-  `verify:ledger` (hash chain + tamper detection + idempotent settle/recover), `verify:crash` (real SIGKILL crash recovery), `verify:leak` (canary key never in ledger/logs),
-  `verify:ttft` (role-only fake first chunk excluded), `verify:tz` (epoch-ms timestamps), `verify:looplag` (contaminated sample eviction keeps conservation),
-  `verify:alerts` (alert thresholds incl. `ttft_high` boundaries), `verify:degraded` (ledger failure → fail-open + disclosure). These cover the implemented slices;
-  `verify:sched` / `verify:delta` / `verify:ports` / `verify:retry` belong to the not-yet-built M4–M6 slices and are intentionally absent.
-
-### Status
-
-v0.2.0 — `test` and the P2 `guard` proxy (CLI-only) are functional, and in-repo you also get the executable web console (`npm run ui`) with two tabs: one-shot test and historical reports. The local API gateway (multi-channel model-alias routing, no retry/fallback yet; OpenAI-compatible + Anthropic Messages + Unified-relay protocols incl. the OpenAI Responses format; optional per-model prices with cost stats; the local ledger, live usage stats and anomaly alerts from S1–S3) is implemented but **temporarily disabled in this version** (console tab hidden, `/api/gateway/*` returns 503) — it will return in a later iteration. Not yet published to npm: run from source (see Quick start); after publishing, `npx model-xray` works out of the box. This repository hosts the CLI and the versioned test assets; audit reports are generated locally under `reports/` and stay out of git (runtime data, .gitignore).
-
 ## 中文
 
-`model-xray` 是一个开源 CLI，用实证手段检测兼容 OpenAI 协议的 LLM 接入点是否存在**模型真伪 / 掺水**问题（换壳、降智、截断上下文、虚标 token 计数等中转站常见套路）。它不要求你相信任何厂商的话：直接探测端点行为，产出可分享的红绿报告。
+### 一、快速开始
 
-### 快速开始：Web 控制台三步走（推荐）
+**前提：Node.js ≥ 22**（`node --version` 确认）。
 
-全程表单可视化——无参数要背、无格式可写错。需要 **Node.js ≥ 22**（用 `node --version` 确认）。
+#### 方式 A：Web 控制台（推荐，三步无脑用）
 
 ```bash
 git clone https://github.com/OpenLlamas/model-xray.git
 cd model-xray
 npm install
 npm run build
-npm run ui       # 自动打开 http://127.0.0.1:8620（仅本机回环）
+npm run ui       # 自动打开 http://127.0.0.1:8620（仅本机）
 ```
 
-在「一次性检测」标签页里：
+1. 粘贴中转站的 **base-url** 和 **模型名**；
+2. **勾选**站方宣称的能力（视觉 / 工具调用 / 推理）、标称上下文、标称价格——价格只在想抓计费问题时填，声明越全探针跑得越深；
+3. 在页内 key 栏**粘贴 API key**，点「开始检测」。
 
-1. **粘贴**中转站的 base-url 和模型名；
-2. **勾选**站方宣称的能力（视觉 / 工具调用 / 推理）、标称上下文窗口、标称价格（价格只有想抓计费问题时才需要填；声明得越全，探针跑得越深）。「计费校验」区还可以填你所在分组的公示 `model_ratio` / `completion_ratio`、站点 `quota_per_unit`、以及无 `/api/pricing` 时的同源价格页；评分卡会多出「计费与倍率」块（公示 vs 实测倍率、分组折扣、quota→USD 系数、余额扣费差值、金额核验状态），每个探针另有可折叠的完整指标明细——`N/A` 会连同原因一起显示，而不是一片空白；
-3. **粘贴** API key 到本页 key 栏（只存本地服务进程、绝不回显），点「开始检测」：CLI 在本机真实运行，日志实时流式滚动，评分卡原位渲染。
+日志实时滚动，结束后评分卡原位渲染。报告落在 `reports/`，文件名 `report-<模型名>-<YYYY-MM-DD_HH-mm-ss>`，三份：`.md`（看这份）、`.html`、`.json`（原始证据）。一整轮通常只花几分钱。key 只存本地服务进程，绝不回显、不落日志。
 
-报告落盘到 `reports/`，文件名主干 `report-<模型名>-<YYYY-MM-DD_HH-mm-ss>`（本地时间）三份：`.md`（看这份）、`.html`（浏览器打开）、`.json`（原始证据）。一整轮通常只花几分钱。此路径无需 `npm link`、无需环境变量。
+#### 方式 B：命令行（可选）
 
-### 命令行运行（可选）
-
-偏好终端时：
-
-- **交互式向导**（Windows）：`npm run ask`——逐项询问端点/模型/key，可先 dry-run 预估，确认后执行并输出报告路径。
-- **裸命令**——先把 key 设进环境变量（`test` 与 `guard` 都读它；key 不进命令行、不进 shell 历史）：
+key 只走环境变量，不进命令行与 shell 历史：
 
 ```powershell
 # PowerShell
@@ -308,222 +45,274 @@ export MODEL_XRAY_KEY='sk-你的key'
 ```
 
 ```bash
-model-xray test \
-  --base-url https://your-relay.example.com/v1 \
-  --model gpt-4o \
-  --yes
+model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes
 ```
 
-`npm run build` 之后可选 `npm link` 拿到短命令 `model-xray`（npm 报权限错误则把 `model-xray` 换成 `node dist/src/cli.js`）。退出码：`0` 通过/可疑 · `1` 不通过 · `2` 用法错误或未得出结论。
+（`npm run build` 后可 `npm link` 获得短命令；没有就换成 `node dist/src/cli.js`。退出码：0 完成（未触发不通过）· 1 不通过 · 2 用法错误或未得出结论。）
 
-知道站方什么就补什么，不知道的项自动跳过（这些字段在 Web 控制台里都是表单项）：
+### 二、能做什么
+
+| 入口 | 用途 | 花费 |
+|---|---|---|
+| `npm run ui`（Web 控制台） | 表单化跑一次性检测：日志实时滚动，评分卡原位渲染，报告一键打开 | 只花探针钱（通常几分钱） |
+| `model-xray test` | 一次性全维度审计，终端一条命令出报告 | 同上 |
+| `model-xray guard` | 本地透明代理，盯你的**真实客户端流量**逐请求打分、滚动对账 | 只转发你自己的流量 |
+| `model-xray pricing-watch` | 只读站点公开价表，倍率被偷偷改动即告警 | 零模型消耗、不需要 key |
+| `model-xray pricing-scan` | 一次扫描多个站点，横向比价 + 全模型倍率表 | 零模型消耗、不需要 key |
+
+**专抓这些「看不出来」的问题：**
+
+- **换壳 / 掺水**：拿轻量版冒充旗舰（如 `glm-5.3-flash` 顶替 `glm-5.3`）——身份问答 + 行为指纹识破；
+- **降智**：固定题集对照参考答案量化首答正确率；
+- **静默截断**：标称 128K 实际只吃 32K——在标称深度埋 needle 实测；
+- **token 灌水**：自报计数全量等比缩放、常量偏移、输出侧虚增——回归 + 绝对参照比对；
+- **偷调倍率**：标价正常、实收偷偷乘系数——公示倍率对照 + guard 余额差值实测；
+- **排队拉长**：TTFT p50/p95 采样，识别「排队拉伸」型中转。
+
+**什么时候最有用：**
+
+- **买之前验货**：新中转站 / 新模型先跑一轮，确认不是「旗舰价、轻量版」；
+- **用着不对劲时**：答得变笨、长文记不住、账单对不上——跑一轮定位是模型问题还是端点抖动；
+- **长期不放心**：`guard` 挂在本地，真实流量逐请求打分，模型一换、倍率一动就告警；
+- **选站 / 比价**：`pricing-scan` 一次扫多站做横向比价；`pricing-watch` 长期盯住单个站的公开倍率，偷偷改价就告警。
+
+真实案例：某站拿 `glm-5.3-flash` 冒充 `glm-5.3` 并设 1.5× 倍率，一次检测即被抓——身份 6 个探针全部回显不符 + 实扣倍率 1.5，最终 45 分不通过（计费硬红线封顶）。更多细节见[完整文档](docs/README-detailed.md)。
+
+![案例：换壳 + 1.5 倍率，45/100 不通过](docs/audit-case-glm-5.3-webui.png)
+
+### 三、衡量维度标准
+
+总分是 0–100 的加权几何「可信度」，各维度独立取证：
+
+| 维度 | 权重 | 查什么 |
+|---|---|---|
+| 计费 Billing | 25 | 端点自报 token 的线性 / 一致性 / 输出侧核对 + 价格核对（默认比较「录入价 ÷ 当前公示价」，一致=1×；列表价折扣另列；guard / 余额模式做实测扣费对账） |
+| 质量 Quality | 25 | 版本化固定题集，pass@1 首答正确率对照参考答案（降智检测） |
+| 身份 Identity | 15 | 自我身份问答 + 行为指纹：换标签、换护栏、换变体都逃不过 |
+| 上下文 Context | 15 | 按标称深度埋 needle，验证窗口真实、usage 校准可信 |
+| 能力 Capability | 10 | 宣称的 vision / tool / thinking 逐项实测，而不只看宣称 |
+| 时延 TTFT | 仅观测 | 流式首字延迟 p50/p95，不计入总分 |
+
+**结果怎么读：**
+
+- 判定 = 退出码：**完成（只给分数）**（0）· **不通过**（1）· **用法错误 / 未得出结论**（2）。不设「可疑」结论档。
+- 证据不足的维度标 `N/A` 并排除计分——绝不按 0 分算。
+- **不通过仅由两类实锤触发**：计费维度 fail（倍率/计量造假、乱收费）或身份维度 fail（明显换壳：自述族矛盾、基线指纹漂移）。其余情况的结论就是分数本身：「可信度总分 X/100」+ 分项分数。计费 / 能力 / 上下文 / 质量低于 40 触发**硬红线**（总分封顶 45）；能力被证伪封顶 60——都只压分数。
+- **实锤不保留及格分**：定罪维度（fail）的分项分一律封顶 45；计费/身份实锤时可信度总分同样封顶 45——「不通过」结论不得配上及格区分数。
+- **计费默认是「形状体检」**：形状检查全过但没做绝对对账时给 **85 分 + 明确披露**（全量等比缩放、虚高扣费无法靠形状排除）；绝对对账成立才 100 分，有矛盾证据直接 fail。
+- **价格下调不扣分**：`--baseline` / 本地价格账本检出显著变化时，只有上调或口径断裂才降档；明确下调视为更划算，只在 findings 披露。
+- **0.3× 不是计费倍率**：报告里的「列表价折扣」= 站内公示价 ÷ 原价；「价格核对」才是你录入的价 ÷ 当前官方公示价，两者一致时为 **1×**。
+- **重要目标跑 2–3 轮再下结论**：单轮可能受端点瞬时异常（空响应、429/503、网络抖动）干扰；固定 `--seed` 配合 `--baseline` / `--baseline-out` 保证题集可比。
+
+### 四、原理：不信任自称，只相信实测
+
+一句话：**它不读站方的宣传页，而是像真实用户一样向端点发请求，用行为差异和账目差额定论。**
+
+| 维度 | 实测方法（简化） |
+|---|---|
+| 身份 | 问「你是谁 / 什么版本」+ 多轮行为指纹；自述的模型、族系、变体后缀与请求名对不上即报警——专抓换壳、轻量版冒充、换护栏。 |
+| 质量 | 跑一套版本化固定题集，用 pass@1 首答正确率对照参考答案；复采样只作证据，避免一次偶发失手就冤枉人。 |
+| 上下文 | 在标称窗口的深处埋「针」并要求原样找回；同时核对端点自报的 `prompt_tokens` 与实际发送量，防止「号称 128K、实际 32K」。 |
+| 计费 | 对端点自报 token 计数做线性回归与硬矛盾检查（非空正文报 0、total 对不上等）；默认核对「录入价 ÷ 当前公示价」（一致=1×），列表价折扣只披露；余额/guard 模式下再用「实际扣费 ÷（录入价 × 自报 usage）」实测真实倍率。 |
+| 能力 | 宣称支持视觉 / 工具调用 / 推理，就真的发对应请求逐项验收，不看参数表。 |
+| 时延 | 流式首字延迟采样 p50 / p95，只作观测，不参与评分。 |
+
+所有阈值、题库、needle 都带版本号，报告可复现；证据不足就标 `N/A`，绝不按 0 分算；每条结论都能顺着 `evidenceIds` 回查原始请求 / 响应。
+
+### 五、进阶用法
+
+知道站方什么就补什么，不知道的项自动跳过：
 
 | 你知道 | 加上 |
 |---|---|
-| 标称上下文窗口（如 128000） | `--claimed-context 128000` —— 启用 needle 实测 |
-| 宣称能力 | `--expect vision,tool,thinking`（默认 `vision,tool`；都没宣称用 `--expect none`） |
-| 标称价格（每百万 tokens） | `--price-input 0.2 --price-output 0.7` —— 启用实测倍率 |
-| 你所在分组的公示倍率 | `--expect-model-ratio 1.5 --expect-completion-ratio 4` —— 锚定 `/api/pricing` 读到的公示倍率（偏差 > 5% 判计费失败） |
-| 站点没有 `/api/pricing` 但有价格页 | `--declared-price-page /pricing` —— 同源路径或同源绝对 URL；抓到的价格是低信任参照（仅 warn，不产生 fail） |
-| 非 new-api 站点（没有 `/api/pricing`） | 自动兜底：探针改读同源公开价表（`/public/model-prices`，其次 `/public/models`）作为模型级公示价锚；这只是公示价锚点，不等于实收对账 |
+| 标称上下文窗口 | `--claimed-context 128000`（启用 needle 实测） |
+| 宣称能力 | `--expect vision,tool,thinking`（默认 `vision,tool`；都没宣称用 `none`） |
+| 标称价格（每百万 tokens） | `--price-input 0.2 --price-output 0.7`（启用计费探针） |
+| 你所在分组的公示倍率 | `--expect-model-ratio 1.5 --expect-completion-ratio 4`（偏差 > 5% 判计费失败） |
+| 站点没有 `/api/pricing` | `--declared-price-page /pricing`（同源价格页，仅 warn 参照） |
+| 想先看请求量和花费 | `--dry-run`（不发任何请求） |
 
-想先看会发什么请求、大约花多少：加 `--dry-run`（不发任何请求）。
+**复测 / 抓偷换**：保留首轮生成的 `reports/baseline-<模型名>-<时间>.json`，复测时加 `--baseline <该文件>` 对比指纹。
 
-**过段时间复测 / 抓偷换模型** —— 保留第一次产出的 `baseline-<模型名>-<YYYY-MM-DD_HH-mm-ss>.json`，复测时带上：
-
-```bash
-model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes \
-  --baseline reports/baseline-gpt-4o-2026-10-11_10-09-23.json
-```
-
-**常驻监控（`guard`，仅命令行）** —— 本地透明代理，盯真实客户端流量并实时打分（控制台不再提供启停入口）：
+**常驻盯真实流量（`guard`，仅 CLI）**：
 
 ```powershell
-# ① key 只走环境变量（guard 没有 --key 旗标，key 不进命令行历史）
 $env:MODEL_XRAY_KEY = 'sk-你的key'
-# ② 启动代理（默认监听 127.0.0.1:8621）
-model-xray guard --base-url https://your-relay.example.com/v1 `
-  --price-input 0.2 --price-output 0.7 --reconcile-minutes 15
-# ③ 把客户端 base-url 指向 http://127.0.0.1:8621/v1，
-#    并把客户端 key 设为与 MODEL_XRAY_KEY 相同的值
+model-xray guard --base-url https://your-relay.example.com/v1 --price-input 0.2 --price-output 0.7 --reconcile-minutes 15
+# 然后把客户端 base-url 指向 http://127.0.0.1:8621/v1，客户端 key 设为与 MODEL_XRAY_KEY 完全相同
 ```
 
-逐请求盯什么、评分卡长什么样，见下文「Guard：本地常驻监控」。
-
-**免费盯倍率（`pricing-watch`，仅命令行）** —— 只读站点公开倍率接口（不发模型请求、不计费、不需要 API key），站点偷偷改倍率即告警：
+**免费盯倍率 / 横向比价（零模型消耗、不需要 key）**：
 
 ```bash
-model-xray pricing-watch --base-url https://your-relay.example.com/v1            # 每小时盯一次
-model-xray pricing-watch --base-url https://your-relay.example.com/v1 --once     # 只查一次
-model-xray pricing-watch --base-url https://your-relay.example.com/v1 --model gpt-4o --interval 600
+model-xray pricing-watch --base-url https://your-relay.example.com/v1 --once
+model-xray pricing-scan --base-url https://relay-a.example.com/v1 --base-url https://relay-b.example.com/v1
 ```
 
-### 结果怎么读
+一句话区别：`pricing-watch` 盯**单个站点**的公开价表（默认每小时一次，`--once` 只查一次），和本地价格账本里的上一份快照对比，倍率漂移 > 5% 或计费口径变更就告警；`pricing-scan` 一次扫**多个站点**做横向比价。
 
-- **判定**（同退出码）：通过（0）· 可疑（0）· 不通过（1）· 用法错误/未得出结论（2）。
-- 证据不足的维度标 `N/A` 并排除在计分之外——绝不按 0 分算。
-- **计分**：加权几何合成 0–100 可信度总分：计量 25 / 质量 25 / 身份 15 / 上下文 15 / 能力 10（TTFT 仅观测，不计分）。任一维度 fail 或可信度总分 < 40 → 不通过；计量/能力/上下文/质量 低于 40 触发**硬红线**（可信度总分封顶 45）；能力被证伪（标称能力实测答错/被明确拒绝）→ 可信度总分封顶 60；可信度总分 < 75 或有 warn 维度 → 可疑。
-- **质量口径（题集版本 v0.2.2，metricVersion pass1 起）**：主指标为 **pass@1**（首答正确率）——temperature 0.7 复采样仅作证据保留（`main`=pass@1、`main_recovered`=两次机会）。`fail` 判定额外要求复采样未恢复至 0.6 线（首答崩 + 复采仍崩才是定论级证据；首答偶发未中不算）。首答 <0.6 但被复采样救回的「复采洗白」形态判可疑并封顶 80 分。基线带 `metricVersion: 'pass1'`；与旧口径基线混比时跳过质量对比并提示（其余维度照常对比）——旧基线需重新生成后对比。
-- 每条结论都附原始请求/响应证据，可回查。
-- **建议多测几次再下结论。** 单轮结果可能受端点瞬时异常干扰（空正文/empty stream、429/503 限流、网络抖动等）——失败样本所在维度会 `N/A` 或被迫用流式回退评分；对同一目标跑 2–3 轮（固定 `--seed` 配合 `--baseline`/`--baseline-out` 保证题集可比）并对比多份报告，结论才稳。间歇性失败通常反映端点稳定性问题，而不是模型能力变化。
+`pricing-scan --json` 输出全模型表与每个端点的探测轨迹；站点不公示 `quota_per_unit` 时 `quotaPerUnit=null`、`quotaPerUnitSynthetic=true`，可用 `--quota-per-usd` 提供真实换算率。
 
-### 检测项
-
-| 检测项 | 做法 |
-|---|---|
-| 身份与指纹 | 自我身份问答（5 次自述，`--deep` 8 次，含 1 道完整模型名称与精确版本自述题）+ 行为指纹，识破换标签/换护栏的"套皮"模型（如自称 Claude 却答"我是 GLM"）；检测到「品牌名 + assistant/助手」形态的人格自述（如 "I am NovaRelay assistant"）→ warn 并分数封顶 80；同族但变体后缀不符（宣称 `glm-5.3`、自述 `glm-5.3-flash`）→ 变体冲突 warn 封顶 80；跨族 → fail 0 分 |
-| 上下文长度实测 | 在标称深度埋 needle，验证标称窗口是真实的，而非静默截断；同时核对端点自报 `prompt_tokens` 与实际发送量，未通过校准的「通过」降为无法判定。深度档自深到浅执行；90% 档取得 ≥2 发有效 needle 全中、usage 校准可信且该档干净时，更浅各档**早停**并如实披露（不计入缺失深度）；`--context-samples ≥2` 时可省约 75% 的 needle 发送量 |
-  | Token 计数对比 | 对端点自报 `prompt_tokens` 与本地保守估算（非官方 tokenizer）做同轮线性回归，暴露非线性/硬编码计数；并检查 `completion_tokens` 的硬矛盾（非空正文却报 0、或超过请求 `max_tokens`）。输出侧另有合计比对：Σ(可见 completion = completion − reasoning_tokens，仅 `finish=stop`) ÷ Σ(正文本地估算) > 1.35 → 疑似输出 token 灌水，warn 封顶 70；< 0.6 → 仅提示。回归存在非零常量偏移（finite r²≥0.9 且截距超 120 tokens）同样按疑似灌水 warn。形状/一致性/输出侧全过即判定「usage 未发现造假证据」：无绝对对账（`--token-reference` 或实测倍率）时该项 85 分并通过，headline 与 findings 如实披露「扣费金额真实性未验证」（全量等比缩放/常量偏移在回归中不可见）；绝对对账成立则 100 分。缺 usage 的样本、请求失败、可能已计费的重试（网关层 429/503 拒绝例外——未进入推理、通常不计费）、completion 异常一律封顶 70 而非通过 |
-| 实测倍率（余额差值法） | 计费序列前后各查一次余额，两个快照都做**稳定化轮询**——连续两次读数一致才认稳定；且序列前的 pre 快照必须**首比即稳**：窗口前未结算的旧账会在 pre 之后入账混入 Δ，把诚实站点诬陷成虚高倍率（post 侧误差方向是漏计、pre 侧是诬告，不对称从严），pre 仍在动的窗口直接作废倍率（不可归因 info，绝不判 fail）。支持 new-api 风格站点：余额取 `GET /api/usage/token`（Bearer；key 级 `total_used`/`total_available`），`GET /api/status`（`quota_per_unit`）校准单位——校准不可达时不加分也不扣分；控制台 API 调用会自动剥掉 `baseUrl` 结尾的 `/v1`。one-api 风格 `/api/user/self`（用户级 quota）在 `/api/status` 可达时同样折算为站点计价单位，但**用户级口径永不产出 fail**：同一用户全部 key 共享该余额，其他 key 的并发消费可把倍率推入 (1.5,10]，>1.5 只降为 warn 并把底层档位记入 `metrics.ratio_masked_verdict`（定论级指控只认 key 级来源）。Δ扣费 ÷（宣称价格 × 端点自报 usage）的应缴金额，揭示"低价"背后的真实倍率。倍率 > 1.5 → fail；(1.1, 1.5] 或 [0.5, 0.8) → warn（低报可能意味着 usage 少计或单位错配）；[0.8, 1.1] → 与宣称价格一致。应缴金额或 Δ 低于余额最小刻度 3 倍时判 N/A——若应缴金额本身低于该门槛，审计会**自动补采**最多 8 笔大 prompt 样本抬升 Δ 至可测区间（预算封顶 3× 目标额、预估不可达则整段跳过、出现首个不可归因事件立即停），而不是直接放弃；>10 倍的差值无法归因到本次窗口（账户级并发/单位错配），只报不可验证并保留原始倍率，不判 fail；窗口内出现可能已计费的重试（408/409/5xx/超时后重试——网关层 429/503 重试豁免）或失败请求时倍率作废。默认 `test` 不读余额，直接给出「价格倍率 = 公示价 ÷ 列表价」并披露「不代表实收扣费」；guard/显式余额模式下余额接口不可用时，才追加「实收未实测」。不会把余额差值 N/A 当成唯一结论。这些数字统一进「计费与倍率」块（控制台评分卡、Markdown/HTML 报告、终端摘要各一份）：公示输入/输出倍率、列表价倍率、实测倍率、金额核验状态，以及拿不到倍率时的确切原因（哪个余额接口失败、站点是否提供公示价接口） |
-| Token 计数参照对比（`--token-reference`） | 与同名模型历史报告的逐档 prompt_tokens 对比（同题集版本才生效）：比值 > 1.25 → fail（分数封顶 30）；1.1–1.25 或 < 0.8 → warn（封顶 70）；0.8–1.1 → ok——唯一能识别"全量等比缩放"型计数虚增的手段（回归对此不可见）。限制如实声明：仅对比 prompt_tokens；参考报告须用户自行确认为可信来源；自动获取官方计费计数的能力暂缺（TODO） |
-| 指纹基线对比 | 保存/对比版本化指纹基线（模型族、质量、能力、计费斜率），识别两次检测之间模型被偷换 |
-| 能力校验 | vision / tool calling / thinking 标称能力逐项实测，而非只看宣称 |
-| 固定题集质量打分 | 版本化可复现题集，对照参考答案量化质量（降智检测）；报告附准确率 95% Wilson 置信区间（仅披露，不改变判定阈值） |
-| 流式首字延迟 | 采样 p50/p95 TTFT，识别"排队拉长"型中转 |
-
-### 关键参数
-
-| 参数 | 说明 |
-|---|---|
-| `--key <key>` | API key；也可改用环境变量 `MODEL_XRAY_KEY` / `OPENAI_API_KEY`（推荐：key 不进 shell 历史；guard 只能用环境变量） |
-| `--claimed-context <n>` | 标称上下文窗口；启用 needle 实测 |
-| `--context-samples <n>` | 每档 needle 样本数，1–5（默认 1；`--deep` 5）；3 = 统计定论档（自动复采） |
-| `--context-budget-usd <n>` | 上下文探针的**软**预算（估算值，单位与 `--price-input/--price-output` 一致；旗标名是历史遗留，工具不做币种换算）；必须与 `--price-input/--price-output` 成对提供。运行估算超过上限即停发后续请求，结尾回显标记 `budget-stopped`，若「通过」结论只建立在停发前的证据上则降为无法判定并披露估算花费。估算只覆盖计划内 needle 发送量，不含重试/流式回退的实际计费 |
-| `--expect <list>` | 宣称能力，取值 `vision,tool,thinking`（或 `none`；默认 `vision,tool`） |
-| `--price-input <n>` / `--price-output <n>` | 每百万 tokens 的宣称价格，必须成对出现；启用价格倍率（公示价 ÷ 列表价）与计费探针费用，默认不读余额 |
-| `--price-cached-read <n>` | 可选的缓存读单价（$/百万 tokens，≥0；缺省按输入价） |
-| `--price-threshold <n>` / `--price-input2 <n>` / `--price-output2 <n>` | 可选长上下文二档：prompt tokens 超过阈值时整单按二档价（三项必须同时提供） |
-| `--price-cached-read2 <n>` | 可选的二档缓存读单价（≥0；缺省按二档输入价；须配合阶梯组） |
-| `--expect-model-ratio <n>` | 你宣称的 `model_ratio`（站点公示值，取自 `/api/pricing`）；偏差 > 5% 判计费探针失败 |
-| `--expect-completion-ratio <n>` | 你宣称的 `completion_ratio`；偏差 > 5% 判计费探针失败 |
-| `--quota-per-usd <n>` | 每 $1 对应的 quota 单位数（new-api `status.quota_per_unit`）；覆盖 `/api/status`，供 guard/显式余额对账使用；`test` 默认不读余额。必须落在 1~1e12（与站点公示值同一有效域：低于 1 等于 1 个 quota 值超过 $1，高于 1e12 就不是换算系数） |
-| `--declared-price-page <path>` | `/api/pricing` 不可用时的网页价格兜底：同源相对路径（仅 warn 级，不产生 fail 判罚） |
-| `--baseline <path>` | 与基线文件做指纹对比；未显式给 `--seed` 时沿用基线 seed |
-| `--baseline-out <path>` | 落盘本轮基线（缺省写到 `reports/baseline-<模型名>-<YYYY-MM-DD_HH-mm-ss>.json`） |
-| `--token-reference <path>` | 与同名模型历史报告对比逐档 prompt token 计数（同题集版本才生效）——识别全量等比虚增；模型/题集版本不符时跳过并提示 |
-| `--yes` | 跳过远程端点的交互式成本确认（脚本/非 TTY 环境必需） |
-| `--dry-run` | 只打印计划请求量与 token 预估，不发任何请求 |
-| `--deep` | 每项探针更多样本（更慢、更贵） |
-| `--http-retries <n>` | 端点/网关层 429/503 拒绝时的每请求重试次数（整数 [0, 6]，默认 2）——与 `--retries`（200 空正文重试）分开计预算。此类请求未进入推理、通常不计费，因此**不污染**计费证据；其余可重试状态（408/409/500/502/504/超时/网络错误）仍按「可能已计费」判污染并作废实测倍率。运行级重试总预算（24）限制端点整体过载时的重试放大 |
-| `--out <dir>` | 报告输出目录（缺省 `reports`） |
-
-### 出错了怎么办
+#### 常见问题
 
 | 现象 | 处理 |
 |---|---|
-| `exit 2` / 提示成本确认 | 加 `--yes`（脚本、CI、非交互终端必需） |
-| guard：客户端收到 `401` | 客户端 key 必须与 `MODEL_XRAY_KEY` **完全一致**；不一致的请求本地即拒、绝不转发 |
-| guard：端口被占用 | `--port 8622`（默认 8621） |
-| 成本维度 `N/A` / `skipped` | 站点没有公开价/列表价，或没给 `--price-input/--price-output`——降级为纯 token 统计，属正常；余额消耗请自行核对 |
-| 能力项 fail 但站方从没宣称过 | 只把站方确实宣称的能力放进 `--expect`（默认 `vision,tool`），其余去掉或用 `--expect none` |
-| 端点对请求报 400 且错误信息含 `temperature` | 部分网关/模型拒绝该参数；客户端会自动去参重发一次并在证据中披露 `temperatureDropped`，审计照常进行——参数校验失败不进入推理、不计费，不构成计费污染 |
-| 多个维度「未判定」且标题提示「端点/网关拒绝」 | 端点当时过载/限流（如 HTTP 503 system cpu overloaded），请求没进入推理。报告 notes 会汇总失败占比；建议错峰重测——工具不会把端点故障伪装成模型问题 |
-| Web 控制台保存 key 报 `403` 且提示 `x-model-xray-token` | 页面里的会话 token 与服务端不一致（控制台重启过）。控制台会自动重取 `/` 的 token 并重试一次；仍失败请刷新页面（Ctrl+R）。token 持久化在 `tmp/console-token`（已被 gitignore），正常情况下重启后旧标签页仍可用 |
-| 想跑得更省更快 | 不传 `--price-*` 与 `--claimed-context`；先 `--dry-run` 预估 |
-| cmd.exe 执行 web 壳生成的命令报错 | 该命令用单引号，请改用 PowerShell 或 bash（表单也有 cmd.exe 引号模式） |
-| 构建失败 / 找不到 node | 安装 Node.js ≥ 22（https://nodejs.org） |
+| `exit 2` 或提示成本确认 | 加 `--yes`（脚本 / CI / 非交互终端必需） |
+| 成本维度 `N/A` / `skipped` | 站点没有可读的价表 / 余额接口，或没给 `--price-*`——降级为 token 形状体检，属正常 |
+| 能力项 fail 但站方没宣称 | 只把真正宣称的能力放进 `--expect`（默认 `vision,tool`） |
+| 多个维度「未判定」且提示端点 / 网关拒绝 | 端点当时过载 / 限流，请求没进推理；错峰重测，不是模型问题 |
+| guard：客户端 401 / 端口占用 | 客户端 key 必须与 `MODEL_XRAY_KEY` 完全一致；端口冲突用 `--port 8622` |
 
-### 边界与注意
+#### 边界（必须知道）
 
-- **余额对账（guard / 显式 `readBalance`）。** `test` 默认不读余额：只按宣称价与站点列表价给出价格倍率，并把本轮全部带 usage 请求的总费用写入报告 notes，余额消耗由用户自行核对。以下余额口径仅适用于 guard 和库内显式开启的旧对账分支。实测倍率是比值（Δ扣费 ÷ 应缴金额），**币种不进判定**：直接照抄站方价目表上的数字即可，**不要**把价格换算成另一种币种——用 ¥ 价格配 $ 余额（或反之）会让倍率整体偏移一个汇率，产出「少计/虚高」的假结论。唯一的真实要求是宣称价与余额读数**同一单位**：quota 单位余额由工具按站点自己公示的换算率（`GET /api/status` 的 `quota_per_unit`，或 `--quota-per-usd`）折算，单位不明的 `total_usage` 读数按应缴金额为锚做口径校准（美分／同单位／quota 三候选）；只有完全无法换算的单位才作废，并给出确切原因。**精度门槛**同样与币种无关：本次应缴或 Δ扣费低于余额读数最小刻度的 3 倍时视为舍入噪声并作废——刻度随读数自身单位而定（1 美分，或 1 quota 单位 = 1/`quota_per_unit`），换算后门槛自动同比缩放。>10 倍的差值无法归因到本次窗口（账户级并发、充值/退款或单位错配），报告为不可验证并保留原始倍率，不判 fail。
-- **勿有并发流量。** guard 余额对账窗口内，被测 key 不要跑其他请求——并发消费会抬高 Δ扣费、使倍率偏高估；`test` 默认不读余额，不受此窗口影响。
-- **充值干扰。** 两次余额查询之间发生充值会使测量作废（Δ<0 直接判无效）；充值与消费叠加的情况难以识别，存疑时请人工核对该站账单流水。
-- **同源假设。** 两次余额读数假定中转站路由到同一后端且返回非缓存值；多后端网关或余额缓存可能使 Δ失真。
-- **计费维度核验的是端点自报 usage。** 判据：自报 `prompt_tokens` 与输入长度线性（英文+中文双轨回归）、内部一致（`total = prompt + completion`、无负值）、输出侧无矛盾（`completion_tokens` 与正文/请求 `max_tokens`）、输出侧合计比对（可见 completion ≈ 正文本地估算：>1.35 warn 封顶 70、<0.6 仅提示）、回归非零常量偏移（截距超 120 tokens 且 r²≥0.9 warn）、usage 恒定检测。全部通过且无绝对对账（无 `--token-reference`，默认也无余额对账）时，计费维度判**通过（85 分）**：未发现 usage 造假证据，但全量等比缩放（如 ×1.3）、常量偏移与虚高扣费无法被形状证据排除——headline 与 findings 如实披露（`evidence_level: shape-only`）。绝对对账成立升为 100 分；有矛盾证据（非线性、恒定 usage、参考漂移；余额模式下实测倍率 >1.5）仍判 fail。
-- **阈值为启发式初值。** 漂移阈值（质量 15%/30%、计费斜率 0.05/20%、余额模式倍率 0.8–1.1–1.5）随题集版本化管理，保证跨版本报告可比。
-- **基线沿用 seed。** `--baseline` 会沿用基线 seed 固定题集——端点理论上可对固定 seed 特判，该权衡在此明示。
-- **基线格式。** 基线文件仅支持 `version: 1`；版本/模型/题集版本不符时跳过对比并给出提示。基线只含聚合指纹字段（模型族、正确率、能力布尔、计费斜率、seed）——不含 API key、提示词原文或余额数值。质量口径带 `metricVersion`：与旧口径（非 pass@1）基线混比时跳过质量对比并提示重建基线，其余维度照常对比。
+- **录入价必须与比较对象同单位**：默认价格核对只做「录入价 ÷ 当前公示价」的同单位比值，不换算币种；guard / 余额对账时录入价要与余额折算后的单位一致（通常是 USD，quota 由站点公示的 `quota_per_unit` 自动折算）。
+- **对账窗口内别并发**：同一 key 的其他请求会抬高扣费差值，使倍率偏高。
+- **充值会让窗口作废**：两次余额读数之间充值，Δ<0 直接判无效。
+- **阈值是版本化启发式初值**，报告跨版本仍可比；基线只含聚合指纹，不含 key / 提示词 / 余额。
 
-### 原则
+### 六、原则
 
-- **对所有平台一视同仁。** 工具自身没有"自营站点"立场。若你是接入点运营方，请发布自己的检测报告并接受任何人复测——公信力来自第三方跑同一条命令，而不是自带榜单。
-- **不做排行榜。** 官方只发布报告不排名次，避免黑稿嫌疑。
-- **证据优先。** 每条结论都附证据 id 链接原始请求/响应记录（单请求结论链接该请求证据；聚合结论链接全部相关样本证据）。
-- **题集版本化。** 题库与 needle 均带版本号，报告可复现可追溯。
+- 不做排行榜、没有「自营站点」立场——公信力来自任何人跑同一条命令复测；
+- 证据优先：每条结论都链到原始请求 / 响应证据；
+- 题集版本化：题库与 needle 带版本号，报告可复现。
 
-### Guard：本地常驻监控（P2）
+**状态**：v0.2.0，`test` / `guard` 可用；Web 控制台含「一次性检测」「历史报告」两页（API 聚合网关本版暂未上线）。尚未发布 npm，从源码运行。
 
-`guard` 启动一个本地透明转发代理，盯**真实流量**而不是一次性探测（启动命令见上文「命令行运行（可选）」）。逐请求盯什么：
+---
 
-- **模型一致性** —— 请求的 `model` 与端点实际应答的模型不一致，立即告警（`model_mismatch`）。比较前先归一（小写、去掉 `. _ - /` 分隔符），因为中转站常把同一 id 改写（`glm-5.3-flash` → `glm-5-3-flash`）；族名或版本号不同仍然照报。
-- **Token 记账** —— 解析 SSE/JSON 响应里的 `usage`（字节原样透传）；token 为负或分项对不上报 `usage_invalid`。响应里带 `cached_tokens` / `reasoning_tokens` 明细时会一并捕获入账。
-- **滚动对账** —— 提供宣称价格后，窗口首尾各查一次余额：Δ扣费 ÷ 应缴金额 = 实测倍率。倍率 > 1.5 按 fail 告警；超出漂移带宽（|ratio−1| > 0.05 且 > 0.2）按 warn 告警；窗口内充值（Δ<0）作废该窗口（`skipped_recharge`），不出假倍率。
-- **JSONL 审计日志** —— 每请求一行，外加 reconcile/anomaly/fingerprint/score 事件，写入 `--out`（默认 `reports/guard`）并按日轮转。**只记元数据**：无对话内容、无凭证、无上游错误体、无 query——有专门的脱敏测试钉死这条红线。
-- **截断与断连** —— `finish_reason=length` 记录在案；客户端流中断开标记 `aborted`。
-- **实时评分卡** —— 每 20 个已转发请求输出一次多维单行评分（可用性/计量/身份/时延/成本），退出时无论计数再输出一张终卡；滚动窗口为最近 100 个已转发请求（本地 401/403 拒绝的请求不转发、不入窗）；「观测」项（截断率/缺用量/中止）仅记录不计总评；小样本（窗口内请求很少时）单笔异常即可拉红总评，属正常抖动。
+## English
 
-可选：`--fingerprint-minutes 60` 周期性复跑身份族指纹探针，模型族漂移即告警（探针发真实请求、产生真实计费——默认关闭）。
+**X-ray your LLM endpoints. One command, one report.**
 
-边界：只有 `chat/completions`、`completions`、`embeddings` 做深检，其余路径原样转发并记基础行；仅支持 HTTP/1.1；深检端点会强制 `Accept-Encoding: identity`（除凭证替换外唯一的字节级改写）。余额探针按 one-api 风格 usage 接口读取 `total_usage`，单位口径不预设币种：整数读数保留「分位」刻度作为可核验候选，非整数读数按应缴金额为锚做口径校准（分位／同单位／quota），quota 读数在上下文已有站点公示换算率时按其折算；完全无法解析单位的窗口带原因跳过，站点没有可用接口时对账降级为纯 token 统计并出 `skipped` 提示。本地鉴权用常量时间比较；`Ctrl+C`（或关闭 stdin）停止时先结算最后一个对账窗口再落盘。
+`model-xray` is an open CLI that empirically audits OpenAI-compatible LLM endpoints for **fake or watered-down models** — relabeled models, dumbed-down answers, silently shortened context, padded token counts, and other common relay tricks. It never asks you to trust any vendor: it probes the endpoint's behavior directly and produces a shareable red/green report (`.md` to read, `.html` for the browser, `.json` as raw evidence).
 
-### 价格账本与倍率看门狗（零模型消耗）
+### 1. Quick start
 
-每次 `test` 都会把站点公示倍率快照追加进本地**价格账本**（`reports/pricing/<主机>-<hash>.jsonl`，只追加，每行一个 JSON 对象）。下一轮审计会自动与最新一份快照对照——**不需要 `--baseline`**：显著变化（> 5%）按漂移告警并把计费维度封顶 85。账本按**主机 + 端口**归档，换路径别名（`/v1` → `/relay/v1`）也共享同一份漂移历史。
+Requires **Node.js ≥ 22**.
 
-`model-xray pricing-watch` 是零成本的常驻搭档：只读站点公开倍率接口（`/api/pricing`、`/api/status`、公开价表）——**不发模型请求、不计费、不需要 API key**——把每份快照写进同一本账本，并标记任何变化：
+**Web console (recommended, 3 steps):**
 
 ```bash
-model-xray pricing-watch --base-url https://relay.example.com/v1            # 每小时盯一次
-model-xray pricing-watch --base-url https://relay.example.com/v1 --once     # 只查一次
-model-xray pricing-watch --base-url https://relay.example.com/v1 --model gpt-4o --interval 600
+git clone https://github.com/OpenLlamas/model-xray.git
+cd model-xray
+npm install
+npm run build
+npm run ui       # opens http://127.0.0.1:8620 (loopback only)
 ```
 
-退出码：`0` 无漂移 · `1` 检测到显著漂移 · `2` 抓取失败／账本不可信／参数错误。两侧来源不可互换：站点若在 API 价目表与公开价表之间切换，看门狗会拒绝给出「无变化」结论（不报假平安）；账本尾部损坏同样不会被读成「无变化」，也不会继续追加。
+1. Paste the station's base URL and model name.
+2. Tick what the station claims — capabilities, context window, prices (prices only when you want billing checks; the more you declare, the deeper the probes).
+3. Paste your API key into the key bar and click **Start**.
 
-**先比口径，再比数字。** 倍率只有配上「站点怎么收费」才有意义：按 token 计价的模型公示 `model_ratio` / `completion_ratio`，按次计价的模型公示 `model_price`，两者不是同一种量纲——所以模型从按 token 改成按次时，报的是**计费基准变更**（显著，且完全不做数值比较），而不是一堆「倍率被偷改」的假漂移。quota 换算系数同理：站点自己公示的 `quota_per_unit` 变了属漂移证据（倍率没动、实收变了），而只来自 `--quota-per-usd` 覆盖或旧账本条目的变化只披露不计分。任一侧没有显式 `quota_type` 时（旧账本条目，或站点不公示），看门狗会披露口径未知并按已知一侧比价，绝不据此断言一个证不出来的换基准。
+The log streams live and the scorecard renders in place. Reports are written to `reports/` as `report-<model>-<YYYY-MM-DD_HH-mm-ss>.{md,html,json}`. A full run typically costs a cent or two. The key stays in the local server process only — never echoed, never logged.
 
-### 中转站常见坑：掺假与偷调倍率（推荐用 Web 控制台实测）
+**CLI (optional):**
 
-市面上的中转站，两类问题最常见，而且都刻意做得「看不出来」：
+```powershell
+$env:MODEL_XRAY_KEY = 'sk-your-key'   # PowerShell
+```
 
-- **掺假（换壳 / 轻量版冒充）**：用同家族的轻量版顶替旗舰模型——例如拿 `glm-5.3-flash` 冒充 `glm-5.3`。文档、模型自述、日常问答看起来都正常，常规使用极难察觉；只有对照「请求的模型名 vs 端点自述身份 / 应答指纹」的探针才抓得住。
-- **偷调倍率**：标价看着正常，后台却悄悄设一个不太夸张的倍率（如 1.5×）——单笔账单金额不大、倍率「不离谱」，靠肉眼对账单几乎发现不了；绝对对账（实测扣费 ÷（宣称价格 × 自报 usage））才能定论实收，价格倍率（公示价 ÷ 站点列表价）则能把可疑倍率直接显示出来。
+```bash
+export MODEL_XRAY_KEY='sk-your-key'    # bash / zsh
+model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes
+```
 
-推荐用 Web 控制台实测（见「Web 控制台」）：页面**可视化勾选**宣称能力、录入标称价格——声明得越全，探针跑得越深，且页面勾选能避免手写 CLI 参数的格式错误（漏项、拼错、分隔符不对）：勾错或漏勾宣称能力会让对应探针直接按「未宣称」放行或误报，从源头造成检测不准。计费核价只在录入宣称价格后启用；想显示价格倍率，除填写价格外还需要站点公开列表价，否则如实标注不可得，不伪造数字。
+(`npm link` after `npm run build` gives the short command; otherwise use `node dist/src/cli.js`. Exit codes: 0 pass/warn · 1 fail · 2 usage error or inconclusive.)
 
-真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实测倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。（该案例使用余额对账模式；当前 `test` 默认按公示价给出价格倍率，不读余额。）
+### 2. What it does
 
-![案例：`glm-5.3-flash` 冒充 `glm-5.3` 且倍率 1.5×——总分 45/100，不通过](docs/audit-case-glm-5.3.png)
+| Entry point | Purpose | Cost |
+|---|---|---|
+| `npm run ui` (web console) | Form-driven one-shot audit: live log, in-place scorecard, report links | Only the probe run (typically cents) |
+| `model-xray test` | One-shot full audit from the terminal | same |
+| `model-xray guard` | Local transparent proxy scoring your real client traffic per request | your own traffic only |
+| `model-xray pricing-watch` | Public rate-table watcher — alerts on silent markup changes | free, no key |
+| `model-xray pricing-scan` | Multi-site price comparison in one run | free, no key |
 
-同一案例在 Web 控制台实测（表单已录入宣称价格、评分卡原位渲染）：![Web 控制台：glm-5.3-flash 冒充 glm-5.3，已录入宣称价格，总分 45/100 不通过](docs/audit-case-glm-5.3-webui.png)
+What it catches: swapped models (e.g. `glm-5.3-flash` standing in for `glm-5.3`), dumbed-down answers, silent context truncation, token inflation, hidden rate multipliers, and queue-stretched TTFT.
 
-### Web 控制台（本地、可执行）
+**When it's most useful:** vetting a new relay or model before buying; diagnosing a sudden quality drop, shortened context, or suspicious bill; running `guard` on real traffic to catch a silent swap or markup; comparing many stations with `pricing-scan`, or watching one station's public rates over time with `pricing-watch` (both free).
 
-`npm run ui` 在 <http://127.0.0.1:8620>（默认端口，仅回环；自动打开浏览器）启动本地服务，把网页变成可执行的检测入口，两个标签页（「API 聚合」标签本版临时隐藏 · 后需迭代上线，见下）：
+### 3. How it's measured
 
-1. **一次性检测** —— 页面内设置全部参数（端点/模型/标称上下文/宣称能力/seed/基线…），在本页 key 栏录入 API key（仅存本地服务进程内存、绝不回显；录入后直接点开始检测即生效），点开始即在本机真实运行 CLI，日志实时流式滚动；结束后评分卡原位渲染，并附 md/html/json 报告链接。模型检测默认开启（身份/质量/能力/上下文/时延）；计费核价为可选，录入站点宣称价格后才启用（支持缓存读单价与超过阈值的二档阶梯价，二档可分别设置输入/输出/缓存读）。
-2. **API 聚合与实时监控 —— 本版暂未上线（后需迭代）** —— 该标签已隐藏，控制台 `/api/gateway/*` 端点一律回 503；实现保留在功能开关之后。以下为上线后的设计行为：页面内按四步启动本地多渠道网关：① 配置渠道（名称 / 协议 —— 统一中转站、OpenAI 兼容或 Anthropic Messages —— / Base URL / API Key）并建立模型清单（「一键获取」由本机服务端请求上游 `/models` 列表 —— Key 不出本机 —— 或手动逐行添加：上游模型名 + 可选对外别名），可选为每个模型配置价格（输入/输出单价，$/百万 tokens；可选缓存读单价；可选超过阈值的长上下文二档价）以统计各模型费用；② 点「启动本地 API」生成接入地址与页面下发的虚拟客户端 Key；③ 实时监控每个渠道的用量（请求数、prompt/completion/缓存 token、费用）与异常告警；④ 让客户端指向该地址并使用虚拟 Key。渠道配置挂在控制台进程上：跨网关启停保留、启动前即可配置（控制台进程退出仍会丢失）。数据面：OpenAI 兼容渠道提供 `chat/completions`、`responses` 与 `models`；Anthropic 兼容渠道提供 `messages` 与 `messages/count_tokens`（认证走 `x-api-key` 或 Bearer）；统一中转站渠道接受以上全部请求，按客户端实际使用的格式原样转发 —— 适合同时支持 OpenAI 与 Anthropic 两种格式的中转站，无需区分。一个别名固定路由到一个渠道，不重试/不回退/不熔断；上游 3xx 一律拒绝；渠道 key 绝不落盘、绝不进日志。每个已转发请求记入本地账本（`reports/gateway-ledger.db`，仅元数据），控制台实时展示用量与异常告警（模型自述不符/错误率/截断/usage 异常/TTFT 偏高）——详见下文「API 网关：观测与数据保证」。
-3. **历史报告** —— 列出 `reports/` 下全部报告，任意 `report-*.json` 页内渲染评分卡，md/html 新标签打开。
+The score is a weighted geometric credibility total (0–100); every dimension is verified independently:
 
-注意：
+| Dimension | Weight | Verifies |
+|---|---|---|
+| Billing | 25 | endpoint-reported token shape (linearity / consistency / output side) + rate comparison (default: price ratio from public vs list price; guard / balance mode: measured spend delta) |
+| Quality | 25 | versioned fixed question bank, pass@1 accuracy against reference answers |
+| Identity | 15 | self-ID questions + behavioral fingerprints — catches relabeled / guardrail-swapped / variant-swapped models |
+| Context | 15 | needle test at claimed depth; usage-calibration cross-check |
+| Capability | 10 | advertised vision / tool / thinking actually exercised |
+| TTFT | observation only | streaming first-token latency p50/p95, never scored |
 
-- `guard` 透明代理仅命令行可用（启动方式见上文「命令行运行（可选）」）：它要求客户端 key 与 `MODEL_XRAY_KEY` 完全一致，适合长期盯真实流量，也是当前唯一的长期监控路径（控制台内的实时用量/告警面板随「API 聚合」一并暂未上线，后需迭代）；控制台不托管 guard 进程。
-- 服务只绑定 127.0.0.1；所有写操作 API 都要求携带注入页面的会话 token（持久化在 `tmp/console-token`，已被 gitignore，重启后已打开的标签页仍可用）。报告文件仅从 `reports/` 提供，带扩展名白名单、路径穿越防护、32 MB 大小上限与沙箱 CSP（报告与控制台同源，绝不能让它执行脚本或读到控制台 token）。
-- 控制台的 `baseline` 只接受本仓库内的 `.json`（相对路径或仓库内绝对路径；UNC/网络路径一律拒绝）——该路径会交给本机子进程，绝不能让它指向机器上的任意文件。
-- key 只存于本地服务进程（或环境变量 `MODEL_XRAY_KEY`）；key 栏仅位于「模型检测」页；绝不写日志（敏感串脱敏）、绝不出现在命令预览里。
-- 旧的纯静态轻壳已移除；若页面脱离本地服务直接打开，会降级为只读提示（仍可预览可复制命令）。
+**How to read the result:**
 
-### API 网关：观测与数据保证
+- Verdict = exit code: **pass** (0) · **warn** (0) · **fail** (1) · **usage error / inconclusive** (2).
+- Dimensions without sufficient evidence are marked `N/A` and excluded — never counted as 0.
+- Any dimension fail or total < 40 → fail; billing / capability / context / quality below 40 hits a hard red line (total capped at 45); falsified capability caps at 60; total < 75 or any warn → suspicious.
+- **Billing is shape-only by default:** all shape checks passing without absolute reconciliation passes at **85 with explicit disclosure** (uniform rescaling and inflated charges cannot be excluded by shape alone); absolute reconciliation passing raises it to 100.
+- **Price cuts are not penalized:** when `--baseline` or the local price ledger detects a significant change, only an increase or a basis break lowers the score; an explicit decrease is disclosed as cheaper and does not cap the score.
+- **Run 2–3 times before concluding.** Transient endpoint anomalies (empty bodies, 429/503, network hiccups) skew single runs; fix `--seed` and pair `--baseline` / `--baseline-out` to keep the probeset comparable.
 
-本地 API 网关（Web 控制台第 2 页）把每个已转发请求记入本地 SQLite 账本，并实时监控渠道异常。**本版暂未上线**——该标签已隐藏、控制台 `/api/gateway/*` 端点回 503（未携带有效会话 token 的请求仍先回 403）；下文为该功能上线后的已实现行为（验收脚本直接跑网关模块，仍可执行）：
+### 4. How it works: evidence, not claims
 
-- **账本** —— `reports/gateway-ledger.db`：只含结构元数据（origin/渠道/别名/状态/token/费用/TTFT，无任何正文；渠道 key 绝不写入）。属运行时数据、已 gitignore。
-- **保留策略** —— 本版不自动清理：需要时整库归档或删除——不要手删单行（会按设计触发断链报告）；归档即整体移动/改名数据库文件。
-- **hash 链** —— 每行带 `row_hash = sha256(上一行 row_hash + 规范化行 JSON)`，两表（`requests`/`settlements`）各自成链；`verifyChain()` 报告首个断点，上链前的旧行按 legacy 计数。可检出局部篡改（误改、单行重写）；链未加钥，无法阻止整体重写文件的人。
-- **崩溃恢复** —— 网关启动时为无结算的请求补记 `interrupted` / `error_source=gateway`（是网关重启，绝不冤枉中转站）；重复恢复幂等。
-- **降级不阻断** —— 账本写失败时转发照常；观测缺口显式披露（控制台横幅 + `status().degraded`），绝不静默吞掉。
-- **异常告警** —— 按渠道滚动窗口（最近 100 条观测）：模型名不一致 ≥2；错误率 >50%（n≥5）；出现截断（n≥3）；usage 畸形 >30%（n≥10）；TTFT 偏高（未污染样本 n≥20 且 p95≥300ms——绝对下限，不与历史比较）。  同一 (渠道, 类别) 30 分钟内至多告警一次（重复触发的压制次数经 `status().alertSuppressed` 如实披露）；网关启动后前 5 分钟全体静默（`status().alertSilenceRemainingMs`；`alertSilenceWasActive` 粘性披露静默期曾生效）。每条事件附最多 10 条证据请求 id，可到账本下钻核对。
-- **TTFT 双口径 + 污染防护** —— 每笔结算两个独立时钟：ttft_upstream_ms（请求发出 → 上游首个内容帧）与 ttft_client_ms（请求进网关 → 向客户端写出首个字节；错误体转发同样打点，全程无写入才为 NULL——绝不写 0 冒充）。  样本窗口内事件循环延迟 ≥ 50ms 时该上游样本标记污染：照实入账（`ttft_contaminated=1`，原始值保留）但不进 p50/p95，机器卡顿不会污染时延统计。
-- **控制台端点（须 token）** —— `GET /api/gateway/status`、`GET /api/gateway/usage`、`GET /api/gateway/events`、`/api/gateway/channels` 下的渠道 CRUD、`POST /api/gateway/probe-models`（一键探测上游模型列表）仅存在于控制台端口（8620）；数据面跑在独立的回环端口上（缺省随机分配，可指定），不暴露任何管理端点。
-- **验收脚本** —— 上文每条保证都对应一条可运行检查（`npm run <脚本>`）：
-  verify:sse（逐字节切割 SSE 回放 + UTF-8 边界 + usage 拒收）· verify:usage（usage 校验矩阵：四类拒收口径）· verify:ledger（hash 链 + 篡改检出 + 幂等结算/恢复）·
-  verify:crash（真实 SIGKILL 崩溃恢复）· verify:leak（金丝雀 key 绝不入账本/日志）· verify:ttft（仅角色假首帧剔除）· verify:tz（时间戳 epoch 毫秒口径）·
-  verify:looplag（污染剔除守恒不变式）· verify:alerts（告警阈值含 ttft_high 边界）· verify:degraded（账本故障 → fail-open + 披露）。
-  以上覆盖已实现切片；verify:sched / verify:delta / verify:ports / verify:retry 属尚未实施的 M4–M6 切片，故意不设。
+In one sentence: **it behaves like a real user and measures differences — in behavior and in money — instead of reading the vendor's marketing page.**
 
-### 状态
+| Dimension | Probe (simplified) |
+|---|---|
+| Identity | Asks "who are you / which version" plus behavioral fingerprints; a self-reported model, family, or variant suffix that doesn't match the requested id raises an alert — catches relabeling, lighter siblings, guardrail swaps. |
+| Quality | Runs a versioned fixed question bank and scores pass@1 against reference answers; the resample is evidence only, so one unlucky first answer doesn't convict a station. |
+| Context | Hides a needle at the claimed depth and asks for it back; cross-checks endpoint-reported `prompt_tokens` against what was actually sent — catches "claims 128K, serves 32K". |
+| Billing | Runs a within-run linearity regression and hard-contradiction checks on self-reported tokens; by default compares public vs list price for a price ratio, and in balance/guard mode measures the real multiplier as spend ÷ (claimed price × reported usage). |
+| Capability | Actually exercises advertised vision / tool calling / thinking instead of reading the spec sheet. |
+| Latency | Samples streaming first-token latency (p50 / p95); observation only, never scored. |
 
-v0.2.0 —— `test` 与 `guard`（P2，仅命令行）均已可用；仓库内还提供可执行 Web 控制台（`npm run ui`，两个标签页：一次性检测 / 历史报告）。本地 API 聚合网关（多渠道模型别名路由，暂不重试/不回退；支持 OpenAI 兼容、Anthropic Messages 与统一中转站三种协议，含 OpenAI Responses 格式；已含本地账本、实时用量、可选模型价格与费用统计、异常告警）**已实现但本版临时停用**（「API 聚合」标签隐藏、`/api/gateway/*` 端点回 503）——后需迭代上线。尚未发布到 npm：请按「快速开始」从源码运行（发布后 `npx model-xray` 开箱即用）。本仓库承载 CLI 与版本化测试资产；检测报告生成在本机 `reports/`（已 gitignore，属运行数据，不入库）。
+Thresholds, question banks, and needles are versioned so reports stay reproducible; insufficient evidence is marked `N/A` and never scored as 0; every finding traces back to raw request/response evidence via `evidenceIds`.
+
+### 5. Advanced usage
+
+Know the station's claims? Add `--claimed-context 128000`, `--expect vision,tool,thinking`, `--price-input 0.2 --price-output 0.7`, `--expect-model-ratio 1.5 --expect-completion-ratio 4`, `--declared-price-page /pricing`; preview with `--dry-run`.
+
+**Re-audit / catch a silent swap:** keep the `baseline-<model>-<timestamp>.json` from the first run and pass `--baseline reports/baseline-....json`.
+
+**Always-on monitoring (`guard`, CLI-only):**
+
+```powershell
+$env:MODEL_XRAY_KEY = 'sk-your-key'
+model-xray guard --base-url https://your-relay.example.com/v1 --price-input 0.2 --price-output 0.7 --reconcile-minutes 15
+# point your client at http://127.0.0.1:8621/v1 with the SAME key
+```
+
+**Free rate watch / cross-site scan (no key, no model spend):**
+
+```bash
+model-xray pricing-watch --base-url https://your-relay.example.com/v1 --once
+model-xray pricing-scan --base-url https://relay-a.example.com/v1 --base-url https://relay-b.example.com/v1
+```
+
+In short: `pricing-watch` tracks **one** station's public rate table over time (hourly by default; `--once` for a single check) and alerts on > 5% drift or a billing-basis change; `pricing-scan` compares **many** stations in one run.
+
+`pricing-scan --json` returns every model plus the per-endpoint probe trail. When a site does not publish `quota_per_unit`, `quotaPerUnit` is `null` and `quotaPerUnitSynthetic` is `true`; pass `--quota-per-usd` to supply the real rate.
+
+**Troubleshooting & boundaries:**
+
+- `exit 2` or a cost confirmation → add `--yes`.
+- Cost dimension `N/A` → no readable price/balance endpoint or no `--price-*` given; degrades to token-shape checks.
+- Several dimensions undetermined mentioning endpoint/gateway rejection → the endpoint was overloaded; re-run later — not a model problem.
+- Use the **same unit** as the balance reading; never convert prices between currencies (the check is a ratio).
+- Keep the audited key idle during a reconciliation window; a recharge between balance reads voids the window.
+- Thresholds are versioned heuristic initial values; baselines hold aggregate fingerprints only (no keys, prompts, or balances).
+
+### 6. Principles
+
+- No leaderboard and no "our own station" to favor — credibility comes from anyone re-running the same command.
+- Evidence over verdicts: every finding links the raw request/response evidence.
+- Versioned test sets: question banks and needles carry versions so reports stay reproducible.
+
+**Status**: v0.2.0 — `test` and `guard` work; the web console ships one-shot test + historical reports (the API-aggregation gateway is temporarily disabled). Not yet on npm; run from source.
+
+---
 
 ## License
 
