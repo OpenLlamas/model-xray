@@ -21,8 +21,6 @@ export const PUBLIC_PRICE_CANDIDATES = ['/public/model-prices', '/public/models'
 
 /** 公开价表条目上限：与 /api/pricing 一致，超过按出现顺序截断并披露。 */
 const MAX_PUBLIC_PRICE_ENTRIES = 2000;
-/** 公开价表没有 new-api 的 quota 概念；该值仅供 expectedCostFromDeclared 做 USD→quota 换算，不得用于余额。 */
-const SYNTHETIC_QUOTA_PER_UNIT = 500_000;
 
 /** 公开价表原始 USD 单价（每百万 tokens）。 */
 export interface PublicUsdPrice {
@@ -54,6 +52,21 @@ export interface PublicPricingResult {
   /** 输入价为 0（无法反推 modelRatio）的条目数。 */
   unusable: number;
 }
+
+/** 公开价表解析后的归一化表格（不绑定具体页面/来源，供多协议适配层复用）。 */
+export interface PublicPriceTable {
+  models: Record<string, DeclaredModelPricing>;
+  prices: Record<string, PublicUsdPrice>;
+  entries: number;
+  skipped: number;
+  duplicates: number;
+  truncated: number;
+  unusable: number;
+}
+
+export type PublicPriceTableParse =
+  | { ok: true; table: PublicPriceTable }
+  | { ok: false; reason: string; skipped: number; truncated: number };
 
 /** 仅接受十进制字面量：拒绝 1e999、+0.5、空串、0.24abc 等会被 Number() 宽松放过的输入。 */
 const DECIMAL_RE = /^-?\d+(\.\d+)?$/;
@@ -115,7 +128,7 @@ function classifyFailure(raw: Exclude<RawGet, { kind: 'ok' | 'not_found' }>, pag
  * 同源跟随一次重定向（尾斜杠/规范化跳转很常见），跨源或二次跳转一律不跟随。
  * 只放宽「同一 origin 的 301/302/307/308」，不改变任何凭证/超时/大小边界。
  */
-async function getWithSameOriginRedirect(url: URL, timeoutMs: number): Promise<RawGet> {
+export async function getWithSameOriginRedirect(url: URL, timeoutMs: number): Promise<RawGet> {
   const raw = await getJsonText(url.toString(), timeoutMs);
   if (raw.kind !== 'redirect' || raw.location === null) return raw;
   let target: URL;
@@ -125,6 +138,11 @@ async function getWithSameOriginRedirect(url: URL, timeoutMs: number): Promise<R
     return raw;
   }
   if (target.origin !== url.origin) return raw;
+  // origin 已含协议；显式限定 http(s) 并把协议不符也视为越界，避免未来放宽 origin 比较时退回 file/ftp。
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return raw;
+  if (target.protocol !== url.protocol) return raw;
+  // URL 内嵌 userinfo 一律不跟随：即使主机相同，也不接受把凭证写进探测请求。
+  if (target.username !== '' || target.password !== '') return raw;
   target.username = '';
   target.password = '';
   const followed = await getJsonText(target.toString(), timeoutMs);
@@ -132,10 +150,17 @@ async function getWithSameOriginRedirect(url: URL, timeoutMs: number): Promise<R
   return followed;
 }
 
-function parsePublicPayload(payload: unknown, page: string, origin: string): PublicPricingResult {
-  if (!isRecord(payload)) return failed(`${page} 响应不是 JSON 对象`, page);
+/**
+ * 解析公开价表 JSON（items[] → 归一化倍率表 + 原始 USD 单价）。
+ * 不绑定页面/来源，供 `/public/model-prices`、`/public/models` 及其他同 schema 的自定义端点复用。
+ */
+export function parsePublicPriceTable(
+  payload: unknown,
+  ratioToUsdPerMillion: number = USD_PER_MILLION_PER_RATIO,
+): PublicPriceTableParse {
+  if (!isRecord(payload)) return { ok: false, reason: '响应不是 JSON 对象', skipped: 0, truncated: 0 };
   const items = payload['items'];
-  if (!Array.isArray(items)) return failed(`${page} 缺少 items 数组`, page);
+  if (!Array.isArray(items)) return { ok: false, reason: '缺少 items 数组', skipped: 0, truncated: 0 };
 
   const truncated = Math.max(0, items.length - MAX_PUBLIC_PRICE_ENTRIES);
   const limited = items.slice(0, MAX_PUBLIC_PRICE_ENTRIES);
@@ -187,7 +212,7 @@ function parsePublicPayload(payload: unknown, page: string, origin: string): Pub
     }
     models[code] = {
       modelName: code,
-      modelRatio: input / USD_PER_MILLION_PER_RATIO,
+      modelRatio: input / ratioToUsdPerMillion,
       completionRatio: output / input,
       cacheRatio: cached !== null && cached > 0 ? cached / input : null,
       quotaType: 0,
@@ -197,35 +222,42 @@ function parsePublicPayload(payload: unknown, page: string, origin: string): Pub
   }
 
   if (entries === 0) {
+    return { ok: false, reason: '条目为空或全部 schema 不符', skipped, truncated };
+  }
+  return { ok: true, table: { models, prices, entries, skipped, duplicates, truncated, unusable } };
+}
+
+function parsePublicPayload(payload: unknown, page: string, origin: string): PublicPricingResult {
+  const parsed = parsePublicPriceTable(payload);
+  if (!parsed.ok) {
     return {
-      ...failed(`${page} 条目为空或全部 schema 不符`, page),
-      skipped,
-      truncated,
+      ...failed(`${page} ${parsed.reason}`, page),
+      skipped: parsed.skipped,
+      truncated: parsed.truncated,
     };
   }
-
   return {
     state: 'ok',
     reason: null,
     page,
-    entries,
+    entries: parsed.table.entries,
     pricing: {
       origin,
       capturedAt: new Date().toISOString(),
       source: 'public-json',
-      quotaPerUnit: SYNTHETIC_QUOTA_PER_UNIT,
-      // 合成系数不是站点公示值：来源标 none，漂移比对不得据此判「站点改了换算系数」。
+      // 公开价表不公示 quota_per_unit：保持未知，绝不把标准基价当成站点值。
+      quotaPerUnit: null,
       quotaPerUnitSource: 'none',
       quotaPerUnitConflict: null,
-      models,
+      models: parsed.table.models,
       groupRatio: {},
       group: null,
     },
-    prices,
-    skipped,
-    duplicates,
-    truncated,
-    unusable,
+    prices: parsed.table.prices,
+    skipped: parsed.table.skipped,
+    duplicates: parsed.table.duplicates,
+    truncated: parsed.table.truncated,
+    unusable: parsed.table.unusable,
   };
 }
 

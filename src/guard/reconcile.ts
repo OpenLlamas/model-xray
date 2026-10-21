@@ -11,9 +11,9 @@ export type RatioVerdict = 'ok' | 'warn' | 'fail';
 type ReconcileReading = BalanceReading & { quotaToUsd?: number | null };
 
 /**
- * 实测倍率分级（期望值 1.0），只读复用基线漂移阈值 DRIFT_BILLING_ABS/REL：
+ * 实扣倍率分级（期望值 1.0），只读复用基线漂移阈值 DRIFT_BILLING_ABS/REL：
  * - |ratio-1| 同时超过绝对(0.05)与相对(0.2)带宽 → warn（与 baseline 计费斜率漂移判据同构）；
- * - ratio > 1.5 → fail（与审计实测倍率硬阈值一致：实际扣费超宣称 1.5 倍）；
+ * - ratio > 1.5 → fail（与审计实扣倍率硬阈值一致：实际扣费超宣称 1.5 倍）；
  * - 其余（含小幅下偏）→ ok。
  */
 export function gradeRatio(ratio: number): RatioVerdict {
@@ -45,7 +45,7 @@ export interface ReconcilerOptions {
  * 滚动对账器：余额差值 ÷ 窗口预期成本。
  * - 请求按「完成时间」归属窗口（recordCompletion 在请求 finalize 时调用）；
  * - usage 缺失/无效的请求单列计数（usageMissing），不进 cost 分母；
- * - 窗口内存在缺失/无效 usage（分母不完整，实测倍率只会上偏）→ skipped，不出 ratio（防假阳性 fail）；
+ * - 窗口内存在缺失/无效 usage（分母不完整，实扣倍率只会上偏）→ skipped，不出 ratio（防假阳性 fail）；
  * - 余额不可得 / 跨端点不同源 / 分母为 0 → skipped 事件，不出 ratio；
  * - Δbalance < 0（充值/退款混入）→ skipped_recharge 事件，不出 ratio。
  */
@@ -206,7 +206,7 @@ export class Reconciler {
           normalizedDelta = outcome.delta;
           if (outcome.confidence === 'low') lowConfidenceNote = calibrationLowConfidenceNote(outcome);
         } else {
-          unitSkipMessage = `实测倍率判定作废：${outcome.message ?? 'total_usage 单位口径无法校准。'}`;
+          unitSkipMessage = `实扣倍率判定作废：${outcome.message ?? 'total_usage 单位口径无法校准。'}`;
         }
       } else if (this.lastReading.unit === 'quota' && reading.unit === 'quota') {
         // guard 不新增网络请求：只用读数上下文已附着的声明式换算率（站点/CLI 预置）。
@@ -250,7 +250,7 @@ export class Reconciler {
         // 分母不完整：余额差值含未观测 usage 请求的真实扣费，ratio 只会系统性上偏——
         // 与测试侧「ratio_contaminated 作废实测」同一纪律，绝不拿不完整窗口出判定（防假阳性 fail）
         verdict = 'skipped';
-        message = `窗口内 ${this.windowUsageMissing} 笔请求缺失/无效 usage，分母不完整、实测倍率只会上偏，作废本窗口不出倍率（缺失已单列）。`;
+        message = `窗口内 ${this.windowUsageMissing} 笔请求缺失/无效 usage，分母不完整、实扣倍率只会上偏，作废本窗口不出倍率（缺失已单列）。`;
       } else if (unitSkipMessage !== null) {
         verdict = 'skipped';
         message = unitSkipMessage;
@@ -261,17 +261,17 @@ export class Reconciler {
         const computed = normalizedDelta / this.windowCost;
         if (!Number.isFinite(computed)) {
           verdict = 'skipped';
-          message = `实测倍率计算越界（Δ=${round(normalizedDelta)}，cost=${round(this.windowCost)}），本窗口跳过对账。`;
+          message = `实扣倍率计算越界（Δ=${round(normalizedDelta)}，cost=${round(this.windowCost)}），本窗口跳过对账。`;
         } else {
           ratio = computed;
           verdict = gradeRatio(computed);
           const suffix = lowConfidenceNote;
           message =
             verdict === 'fail'
-              ? `实测倍率 ${round(computed)} > 1.5：窗口扣费显著高于按宣称价格的应缴金额（${final ? '退出结算' : '滚动对账'}）。${suffix}`
+              ? `实扣倍率 ${round(computed)} > 1.5：窗口扣费显著高于按宣称价格的应缴金额（${final ? '退出结算' : '滚动对账'}）。${suffix}`
               : verdict === 'warn'
-                ? `实测倍率 ${round(computed)} 偏离宣称价格带宽（|ratio-1| > ${DRIFT_BILLING_REL}），存在加价/单位错配嫌疑（${final ? '退出结算' : '滚动对账'}）。${suffix}`
-                : `实测倍率 ${round(computed)} 在正常带宽内（${final ? '退出结算' : '滚动对账'}）。${suffix}`;
+                ? `实扣倍率 ${round(computed)} 偏离宣称价格带宽（|ratio-1| > ${DRIFT_BILLING_REL}），存在加价/单位错配嫌疑（${final ? '退出结算' : '滚动对账'}）。${suffix}`
+                : `实扣倍率 ${round(computed)} 在正常带宽内（${final ? '退出结算' : '滚动对账'}）。${suffix}`;
         }
       }
     }

@@ -55,6 +55,7 @@ function fullInput() {
     expectCompletionRatio: '4',
     quotaPerUsd: '500000',
     declaredPricePage: '/pricing',
+    readBalance: true,
     seed: '12345',
     timeout: '60',
     out: 'reports-out',
@@ -82,6 +83,7 @@ function minimalInput() {
     expectCompletionRatio: '',
     quotaPerUsd: '',
     declaredPricePage: '',
+    readBalance: false,
     seed: '',
     timeout: '',
     out: '',
@@ -102,12 +104,21 @@ test('classifyLogLine：阶段/请求/结果行颜色分类，且 CSS 有对应�
     classifyLogLine('[RUN] ttft 请求 #3 开始（第 1 次尝试 · 约 10 输入 tokens；超时上限 60s）'),
     'log-line log-line-request log-line-phase-ttft',
   );
-  assert.equal(classifyLogLine('[WARN] identity — 身份探针存在 2 项可疑信号'), 'log-line log-line-warn');
+  assert.equal(classifyLogLine('[WARN] identity — 身份探针存在 2 项未达实锤标准的信号'), 'log-line log-line-warn');
+  assert.equal(classifyLogLine('[FAIL] identity — 身份矛盾：明显换壳实锤'), 'log-line log-line-fail');
   assert.equal(classifyLogLine('[UNKNOWN] identity — 身份探针无有效回答'), 'log-line log-line-unknown');
   assert.equal(classifyLogLine('[PASS] context — 上下文探针通过'), 'log-line log-line-pass');
+  // 「未见异常」是正常结论，不能让关键词兜底把 PASS 行染红。
+  assert.equal(classifyLogLine('[PASS] identity 100 身份探针未见异常'), 'log-line log-line-pass');
+  assert.equal(
+    classifyLogLine('[PASS] billing 85 usage 计数核验通过，已按站点公开价表折算应缴金额'),
+    'log-line log-line-pass',
+  );
+  assert.equal(classifyLogLine('[N/A] context - 未提供 --claimed-context，跳过上下文实测'), 'log-line log-line-unknown');
   assert.equal(classifyLogLine('[INFO] starved sample'), 'log-line log-line-info');
   assert.equal(classifyLogLine('[FAIL] quality — 质量异常'), 'log-line log-line-fail');
   assert.equal(classifyLogLine('plain text'), 'log-line');
+  assert.equal(classifyLogLine('无标签但检测到异常'), 'log-line log-line-fail');
   for (const phase of ['identity', 'context', 'billing', 'capability', 'decoy', 'quality', 'ttft']) {
     assert.match(dashboardHtml, new RegExp(`\\.log-line-phase-${phase}\\s*\\{[^}]*color`), `missing CSS color for ${phase}`);
   }
@@ -134,6 +145,7 @@ const ALLOWED_FLAGS = [
   '--expect-completion-ratio',
   '--quota-per-usd',
   '--declared-price-page',
+  '--read-balance',
   '--seed',
   '--timeout',
   '--out',
@@ -205,6 +217,7 @@ test('buildCommand：全参数——含全部 flag，字符串参数单引号包
   assert.ok(command.includes('--expect-completion-ratio 4'), command);
   assert.ok(command.includes('--quota-per-usd 500000'), command);
   assert.ok(command.includes("--declared-price-page '/pricing'"), command);
+  assert.ok(command.includes('--read-balance'), command);
   assert.ok(command.includes('--timeout 60'), command);
   assert.ok(command.includes('--deep'), command);
   assert.ok(command.includes('--dry-run'), command);
@@ -228,6 +241,15 @@ test('buildCommand：缺 --model → error', () => {
   const result = buildCommand({ ...minimalInput(), model: '  ' });
   assert.ok(result.error !== null && result.error.includes('--model'));
   assert.equal(result.command, '');
+});
+
+test('buildCommand：余额对账未填价格 → error（实扣倍率分母依赖录入价）；填了价格 → 透传 --read-balance', () => {
+  const noPrice = buildCommand({ ...minimalInput(), readBalance: true });
+  assert.ok(noPrice.error !== null && noPrice.error.includes('余额对账'), noPrice.error ?? '');
+  assert.equal(noPrice.command, '');
+  const withPrice = buildCommand({ ...minimalInput(), priceInput: '2.5', priceOutput: '10', readBalance: true });
+  assert.equal(withPrice.error, null);
+  assert.ok(withPrice.command.includes('--read-balance'), withPrice.command);
 });
 
 test('buildCommand：价格只填一个 → 成对提示 error（双向）', () => {
@@ -490,7 +512,11 @@ test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / f
   const result = renderScorecard(JSON.stringify(report));
   assert.equal(result.error, null);
   assert.ok(result.html.includes('可信度总分：87'), result.html);
-  assert.ok(result.html.includes('通过'));
+  // pass/warn 轮不再渲染「通过/可疑」结论徽标，只展示分数；fail 才有「不通过」徽标
+  assert.ok(!result.html.includes('>通过</span>'), result.html);
+  const failResult = renderScorecard(JSON.stringify({ ...sampleReport({}), overall: 'fail' }));
+  assert.equal(failResult.error, null);
+  assert.ok(failResult.html.includes('>不通过</span>'), failResult.html);
   for (const id of ['identity', 'context', 'billing', 'capability', 'quality', 'ttft', 'extra']) {
     assert.ok(result.html.includes(id), `缺少探针 ${id}`);
   }
@@ -498,7 +524,37 @@ test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / f
   assert.ok(result.html.includes('note 一'));
 });
 
-test('renderScorecard：计费探针的公示倍率/实测倍率/金额核验指标必须可见（中文标签 + 原值）', () => {
+test('renderScorecard：scores 优先展示（实锤封顶分与报告一致），未覆盖观测项按原样追加', () => {
+  // 实锤封顶语义：报告 JSON 里 scores[].billing=45（封顶后）而 outcomes[].billing=70（探针原始分），
+  // 评分卡表必须显示 45；否则与 CLI/Markdown/HTML 详情区矛盾。
+  const report = sampleReport({
+    total: 45,
+    overall: 'fail',
+    scores: [{ id: 'billing', weight: 25, score: 45, level: 'fail', headline: '换芯实锤', status: 'ok' }],
+    outcomes: [
+      sampleOutcome('billing', { score: 70, level: 'fail', headline: '换芯实锤' }),
+      sampleOutcome('identity'),
+      sampleOutcome('decoy', { score: null, level: 'unknown' }),
+    ],
+  });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  assert.ok(result.html.includes('<td class="score">45</td>'), result.html);
+  assert.ok(!result.html.includes('<td class="score">70</td>'), `评分卡不得显示探针原始分 70：${result.html}`);
+  // billing 已被 scores 覆盖不重复；identity 不在 scores → 按原样追加（95）；decoy score null → —
+  assert.ok(result.html.includes('<td class="score">95</td>'), result.html);
+  assert.ok(result.html.includes('<td class="score">—</td>'), result.html);
+});
+
+test('renderScorecard：老报告 scores 为空/缺失 → 回退 outcomes 原始分（兼容不炸）', () => {
+  for (const report of [sampleReport({}), sampleReport({ scores: undefined })]) {
+    const result = renderScorecard(JSON.stringify(report));
+    assert.equal(result.error, null);
+    assert.ok(result.html.includes('<td class="score">95</td>'), result.html);
+  }
+});
+
+test('renderScorecard：计费探针的公示倍率/实扣倍率/金额核验指标必须可见（中文标签 + 原值）', () => {
   const report = sampleReport({
     outcomes: [
       sampleOutcome('identity'),
@@ -534,7 +590,7 @@ test('renderScorecard：计费探针的公示倍率/实测倍率/金额核验指
   assert.ok(result.html.includes('计费与倍率'), result.html);
   assert.ok(result.html.includes('公示输入倍率'), result.html);
   assert.ok(result.html.includes('公示输出倍率'), result.html);
-  assert.ok(result.html.includes('实测倍率'), result.html);
+  assert.ok(result.html.includes('实扣倍率'), result.html);
   assert.ok(result.html.includes('分组折扣倍率'), result.html);
   // 金额核验
   assert.ok(result.html.includes('金额核验状态'), result.html);
@@ -543,8 +599,8 @@ test('renderScorecard：计费探针的公示倍率/实测倍率/金额核验指
   assert.ok(result.html.includes('total_usage_raw'), result.html);
   assert.ok(result.html.includes('500000'), result.html);
   // 公示价应缴额与校准置信度也在摘要块（倍率结论的可复核依据）
-  assert.ok(result.html.includes('计费探针费用（按公示价，USD）'), result.html);
-  assert.ok(result.html.includes('计费探针费用（按公示价，quota）'), result.html);
+  assert.ok(result.html.includes('按价目应扣（USD，估算）'), result.html);
+  assert.ok(result.html.includes('按价目应扣（quota，估算）'), result.html);
   assert.ok(result.html.includes('210000'), result.html);
   assert.ok(result.html.includes('单位校准置信度'), result.html);
   // 布尔值读作是/否（不是裸 true）
@@ -840,7 +896,7 @@ test('isTokenAuthError：仅 403 且 token 缺失/过期才允许重试；Host/O
   assert.equal(isTokenAuthError(500, { code: 'token_stale' }), false);
 });
 
-test('renderScorecard：倍率摘要块必须给出「公示倍率 / 实测倍率 / 为什么没有倍率的原因 / 证据等级」', () => {
+test('renderScorecard：倍率摘要块必须给出「公示倍率 / 实扣倍率 / 为什么没有倍率的原因 / 证据等级」', () => {
   const report = sampleReport({
     outcomes: [
       sampleOutcome('billing', {
@@ -859,9 +915,37 @@ test('renderScorecard：倍率摘要块必须给出「公示倍率 / 实测倍�
   const result = renderScorecard(JSON.stringify(report));
   assert.equal(result.error, null);
   const html = result.html ?? '';
-  for (const label of ['公示输入倍率', '公示输出倍率', '实测倍率', '余额探测原因', '金额核验状态', '证据等级']) {
+  for (const label of ['公示输入倍率', '公示输出倍率', '实扣倍率', '余额探测原因', '金额核验状态', '证据等级']) {
     assert.ok(html.includes(label), `倍率摘要块缺标签「${label}」`);
   }
   assert.ok(html.includes('候选余额接口均不可用'), '倍率摘要块必须带「为什么没有倍率」的原因原文');
   assert.ok(html.includes('shape-only'), '倍率摘要块必须显示证据等级');
 });
+
+test('renderScorecard：计费块每个 N/A 连标准原因，比价标「未看实扣」，应缴标「估算」', () => {
+  const report = sampleReport({
+    outcomes: [
+      sampleOutcome('billing', {
+        metrics: {
+          measured_ratio: 'N/A',
+          balance_probe_reason: '候选余额接口均不可用',
+          claimed_price_ratio_input: 'N/A',
+          claimed_price_ratio_output: 'N/A',
+          quota_per_unit_synthetic: 1,
+          expected_cost_usd_declared: 0.42,
+          spend_delta: 0.5,
+          evidence_level: 'shape-only',
+        },
+      }),
+    ],
+  });
+  const result = renderScorecard(JSON.stringify(report));
+  assert.equal(result.error, null);
+  const html = result.html ?? '';
+  assert.ok(html.includes('N/A（该站没有可用的余额接口）'), `N/A 必须连标准原因：${html}`);
+  assert.ok(html.includes('N/A（站点未公示 quota_per_unit 换算率）'), `缺换算率必须连原因：${html}`);
+  assert.ok(html.includes('你填的单价÷站点现价（输入；只比价目，未看实扣）'), `比价必须标未看实扣：${html}`);
+  assert.ok(html.includes('按价目应扣（USD，估算）'), `应缴必须标估算：${html}`);
+  assert.ok(html.includes('本轮实际扣费（实测；单位校准采信后为估算）'), `实际扣费必须标口径：${html}`);
+});
+

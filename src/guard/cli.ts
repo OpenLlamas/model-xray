@@ -30,9 +30,9 @@ const GUARD_HELP = `model-xray guard — 常驻监控：本地透明转发代理
   --base-url <url>            必填。真实中转站地址，例如 https://relay.example.com/v1
   --port <n>                  本地监听端口，[1, 65535] 整数（默认 8621）
   --out <dir>                 审计日志目录（默认 reports/guard；按日轮转 guard-YYYYMMDD.jsonl）
-  --price-input <n>           宣称输入价（$/M tokens），与 --price-output 成对出现才启用金额对账
-  --price-output <n>          宣称输出价（$/M tokens）
-  --price-cached-read <n>     宣称缓存读价（$/M tokens，可不填=按输入价）
+  --price-input <n>           录入输入价（与余额同单位/百万 tokens），与 --price-output 成对出现才启用金额对账
+  --price-output <n>          录入输出价（与余额同单位/百万 tokens）
+  --price-cached-read <n>     录入缓存读价（与余额同单位/百万 tokens，可不填=按输入价）
   --price-threshold <n>       长上下文阶梯阈值（prompt tokens 正整数；须与二档输入/输出同填）
   --price-input2 <n>          二档输入价（$/M tokens）
   --price-output2 <n>         二档输出价（$/M tokens）

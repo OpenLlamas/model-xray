@@ -1,5 +1,5 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
-import { levelLabel, statusTag } from '../scoring.js';
+import { statusTag, verdictLabel } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 
 /** 固定注记：报告输出可信度评分而非真伪断言（html.ts 同步使用）。 */
@@ -10,8 +10,12 @@ export function renderMarkdown(report: AuditReport): string {
   const meta = report.meta;
   lines.push(`# model-xray 报告 — ${singleLine(meta.model)}`);
   lines.push('');
+  // 仅实锤（计费/身份 fail）或未判定时有结论词；其余只展示分数（无「可疑/通过」中间档）。
+  const verdict = verdictLabel(report.overall);
   lines.push(
-    `> 可信度总分：**${report.total ?? '未判定'}${report.total === null ? '' : '/100'}** · 结论：**${levelLabel(report.overall)}**`,
+    `> 可信度总分：**${report.total ?? '未判定'}${report.total === null ? '' : '/100'}**${
+      verdict === null ? '' : ` · 结论：**${verdict}**`
+    }`,
   );
   lines.push('');
 
@@ -60,8 +64,10 @@ export function renderMarkdown(report: AuditReport): string {
 
   lines.push('## 检测详情');
   lines.push('');
+  // 分项得分（含实锤封顶）按 id 建索引：检测详情区与评分卡同源展示，不显示探针原始分。
+  const scoreById = new Map(report.scores.map((s) => [s.id, s.score]));
   for (const outcome of report.outcomes) {
-    lines.push(renderOutcome(outcome));
+    lines.push(renderOutcome(outcome, scoreById.get(outcome.id)));
   }
 
   if (report.evidence.length > 0) {
@@ -76,9 +82,13 @@ export function renderMarkdown(report: AuditReport): string {
   return `${lines.join('\n')}\n`;
 }
 
-function renderOutcome(outcome: ProbeOutcome): string {
+function renderOutcome(outcome: ProbeOutcome, scoreOverride?: number | null): string {
   const lines: string[] = [];
-  lines.push(`### ${outcome.id} — ${statusTag(outcome.level)}（${outcome.score ?? '未判定'}）`);
+  // 分数展示与评分卡同源：scores 里的分项分已经过聚合层实锤封顶（定罪维度不保留及格分），
+  // 详情区不得再显示探针原始分（否则同一份报告出现「评分卡 45 / 详情 70」的矛盾数字）。
+  // scores 未覆盖的观测项（如 decoy）回退 outcome.score；覆盖但分数 null（未判定）也按未判定展示。
+  const shownScore = scoreOverride !== undefined ? scoreOverride : outcome.score;
+  lines.push(`### ${outcome.id} — ${statusTag(outcome.level)}（${shownScore ?? '未判定'}）`);
   lines.push('');
   // headline 可能内嵌上游错误消息（可含换行），单行化避免破坏 Markdown 段落结构。
   lines.push(singleLine(outcome.headline));
@@ -125,7 +135,7 @@ export const HIDDEN_METRICS = new Set(['declared_models_json', 'declared_group_r
 
 /**
  * 计费维度「计费与倍率」摘要块的固定展示顺序与中文标签。
- * 只列「决定性 + 解释性」指标：公示倍率、实测倍率、金额核验、以及「为什么没有倍率」的原因字段
+ * 只列「决定性 + 解释性」指标：公示倍率、实扣倍率、金额核验、以及「为什么没有倍率」的原因字段
  * （余额探测原因 / 污染标记 / 证据等级）；其余原始指标仍由下方完整指标表承载。
  * 控制台 web/app.js 有一份同口径副本（web/ 不参与 tsc 编译，无法直接 import 复用），
  * 两侧一致性由 test/unit/report.test.ts 的漂移钉子守住。
@@ -138,10 +148,11 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['declared_group', '生效分组'],
   ['declared_group_ratio', '分组折扣倍率'],
   ['group_ratio_verified', '分组倍率可信'],
-  ['declared_model_ratio', '公示输入倍率'],
-  ['declared_completion_ratio', '公示输出倍率'],
+  ['declared_model_ratio', '公示输入倍率（公开价表为反推值）'],
+  ['declared_completion_ratio', '公示输出倍率（公开价表为反推值）'],
   ['cache_ratio', '缓存倍率'],
-  ['declared_drift_count', '公示价漂移项数'],
+  ['declared_drift_count', '公示价上调/口径断裂项数'],
+  ['declared_drift_down_count', '公示价下调项数（不扣分）'],
   ['declared_drift_fields', '公示价漂移字段'],
   ['public_price_state', '公开价表状态'],
   ['public_price_page', '公开价表页面'],
@@ -154,8 +165,10 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['public_price_list_input_usd_per_m', '公开价列表输入价（$/百万）'],
   ['public_price_list_output_usd_per_m', '公开价列表输出价（$/百万）'],
   ['public_price_list_cached_usd_per_m', '公开价列表缓存价（$/百万）'],
-  ['public_price_ratio_input', '价格倍率（输入）'],
-  ['public_price_ratio_output', '价格倍率（输出）'],
+  ['claimed_price_ratio_input', '你填的单价÷站点现价（输入；只比价目，未看实扣）'],
+  ['claimed_price_ratio_output', '你填的单价÷站点现价（输出；只比价目，未看实扣）'],
+  ['public_price_ratio_input', '站点现价÷官方列表价（输入；仅披露）'],
+  ['public_price_ratio_output', '站点现价÷官方列表价（输出；仅披露）'],
   ['scraped_price_state', '网页抓价状态'],
   ['scraped_price_reason', '网页抓价原因'],
   ['scraped_price_page', '抓价页面'],
@@ -164,9 +177,9 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['scraped_price_output_usd_per_m', '抓价输出价（$/百万）'],
   ['scraped_price_confidence', '抓价置信度'],
   ['scraped_price_currency', '抓价币种'],
-  ['measured_ratio', '实测倍率'],
-  ['ratio_verified', '实测倍率可信'],
-  ['ratio_masked_verdict', '实测倍率结论'],
+  ['measured_ratio', '实扣倍率（实际扣费÷应缴）'],
+  ['ratio_verified', '实扣倍率可信'],
+  ['ratio_masked_verdict', '实扣倍率底层判定（用户级口径永不判 fail）'],
   ['ratio_contaminated', '倍率被污染'],
   ['ratio_samples', '倍率样本数'],
   ['ratio_dropped', '丢弃样本数'],
@@ -174,34 +187,37 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['balance_probe_reason', '余额探测原因'],
   ['balance_unit', '余额读数单位'],
   ['balance_resolution', '余额读数刻度'],
-  ['balance_calibrated_unit', '校准后单位'],
-  ['balance_calibration_confidence', '单位校准置信度'],
+  ['balance_calibrated_unit', '校准后单位（推断口径）'],
+  ['balance_calibration_confidence', '单位校准置信度（推断 high/low）'],
   ['balance_scope', '余额口径'],
   ['balance_pre_settled', '前快照已结算'],
   ['balance_post_settled', '后快照已结算'],
   ['balance_before', '请求前余额读数'],
   ['balance_after', '请求后余额读数'],
-  ['spend_delta', '余额扣费差值'],
+  ['spend_delta', '本轮实际扣费（实测；单位校准采信后为估算）'],
   ['money_check_state', '金额核验状态'],
   ['money_verified', '金额已核验'],
-  ['absolute_reconciliation', '绝对对账'],
-  ['expected_cost_usd_declared', '计费探针费用（按公示价，USD）'],
-  ['expected_quota_declared', '计费探针费用（按公示价，quota）'],
-  ['cost_is_upper_bound', '应缴额为上界'],
-  ['cost_is_lower_bound', '应缴额为下界'],
-  ['calibration_confidence', '单位校准置信度'],
+  ['absolute_reconciliation', '与外部硬证据比对'],
+  ['expected_cost_usd_declared', '按价目应扣（USD，估算）'],
+  ['expected_cost_usd_basis', '费用来源（public_usd / quota）'],
+  ['expected_quota_declared', '按价目应扣（quota，估算）'],
+  ['cost_is_upper_bound', '应扣额为上界'],
+  ['cost_is_lower_bound', '应扣额为下界'],
+  ['calibration_confidence', '单位校准置信度（推断 high/low）'],
   ['reference_source', '令牌基准来源'],
   ['reference_verified', '令牌基准已核验'],
   ['quota_to_usd', 'quota→USD 系数'],
   ['quota_per_unit', '站点 quota 每美元'],
-  ['expected_cost', '本轮应缴额'],
-  ['price_input', '宣称输入价（$/百万）'],
-  ['price_output', '宣称输出价（$/百万）'],
-  ['price_cached_read', '宣称缓存读价（$/百万）'],
+  ['quota_per_unit_synthetic', 'quota 换算使用标准基价（1=是）'],
+  ['declared_ratio_synthetic', '公示倍率为公开价表反推（1=是）'],
+  ['expected_cost', '本轮应扣（按你填的单价，估算）'],
+  ['price_input', '录入输入价（与公示同单位/百万）'],
+  ['price_output', '录入输出价（与公示同单位/百万）'],
+  ['price_cached_read', '录入缓存读价（与公示同单位/百万）'],
   ['price_threshold', '阶梯阈值（tokens）'],
-  ['price_input2', '二档输入价（$/百万）'],
-  ['price_output2', '二档输出价（$/百万）'],
-  ['price_cached_read2', '二档缓存读价（$/百万）'],
+  ['price_input2', '二档输入价（与公示同单位/百万）'],
+  ['price_output2', '二档输出价（与公示同单位/百万）'],
+  ['price_cached_read2', '二档缓存读价（与公示同单位/百万）'],
   ['echo_model_mismatch', '回显模型不一致'],
   ['requests', '请求数'],
   ['details_reported_count', '已回报样本数'],
@@ -216,7 +232,7 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['slope_zh', '输入 token 斜率（中）'],
   ['r2_en', '回归 R²（英）'],
   ['r2_zh', '回归 R²（中）'],
-  ['evidence_level', '证据等级'],
+  ['evidence_level', '证据等级（shape-only / absolute）'],
 ];
 
 /**

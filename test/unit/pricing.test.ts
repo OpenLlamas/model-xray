@@ -74,6 +74,27 @@ test('lookupDeclaredModel：精确 → 归一 → 版本尾缀 → 带边界的�
   assert.equal(lookupDeclaredModel(declared, 'claude-3-opus'), null);
 });
 
+test('lookupDeclaredModel：provider/model 仅在去前缀后唯一命中时回退', () => {
+  const prefixed = {
+    models: {
+      'openai/gpt-4o': model({ modelRatio: 1 }),
+      'openai/gpt-4o-mini': model({ modelRatio: 0.2 }),
+    },
+  };
+  assert.equal(lookupDeclaredModel(prefixed, 'gpt-4o')?.key, 'openai/gpt-4o');
+  assert.equal(lookupDeclaredModel(prefixed, 'gpt-4o-mini')?.key, 'openai/gpt-4o-mini');
+  assert.equal(lookupDeclaredModel(prefixed, 'openai/gpt-4o')?.key, 'openai/gpt-4o');
+
+  const ambiguous = {
+    models: {
+      'openai/gpt-4o': model({ modelRatio: 1 }),
+      'azure/gpt-4o': model({ modelRatio: 1.1 }),
+    },
+  };
+  assert.equal(lookupDeclaredModel(ambiguous, 'gpt-4o'), null);
+  assert.equal(lookupDeclaredModel(ambiguous, 'azure/gpt-4o')?.key, 'azure/gpt-4o');
+});
+
 test('expectedCostFromDeclared：quota 公式、美元折算、上下界标注', () => {
   const estimate = expectedCostFromDeclared({ quotaPerUnit: 500000 }, model(), {
     promptTokens: 1000,
@@ -193,8 +214,24 @@ test('parsePricingPayload：schema 能力边界（404 之外的「不是 new-api
   assert.equal(parsePricingPayload({}).ok, false);
   assert.equal(parsePricingPayload({ data: [] }).ok, false);
   assert.equal(parsePricingPayload({ data: [{ foo: 'bar' }] }).ok, false);
-  // 字符串数字不做隐式转换：宁可不判定，也不猜站点口径
-  assert.equal(parsePricingPayload({ data: [{ model_name: 'x', model_ratio: '1', completion_ratio: 4 }] }).ok, false);
+  // 部分 new-api 分支会把数字序列化成字符串：仅接受严格十进制/科学计数法，不猜带单位/逗号的口径。
+  const stringNumber = parsePricingPayload({
+    data: [{ model_name: 'x', model_ratio: '1', completion_ratio: '4e0', quota_type: '0' }],
+    group_ratio: { default: '1' },
+  });
+  assert.equal(stringNumber.ok, true);
+  if (stringNumber.ok) {
+    assert.equal(stringNumber.table.models['x']?.modelRatio, 1);
+    assert.equal(stringNumber.table.models['x']?.completionRatio, 4);
+    assert.deepEqual(stringNumber.table.groupRatio, { default: 1 });
+  }
+  for (const bad of ['1,000', '$1', '1 usd', '1e999', ' ']) {
+    assert.equal(
+      parsePricingPayload({ data: [{ model_name: 'x', model_ratio: bad, completion_ratio: 4 }] }).ok,
+      false,
+      bad,
+    );
+  }
   // completion_ratio=0 / 负数 → 输出免费属异常价格，整条丢弃
   assert.equal(parsePricingPayload({ data: [{ model_name: 'x', model_ratio: 1, completion_ratio: 0 }] }).ok, false);
   assert.equal(parsePricingPayload({ data: [{ model_name: 'x', model_ratio: -1, completion_ratio: 4 }] }).ok, false);
@@ -228,7 +265,7 @@ test('fetchDeclaredPricing：ok + status quota，且绝不携带 Authorization',
       return;
     }
     res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify({ data: { quota_per_unit: 500000 } }));
+    res.end(JSON.stringify({ data: { quota_per_unit: '500000' } }));
   });
   try {
     const result = await fetchDeclaredPricing(`${origin}/v1`, { timeoutMs: 1000, group: ' vip ' });

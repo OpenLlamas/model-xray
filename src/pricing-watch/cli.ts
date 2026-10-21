@@ -1,8 +1,8 @@
 import { parseArgs } from 'node:util';
 import { strictInt, strictPositiveNumber } from '../cli.js';
 import { supportsColor } from '../color.js';
-import { deriveOrigin, fetchDeclaredPricing, type DeclaredPricing } from '../pricing.js';
-import { fetchPublicPricing } from '../pricing-public.js';
+import { deriveOrigin, type DeclaredPricing } from '../pricing.js';
+import { discoverPricing, pricingAdapterLabel } from '../pricing-discovery.js';
 import {
   buildLedgerEntry,
   comparePricingSnapshots,
@@ -18,7 +18,7 @@ const WATCH_HELP = `model-xray pricing-watch — 公示倍率看门狗：只读�
 
 与 test 的区别:
   model-xray test           一次性审计：跑完整探针（真实消耗模型 token），产出评分报告。
-  model-xray pricing-watch   只请求同源公开价接口（/api/pricing、/api/status、公开价表）：
+  model-xray pricing-watch   只请求同源公开价接口（/api/pricing、/api/ratio_config、OpenRouter、LiteLLM、公开价表）：
                              零模型消耗、零计费；按周期把公示价写入本地价格账本并与上一份快照比对，
                              倍率被改动（>5%）即告警。
 
@@ -75,34 +75,29 @@ function errorResult(origin: string, ledgerPath: string, error: string): Pricing
 }
 
 /**
- * 抓站点公示价（/api/pricing 优先，其次公开价表），构造账本条目。
- * 两个来源都拿不到时返回错误（不写账本、不判漂移）。
+ * 抓站点公示价（自动探测 /api/pricing、/api/ratio_config、OpenRouter、LiteLLM、公开价表），
+ * 构造账本条目。所有来源都拿不到时返回错误（不写账本、不判漂移）。
  */
 async function fetchWatchPricing(options: PricingWatchOptions): Promise<{
   pricing: DeclaredPricing | null;
   note: string | null;
   error: string | null;
 }> {
-  const declared = await fetchDeclaredPricing(options.baseUrl, {
+  const discovered = await discoverPricing(options.baseUrl, {
     timeoutMs: options.timeoutMs,
     quotaPerUsd: options.quotaPerUsd,
     group: options.group,
+    model: options.model,
   });
-  if (declared.state === 'ok' && declared.pricing !== null) {
-    return { pricing: declared.pricing, note: '来源：站点公示倍率接口 /api/pricing', error: null };
-  }
-  const publicResult = await fetchPublicPricing(options.baseUrl, { timeoutMs: options.timeoutMs });
-  if (publicResult.state === 'ok' && publicResult.pricing !== null) {
-    return {
-      pricing: publicResult.pricing,
-      note: `来源：公开价表 ${publicResult.page ?? '(未知页)'}`,
-      error: null,
-    };
+  if (discovered.state === 'ok' && discovered.pricing !== null) {
+    const source = pricingAdapterLabel(discovered.adapter);
+    const path = discovered.path ?? '(未知路径)';
+    return { pricing: discovered.pricing, note: `来源：${source} ${path}`, error: null };
   }
   return {
     pricing: null,
     note: null,
-    error: `站点未提供可解析的公示价：/api/pricing ${declared.reason ?? '不可用'}；公开价表 ${publicResult.reason ?? '不可用'}`,
+    error: `站点未提供可解析的公示价：${discovered.reason ?? '未知原因'}`,
   };
 }
 

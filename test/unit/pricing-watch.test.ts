@@ -21,7 +21,12 @@ interface Site {
 
 /** mock 站点：/api/pricing 返回 new-api 风格公示倍率表；/api/status 返回 quota_per_unit；其余 404。 */
 async function startSite(
-  options: { withPricing?: boolean; quotaType?: number; quotaPerUnit?: number | null } = {},
+  options: {
+    withPricing?: boolean;
+    withPublicPricing?: boolean;
+    quotaType?: number;
+    quotaPerUnit?: number | null;
+  } = {},
 ): Promise<Site> {
   const withPricing = options.withPricing !== false;
   let modelRatio = 1;
@@ -35,6 +40,15 @@ async function startSite(
         JSON.stringify({
           data: [{ model_name: 'gpt-4o', model_ratio: modelRatio, completion_ratio: 4, quota_type: quotaType }],
           group_ratio: { default: 1 },
+        }),
+      );
+      return;
+    }
+    if (options.withPublicPricing === true && path.endsWith('/public/model-prices')) {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          items: [{ code: 'gpt-4o', price_input_usd: 2, price_output_usd: 8 }],
         }),
       );
       return;
@@ -103,6 +117,25 @@ test('pricing-watch：首轮建立基线（不判漂移），第二轮无变化�
     assert.ok(ratioDrift !== undefined);
     assert.equal(ratioDrift.direction, 'up');
     assert.equal(ratioDrift.model, 'gpt-4o');
+  } finally {
+    site.close();
+  }
+});
+
+test('pricing-watch：公开价表无真实 quota 时账本写 null，不落合成 500000', async () => {
+  const site = await startSite({ withPricing: false, withPublicPricing: true });
+  const outDir = mkdtempSync(join(tmpdir(), 'model-xray-watch-'));
+  try {
+    const result = await runPricingWatchCycle(makeOptions(site, outDir));
+    assert.equal(result.status, 'ok');
+    assert.equal(result.baselineCreated, true);
+    assert.equal(result.wrote, true);
+    const line = readFileSync(result.ledgerPath, 'utf8').trim().split('\n').at(-1);
+    assert.ok(line !== undefined);
+    const entry = JSON.parse(line) as { source?: string; quotaPerUnit?: unknown; quotaPerUnitSource?: string };
+    assert.equal(entry.source, 'public-json');
+    assert.equal(entry.quotaPerUnit, null);
+    assert.equal(entry.quotaPerUnitSource, 'none');
   } finally {
     site.close();
   }

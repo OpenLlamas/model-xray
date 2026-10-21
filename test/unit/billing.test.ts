@@ -1,8 +1,8 @@
-﻿import { test } from 'node:test';
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { applyRatioDecision, decideRatio, probeBilling, type RatioArgs, type RatioDecision } from '../../src/probes/billing.js';
+import { applyRatioDecision, composeMoneySide, decideRatio, probeBilling, ratioHeadline, type RatioArgs, type RatioDecision } from '../../src/probes/billing.js';
 import type { BalanceReading, } from '../../src/balance.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
@@ -422,6 +422,17 @@ function billingClient(onCall: (track: 'en' | 'zh', index: number) => ChatResult
   };
 }
 
+test('probeBilling: 不提供价格 → 不算录入价/当前公示价核对，也不读余额', async () => {
+  const { client } = billingClient((track, index) => usageResult(2000 + 5000 * index + (track === 'zh' ? 10 : 0)));
+  const ctx = billingCtx(client);
+  const outcome = await probeBilling(ctx);
+  assert.equal(outcome.metrics['claimed_price_ratio_input'], null);
+  assert.equal(outcome.metrics['claimed_price_ratio_output'], null);
+  assert.ok(!outcome.headline.includes('价格核对'), outcome.headline);
+  // 余额对账同样被价格门禁挡住：没有价格就没有应缴金额分母。
+  assert.equal(outcome.metrics['measured_ratio'], undefined);
+});
+
 test('probeBilling: total samples >=3 but every track <3 → insufficient (zero-regression evidence is not a 100/pass)', async () => {
   // en 5 档中前 2 档成功，zh 仅第 1 档成功：合计 3 个有效样本，但无任何轨道 ≥3
   const { client } = billingClient((track, index) => {
@@ -536,7 +547,7 @@ test('probeBilling: 默认 5 档覆盖 4k/16k，采样点之间的非线性不�
   assert.ok(outcome.metrics['prompt_tokens_en_16000'] != null, '默认档位必须包含 16k');
 });
 
-test('probeBilling: 窗口内存在失败请求 → 实测倍率作废（不得用不完整分母指控虚高）', async () => {
+test('probeBilling: 窗口内存在失败请求 → 实扣倍率作废（不得用不完整分母指控虚高）', async () => {
   const expectedCost = 28292 / 1e6;
   let balanceReads = 0;
   const server = createServer((req, res) => {
@@ -591,7 +602,7 @@ test('probeBilling: 窗口内存在失败请求 → 实测倍率作废（不得�
     assert.notEqual(outcome.level, 'pass');
     assert.ok((outcome.score ?? 100) <= 70, `score=${outcome.score}`);
     assert.ok(outcome.findings.some((f) => f.level === 'warn' && /部分计费探针请求失败/.test(f.message)), JSON.stringify(outcome.findings));
-    assert.ok(!outcome.findings.some((f) => f.level === 'fail' && /实测倍率/.test(f.message)), JSON.stringify(outcome.findings));
+    assert.ok(!outcome.findings.some((f) => f.level === 'fail' && /实扣倍率/.test(f.message)), JSON.stringify(outcome.findings));
     assert.ok(outcome.findings.some((f) => f.level === 'info' && /失败请求/.test(f.message)), JSON.stringify(outcome.findings));
   } finally {
     await new Promise<void>((resolve) => server.close(() => resolve()));
@@ -612,7 +623,9 @@ test('probeBilling: 线性形状正常但无绝对对账 → usage 判定通过�
   assert.equal(outcome.score, 85);
   assert.equal(outcome.level, 'pass');
   assert.match(outcome.headline, /未发现造假证据/);
-  assert.match(outcome.headline, /未做绝对对账/);
+  assert.match(outcome.headline, /未与外部硬证据比对/);
+  assert.match(outcome.headline, /补充说明：实际扣款未核对（默认不读余额）；未与外部硬证据比对/, outcome.headline);
+  assert.ok(!(outcome.headline.split('；')[0] ?? '').includes('$'), `主句不得含金额：${outcome.headline}`);
   assert.ok(!outcome.headline.includes('仅验证 usage 与输入长度线性'), outcome.headline);
   assert.equal(outcome.metrics['reference_verified'], 0);
   assert.equal(outcome.metrics['ratio_verified'], 0);
@@ -667,7 +680,95 @@ const PUBLIC_GPT4O = {
   price_list_output_usd: '2.8000',
 };
 
-test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline 含公示单价与价格倍率，不读余额', async () => {
+async function withApiPricing(pricing: unknown, run: (baseUrl: string) => Promise<void>): Promise<void> {
+  const server = createServer((req, res) => {
+    if (req.url === '/api/pricing') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify(pricing));
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    await run(`http://127.0.0.1:${address.port}/v1`);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+}
+
+function apiPricingCtx(baseUrl: string, input: number, output: number, quotaPerUsd?: number): ProbeCtx {
+  const client: OpenAIClient = {
+    baseUrl,
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      return usageResult(estimateMessageTokens(req.messages));
+    },
+  };
+  const base = billingCtx(client);
+  return {
+    ...base,
+    cfg: {
+      ...base.cfg,
+      priceInput: input,
+      priceOutput: output,
+      quotaPerUsd: quotaPerUsd ?? null,
+      readBalance: false,
+    },
+  };
+}
+
+test('probeBilling: API 倍率表缺 quota_per_unit → 不合成 USD、不做价格核对、不编造应缴额', async () => {
+  await withApiPricing(
+    {
+      data: [{ model_name: 'gpt-4o', model_ratio: 1, completion_ratio: 4 }],
+      group_ratio: { default: 1 },
+    },
+    async (baseUrl) => {
+      const outcome = await probeBilling(apiPricingCtx(baseUrl, 2, 8));
+      assert.equal(outcome.metrics['pricing_state'], 'ok');
+      assert.equal(outcome.metrics['declared_source'], 'api');
+      assert.equal(outcome.metrics['declared_model_ratio'], 1);
+      assert.equal(outcome.metrics['quota_per_unit'], null);
+      assert.equal(outcome.metrics['quota_per_unit_source'], 'none');
+      assert.equal(outcome.metrics['quota_per_unit_synthetic'], 1);
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], null);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], null);
+      assert.equal(outcome.metrics['expected_quota_declared'], null);
+      assert.equal(outcome.metrics['expected_cost_usd_declared'], null);
+      assert.match(outcome.headline, /价目对比 N\/A（站点未公示 quota_per_unit 换算率）/);
+      assert.match(outcome.headline, /站点未公示 quota_per_unit/);
+      assert.doesNotMatch(outcome.headline, /你填的单价÷站点现价/);
+      assert.doesNotMatch(outcome.headline, /按公示价估算计费探针应缴/);
+      assert.ok(
+        outcome.findings.some((f) => f.level === 'info' && /未公示 quota_per_unit/.test(f.message)),
+        JSON.stringify(outcome.findings),
+      );
+    },
+  );
+});
+
+test('probeBilling: 站点 quota 缺失但 CLI 提供换算率 → 仍按真实 quota 做价格核对', async () => {
+  await withApiPricing(
+    {
+      data: [{ model_name: 'gpt-4o', model_ratio: 1, completion_ratio: 4 }],
+      group_ratio: { default: 1 },
+    },
+    async (baseUrl) => {
+      const outcome = await probeBilling(apiPricingCtx(baseUrl, 2, 8, 500_000));
+      assert.equal(outcome.metrics['quota_per_unit'], 500_000);
+      assert.equal(outcome.metrics['quota_per_unit_source'], 'cli');
+      assert.equal(outcome.metrics['quota_per_unit_synthetic'], 0);
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], 1);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], 1);
+      assert.equal(typeof outcome.metrics['expected_quota_declared'], 'number');
+      assert.equal(typeof outcome.metrics['expected_cost_usd_declared'], 'number');
+      assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
+    },
+  );
+});
+
+test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline 含录入价/当前公示价核对，不读余额', async () => {
   await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
     const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
     assert.equal(outcome.status, 'ok');
@@ -681,23 +782,40 @@ test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline
     assert.equal(outcome.metrics['public_price_matched'], 'gpt-4o');
     assert.equal(outcome.metrics['public_price_input_usd_per_m'], 0.24);
     assert.equal(outcome.metrics['public_price_output_usd_per_m'], 0.84);
+    assert.equal(outcome.metrics['declared_ratio_synthetic'], 1);
+    assert.equal(outcome.metrics['quota_per_unit_synthetic'], 0);
+    // 用户录入价 = 官方公示价 → 用户直觉里的价格核对必须是 1×。
+    assert.equal(outcome.metrics['claimed_price_ratio_input'], 1);
+    assert.equal(outcome.metrics['claimed_price_ratio_output'], 1);
+    // 列表价折扣是另一个口径（公示价 ÷ 列表价），仍保留但不抢主位。
     assert.equal(outcome.metrics['public_price_ratio_input'], 0.3);
     assert.equal(outcome.metrics['public_price_ratio_output'], 0.3);
     // 公开价表锚：应缴只以 USD 披露，quota 单位未知（合成 500000 不得冒充站点单位写进报告）
     assert.equal(outcome.metrics['expected_quota_declared'], null);
     const expectedUsd = outcome.metrics['expected_cost_usd_declared'];
     assert.ok(typeof expectedUsd === 'number' && expectedUsd > 0, `应缴 USD 应为正数：${String(expectedUsd)}`);
+    assert.equal(outcome.metrics['expected_cost_usd_basis'], 'public_usd');
     assert.equal(outcome.metrics['money_check_state'], 'declared_only');
     assert.equal(outcome.metrics['measured_ratio'], undefined);
-    assert.match(outcome.headline, /公示 输入 \$0\.24\/M · 输出 \$0\.84\/M/);
-    assert.match(outcome.headline, /倍率 0\.3×（输入\/输出一致，公示价 ÷ 列表价）/);
-    assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
-    assert.ok(!outcome.headline.includes('实测倍率 N/A'), outcome.headline);
+    assert.match(outcome.headline, /站点现价：输入 \$0\.24\/百万 · 输出 \$0\.84\/百万/);
+    assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
+    assert.match(outcome.headline, /按价目应扣 \$[\d.]+（估算，上界）/, outcome.headline);
+    assert.match(outcome.headline, /补充说明：站点分组折扣未知，按无折扣（×1）计算/, outcome.headline);
+    assert.equal(outcome.headline.split('；')[0], 'token 计数核验通过', '主句只保留实测形状结论');
+    assert.ok(!outcome.headline.includes('公示价÷列表价'), outcome.headline);
+    assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+    assert.ok(!outcome.headline.includes('实扣倍率无法计算'), outcome.headline);
     assert.ok(!outcome.headline.includes('未与实收对账'), outcome.headline);
     assert.ok(!outcome.headline.includes('仅验证 usage 与输入长度线性'), outcome.headline);
     assert.ok(
       outcome.findings.some(
         (f) => f.level === 'info' && /公开价表无分组概念，按倍率 1 折算，分组口径未核验/.test(f.message),
+      ),
+      JSON.stringify(outcome.findings),
+    );
+    assert.ok(
+      outcome.findings.some(
+        (f) => f.level === 'info' && /公示输入\/输出倍率是按标准基价反推的展示值/.test(f.message),
       ),
       JSON.stringify(outcome.findings),
     );
@@ -708,46 +826,140 @@ test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline
   });
 });
 
-test('probeBilling: 公开价表无列表价 → 不编造倍率，也不读余额', async () => {
+test('probeBilling: 换芯回显 fail 不得污染 regressionLevel——倍率虚高仍要封顶 30（硬红线），score≠70', async () => {
+  // 复刻 2026-10-21 真机：站点回显低价模型（echo ratio 30%<50% → fail + cap 70），
+  // 同时余额对账测得 ×1.6 虚高。修复前 regressionLevel 在回显 fail 之后才捕获，
+  // decideRatio 误走「usage 回归失败」分支（cap=null），billing 停在 70 → 总分 77 不触发硬红线。
+  let usedQuota = 5_000_000; // quota；/api/usage/token 的 total_used，5_000_000/500000 = $10 已用
+  const COST_PER_UNIT_QUOTA = 500_000; // quota_per_unit（new-api 默认）
+  const server = createServer((req, res) => {
+    const url = (req.url ?? '').split('?')[0];
+    if (url === '/api/status') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { quota_per_unit: COST_PER_UNIT_QUOTA } }));
+      return;
+    }
+    if (url === '/api/usage/token') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ data: { total_granted: 100_000_000, total_used: usedQuota, total_available: 95_000_000 } }));
+      return;
+    }
+    if (url === '/api/pricing') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(
+        JSON.stringify({
+          data: [
+            { model_name: 'gpt-4o', model_ratio: 1, completion_ratio: 4 },
+            { model_name: 'gpt-4o-mini', model_ratio: 0.3, completion_ratio: 2 },
+          ],
+          group_ratio: { default: 1 },
+        }),
+      );
+      return;
+    }
+    res.writeHead(404).end();
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address() as AddressInfo;
+  try {
+    const baseUrl = `http://127.0.0.1:${address.port}/v1`;
+    // chat 由 mock client 承接：诚实 usage + 回显他族低价模型；扣费按 ×1.6 虚计入余额。
+    const client: OpenAIClient = {
+      baseUrl,
+      async chat(req: ChatRequest): Promise<ChatResult> {
+        const promptTokens = estimateMessageTokens(req.messages);
+        const result = usageResult(promptTokens);
+        result.model = 'gpt-4o-mini'; // 回显换芯：公示倍率 0.3 vs 请求 1 → 30% <50% → fail
+        const expectedCost = (promptTokens / 1e6) * 2 + (16 / 1e6) * 8; // 录入价 2/8 的应缴
+        usedQuota += expectedCost * 1.6 * COST_PER_UNIT_QUOTA; // 余额按 ×1.6 虚增扣费
+        return result;
+      },
+    };
+    const base = billingCtx(client);
+    const ctx: ProbeCtx = { ...base, cfg: { ...base.cfg, baseUrl, priceInput: 2, priceOutput: 8, readBalance: true } };
+    const outcome = await probeBilling(ctx);
+    assert.equal(outcome.status, 'ok');
+    // 回显 fail 封顶 70，倍率 fail 再封 30：regressionLevel 只认回归块结果（本夹具 r2=1 回归通过）
+    assert.equal(outcome.score, 30, `倍率虚高必须封顶 30：${outcome.score}`);
+    assert.equal(outcome.level, 'fail');
+    assert.equal(outcome.metrics['echo_model_mismatch'], 10);
+    assert.equal(outcome.metrics['measured_ratio'], 1.6);
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'fail' && /换芯|低价\/弱模型冒充/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'fail' && /实扣倍率 1\.6 > 1\.5/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+    // 回归本身通过（r2=1）→ headline 不得声称「usage 计数亦异常」
+    assert.ok(!outcome.headline.includes('token 计数也有问题'), outcome.headline);
+    assert.match(outcome.headline, /实际扣费是应缴的 1\.6 倍，计费虚高（判据 >1\.5 倍）/);
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+test('probeBilling: 宣称价高于公示价 → 价格核对给出 1.2×/1.4×，不误报为 1×', async () => {
+  await withPublicPricing(
+    [{ ...PUBLIC_GPT4O, price_input_usd: '0.2000', price_output_usd: '0.6000' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.level, 'pass');
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], 1.2);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], 1.4);
+      assert.match(outcome.headline, /你填的单价÷站点现价 输入 1\.2× · 输出 1\.4×/);
+    },
+  );
+});
+
+test('probeBilling: 公开价表无列表价 → 仍按录入价/当前公示价给 1×，不编造列表折扣', async () => {
   await withPublicPricing(
     [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_cached_usd: '0.0690' }],
     async (baseUrl) => {
       const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
       assert.equal(outcome.status, 'ok');
       assert.equal(outcome.score, 85);
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], 1);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], 1);
       assert.equal(outcome.metrics['public_price_ratio_input'], null);
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
-      assert.ok(!outcome.headline.includes('倍率 '), outcome.headline);
-      assert.match(outcome.headline, /倍率不可得（站点未提供列表价）/);
-      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
-      assert.ok(!outcome.headline.includes('实测倍率 N/A'), outcome.headline);
+      assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
+      assert.ok(!outcome.headline.includes('站点现价÷官方列表价'), outcome.headline);
+      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+      assert.ok(!outcome.headline.includes('实扣倍率无法计算'), outcome.headline);
     },
   );
 });
 
-test('probeBilling: 列表价为 0 → 不除零、不编造倍率', async () => {
+test('probeBilling: 列表价为 0 → 不除零、不编造列表折扣，但录入价/当前公示价仍可核对', async () => {
   await withPublicPricing(
     [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_list_input_usd: '0', price_list_output_usd: '0' }],
     async (baseUrl) => {
       const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], 1);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], 1);
       assert.equal(outcome.metrics['public_price_ratio_input'], null);
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
-      assert.ok(!outcome.headline.includes('倍率 '), outcome.headline);
-      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+      assert.match(outcome.headline, /你填的单价÷站点现价 1×/);
+      assert.ok(!outcome.headline.includes('站点现价÷官方列表价'), outcome.headline);
+      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
     },
   );
 });
 
-test('probeBilling: 仅单侧列表价 → 只展示可得一侧，不声称输入/输出一致', async () => {
+test('probeBilling: 仅单侧列表价 → 录入价/当前公示价仍两边核对，列表折扣只留可得一侧', async () => {
   await withPublicPricing(
     [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_list_input_usd: '0.8000' }],
     async (baseUrl) => {
       const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.metrics['claimed_price_ratio_input'], 1);
+      assert.equal(outcome.metrics['claimed_price_ratio_output'], 1);
       assert.equal(outcome.metrics['public_price_ratio_input'], 0.3);
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
-      assert.match(outcome.headline, /倍率 输入 0\.3×（公示价 ÷ 列表价）/);
-      assert.ok(!outcome.headline.includes('输入/输出一致'), outcome.headline);
-      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+      assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
+      assert.ok(!outcome.headline.includes('0.3×'), outcome.headline);
+      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
     },
   );
 });
@@ -778,7 +990,7 @@ test('probeBilling: 公开价与宣称价约 1000× 量级差 → 仅 info 披�
       assert.equal(outcome.score, 85);
       assert.equal(outcome.level, 'pass');
       assert.equal(outcome.metrics['public_price_input_usd_per_m'], 240);
-      assert.match(outcome.headline, /公示 输入 \$240\/M · 输出 \$840\/M/);
+      assert.match(outcome.headline, /站点现价：输入 \$240\/百万 · 输出 \$840\/百万/);
       assert.ok(
         outcome.findings.some(
           (f) => f.level === 'info' && /单位口径不同|相差约 1000×/.test(f.message),
@@ -900,6 +1112,34 @@ test('probeBilling: 公开价表 anchor 与 API 基线跨来源 → 跳过漂移
       JSON.stringify(outcome.findings),
     );
     assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /漂移/.test(f.message)), JSON.stringify(outcome.findings));
+  });
+});
+
+test('probeBilling: 公示价明确下调 → 更划算，不降档、不封顶', async () => {
+  await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
+    const base = publicPricingCtx(baseUrl, 0.24, 0.84);
+    const outcome = await probeBilling({
+      ...base,
+      previousPricing: {
+        origin: 'https://api.example.com',
+        capturedAt: '2026-10-01T00:00:00.000Z',
+        source: 'public-json',
+        quotaPerUnit: null,
+        group: null,
+        models: { 'gpt-4o': { modelRatio: 0.24, completionRatio: 3.5 } },
+        groupRatio: {},
+      },
+      previousPricingSource: 'baseline',
+    });
+    assert.equal(outcome.level, 'pass');
+    assert.equal(outcome.score, 85);
+    assert.equal(outcome.metrics['declared_drift_count'], 0);
+    assert.equal(outcome.metrics['declared_drift_down_count'], 1);
+    assert.ok(
+      outcome.findings.some((f) => f.level === 'info' && /下调，价格更划算.*不降档/.test(f.message)),
+      JSON.stringify(outcome.findings),
+    );
+    assert.ok(!outcome.findings.some((f) => f.level === 'warn' && /下调/.test(f.message)), JSON.stringify(outcome.findings));
   });
 });
 
@@ -1152,7 +1392,7 @@ test('probeBilling + token-reference: model mismatch → comparison skipped, N/A
   assert.equal(outcome.metrics['reference_verified'], 0);
   assert.equal(outcome.metrics['evidence_level'], 'shape-only');
   assert.ok(outcome.findings.some((f) => f.level === 'info' && /不一致，跳过 token 计数对比/.test(f.message)));
-  assert.ok(outcome.findings.some((f) => f.level === 'info' && /未做绝对对账/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /未与外部硬证据比对/.test(f.message)), JSON.stringify(outcome.findings));
 });
 
 test('probeBilling + token-reference: probeset version mismatch → comparison skipped, usage 判定 85', async () => {
@@ -1287,7 +1527,7 @@ test('probeBilling：极高倍率（>10×）不再假 fail，改为 warn + maske
     assert.equal(outcome.score, 100);
     assert.ok((outcome.metrics['measured_ratio'] as number) > 200, `measured_ratio=${outcome.metrics['measured_ratio']}`);
     assert.equal(outcome.metrics['ratio_masked_verdict'], 'fail');
-    assert.match(outcome.headline, /无法归因/);
+    assert.match(outcome.headline, /说不清是谁多扣的/);
     assert.ok(!outcome.headline.includes('计费虚高'), outcome.headline);
     assert.ok(!outcome.headline.includes('线性关系正常'), outcome.headline);
     assert.ok(
@@ -1299,7 +1539,7 @@ test('probeBilling：极高倍率（>10×）不再假 fail，改为 warn + maske
   }
 });
 
-test('probeBilling：库调用方传入半组阶梯价 → warn 且不计算实测倍率', async () => {
+test('probeBilling：库调用方传入半组阶梯价 → warn 且不计算实扣倍率', async () => {
   const { client } = billingClient(() => usageResult(1000));
   const ctx = billingCtx(client);
   ctx.cfg.priceInput = 2;
@@ -1389,7 +1629,7 @@ contaminatedRetryBillingTest(
 );
 
 contaminatedRetryBillingTest(
-  'probeBilling：可能已计费的重试（contaminatingRetry=true）→ warn 封顶且实测倍率作废',
+  'probeBilling：可能已计费的重试（contaminatingRetry=true）→ warn 封顶且实扣倍率作废',
   true,
   (outcome) => {
     assert.equal(outcome.metrics['contaminating_retries'], 1);
@@ -1445,7 +1685,7 @@ test('decideRatio：user 级余额来源（/api/user/self）超 1.5 倍 → 禁�
   assert.equal(userScopeRegFail?.maskedVerdict, 'fail');
 });
 
-test('probeBilling：pre 快照未即时稳定（窗口前存在未结算消费）→ 实测倍率作废，不得诬告', async () => {
+test('probeBilling：pre 快照未即时稳定（窗口前存在未结算消费）→ 实扣倍率作废，不得诬告', async () => {
   let balanceReads = 0;
   const server = createServer((req, res) => {
     if (req.url === '/v1/dashboard/billing/usage') {
@@ -1601,4 +1841,182 @@ test('probeBilling：补采首笔失败 → 立即停并如实污染窗口（不
   } finally {
     await fixture.close();
   }
+});
+
+// ---------- 金额侧标准后缀块（口径标签 / 固定顺序 / 补充说明槽） ----------
+
+type MoneyArgs = Parameters<typeof composeMoneySide>[0];
+
+function moneyArgs(patch: Partial<MoneyArgs> = {}): MoneyArgs {
+  return {
+    priceEnabled: false,
+    balanceEnabled: false,
+    measuredRatio: null,
+    measuredRatioInHeadline: false,
+    spendDelta: null,
+    balanceUnit: null,
+    balanceEndpointUnavailable: false,
+    balanceUnstable: false,
+    balanceContaminated: false,
+    balanceScope: null,
+    maskedVerdict: null,
+    ratioUnattributable: false,
+    calibratedUnit: null,
+    calibrationConfidence: null,
+    anchorInPerM: null,
+    anchorOutPerM: null,
+    claimedRatioIn: null,
+    claimedRatioOut: null,
+    declaredEstimate: null,
+    expectedUsd: null,
+    expectedQuota: null,
+    expectedIsUpperBound: false,
+    quotaPerUnitSynthetic: false,
+    publicPrice: null,
+    publicPriceState: null,
+    declaredState: 'not_applicable',
+    modelCovered: false,
+    groupRatioUnverified: false,
+    chargePerRequest: false,
+    driftUp: 0,
+    driftDown: 0,
+    driftInHeadline: false,
+    absoluteVerified: false,
+    ...patch,
+  };
+}
+
+const PRICED_ESTIMATE = {
+  quota: 100000,
+  usd: 0.12,
+  inputUsdPerM: 2,
+  outputUsdPerM: 8,
+  isUpperBound: true,
+  isLowerBound: false,
+  state: 'priced' as const,
+  unverifiedReason: null,
+  groupRatioUnverified: false,
+  expectedQuota: 100000,
+};
+
+test('composeMoneySide：固定顺序且每个数字带口径标签（实测/估算/只比价目）', () => {
+  const text = composeMoneySide(
+    moneyArgs({
+      priceEnabled: true,
+      balanceEnabled: true,
+      measuredRatio: 1.2,
+      spendDelta: 0.12,
+      balanceUnit: 'USD',
+      anchorInPerM: 2,
+      anchorOutPerM: 8,
+      claimedRatioIn: 1.2,
+      claimedRatioOut: 1.4,
+      declaredEstimate: PRICED_ESTIMATE,
+      expectedUsd: 0.12,
+      expectedIsUpperBound: true,
+      modelCovered: true,
+    }),
+  );
+  assert.match(text, /实扣倍率 1\.2×/, text);
+  assert.match(text, /本轮实际扣费（实测）0\.12 USD/, text);
+  assert.match(text, /按价目应扣 \$0\.12（估算，上界）/, text);
+  assert.match(text, /你填的单价÷站点现价 输入 1\.2× · 输出 1\.4×（只比价目，未看实扣）/, text);
+  assert.match(text, /站点现价：输入 \$2\/百万 · 输出 \$8\/百万/, text);
+  const order = ['实扣倍率', '本轮实际扣费', '按价目应扣', '你填的单价', '站点现价', '补充说明'].map((key) => text.indexOf(key));
+  assert.ok(
+    order.every((index) => index >= 0) && order.every((index, i) => i === 0 || (order[i - 1] ?? -1) < index),
+    `后缀块顺序漂移：${text}`,
+  );
+  assert.match(text, /补充说明：未与外部硬证据比对/, text);
+});
+
+test('composeMoneySide：默认不读余额 → 主结论后仍给出实际扣款未核对与未与外部硬证据比对', () => {
+  assert.equal(
+    composeMoneySide(moneyArgs()),
+    '；补充说明：实际扣款未核对（默认不读余额）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）',
+    '金额信息不得因未启用价格/余额而缺失',
+  );
+});
+
+test('composeMoneySide：校准采信标「推断口径 + 置信档」，用户级口径标永不 fail', () => {
+  const text = composeMoneySide(
+    moneyArgs({
+      balanceEnabled: true,
+      measuredRatio: 238.569,
+      spendDelta: 12,
+      balanceUnit: 'USD',
+      balanceScope: 'user',
+      maskedVerdict: 'fail',
+      ratioUnattributable: true,
+      calibratedUnit: 'cents',
+      calibrationConfidence: 'high',
+    }),
+  );
+  assert.match(text, /实扣倍率 238\.569×（扣费按 cents 口径换算，置信 high，换算值为估算）/, text);
+  assert.match(text, /本轮实际扣费 12 USD（按 cents 口径换算的估算值，置信 high）/, text);
+  assert.match(
+    text,
+    /补充说明：实扣倍率异常但说不清是谁多扣的（疑并发消费混入或单位错配），本次不判 fail（底层判定 fail 记录于 metrics）；余额为用户级口径（该用户所有 key 共享），无法排除其他 key 的消费，本次不判 fail（底层判定 fail 记录于 metrics）/,
+    text,
+  );
+});
+
+test('composeMoneySide：按次计费/分组未核验进补充说明槽，不用 N/A 占位', () => {
+  const text = composeMoneySide(
+    moneyArgs({
+      priceEnabled: true,
+      modelCovered: true,
+      chargePerRequest: true,
+      groupRatioUnverified: true,
+      declaredEstimate: { ...PRICED_ESTIMATE, state: 'unverified', unverifiedReason: '按次计费（quota_type=1），单价单位未核验' },
+    }),
+  );
+  assert.ok(!text.includes('按价目应扣 N/A'), text);
+  assert.ok(!text.includes('价目对比 N/A'), text);
+  assert.match(text, /补充说明：按次计费，金额未验证；站点分组折扣未知，按无折扣（×1）计算；实际扣款未核对（默认不读余额）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）/, text);
+});
+
+test('composeMoneySide：主句已带倍率数字时后缀去重，不重复同一测量值', () => {
+  const text = composeMoneySide(
+    moneyArgs({
+      balanceEnabled: true,
+      measuredRatio: 2.345,
+      measuredRatioInHeadline: true,
+      spendDelta: 0.23,
+      balanceUnit: 'USD',
+    }),
+  );
+  assert.ok(!/实扣倍率 [\d.]+×/.test(text), `后缀不得重复主句数字：${text}`);
+  assert.match(text, /本轮实际扣费（实测）0\.23 USD/, text);
+});
+
+test('ratioHeadline：主句保留原始倍率数字，fail/warn 结论不丢数据也不失真', () => {
+  const base = {
+    verdict: 'ok' as const,
+    maskedVerdict: null,
+    cap: null,
+    ratio: 2.345,
+    finding: { level: 'fail' as const, message: '', evidenceIds: [] },
+  };
+  assert.match(ratioHeadline(base, 'pass') ?? '', /实际扣费是应缴的 2\.345 倍，计费虚高（判据 >1\.5 倍）/, 'fail 主句必须带实扣倍率数字');
+  assert.match(
+    ratioHeadline({ ...base, verdict: 'warn', ratio: 0.42, finding: { level: 'warn', message: '', evidenceIds: [] } }, 'pass') ?? '',
+    /实际扣费是应缴的 0\.42 倍，异常偏低/,
+    'warn 主句必须带实扣倍率数字',
+  );
+  assert.match(
+    ratioHeadline({ ...base, verdict: 'N/A', ratio: 238.569, maskedVerdict: 'fail' }, 'pass') ?? '',
+    /实际扣费是应缴的 238\.569 倍，异常但说不清是谁多扣的/,
+    '不可归因主句同样保留原始倍率',
+  );
+});
+
+test('composeMoneySide：N/A 一律带标准原因短语', () => {
+  const synthetic = composeMoneySide(moneyArgs({ priceEnabled: true, modelCovered: true, quotaPerUnitSynthetic: true }));
+  assert.match(synthetic, /按价目应扣 N\/A（站点未公示 quota_per_unit 换算率）/, synthetic);
+  assert.match(synthetic, /价目对比 N\/A（站点未公示 quota_per_unit 换算率）/, synthetic);
+  const unavailable = composeMoneySide(moneyArgs({ balanceEnabled: true, balanceEndpointUnavailable: true }));
+  assert.match(unavailable, /实扣倍率无法计算（该站没有可用的余额接口）/, unavailable);
+  const contaminated = composeMoneySide(moneyArgs({ balanceEnabled: true, balanceContaminated: true }));
+  assert.match(contaminated, /实扣倍率无法计算（窗口内扣费混入其他消费，无法归因到本次测试）/, contaminated);
 });

@@ -13,7 +13,7 @@ test('badrelay 标定台：坏中转模式检出矩阵（逐维度等级断言�
   }
 });
 
-test('badrelay 组合作弊：billing shape-only pass 必须披露「等比缩放不可见 + 未做绝对对账」，且评分不超过 85', async () => {
+test('badrelay 组合作弊：billing shape-only pass 必须披露「等比缩放不可见 + 未与外部硬证据比对」，且评分不超过 85', async () => {
   const scenario = BADRELAY_MATRIX.find((s) => s.name === 'combined-usage-relabel-truncate');
   assert.ok(scenario !== undefined);
   const report = await auditScenario(scenario);
@@ -23,7 +23,7 @@ test('badrelay 组合作弊：billing shape-only pass 必须披露「等比缩�
   assert.ok(billing.score !== null && billing.score <= 85, `shape-only 上限 85（实际 ${billing.score}）`);
   assert.equal(billing.metrics['evidence_level'], 'shape-only');
   assert.ok(
-    billing.findings.some((f) => /等比缩放.*不可见|未做绝对对账/.test(f.message)),
+    billing.findings.some((f) => /等比缩放.*不可见|未与外部硬证据比对/.test(f.message)),
     JSON.stringify(billing.findings),
   );
 });

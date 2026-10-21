@@ -10,6 +10,7 @@ import { renderConsole } from './report/console.js';
 import { supportsColor } from './color.js';
 import { runGuard } from './guard/cli.js';
 import { runPricingWatch } from './pricing-watch/cli.js';
+import { runPricingScan } from './pricing-scan/cli.js';
 import { parsePriceFlags } from './price-flags.js';
 import { redactUrl } from './redact.js';
 import { isPlausibleQuotaPerUnit, QUOTA_PER_UNIT_MAX, QUOTA_PER_UNIT_MIN } from './pricing.js';
@@ -26,6 +27,9 @@ Usage:
   model-xray pricing-watch --base-url <url> [options]
       公示倍率看门狗：只读公开价接口（零模型消耗），按周期比对本地价格账本，
       站点倍率被改动即告警；详见 model-xray pricing-watch --help。
+  model-xray pricing-scan --base-url <url> [--base-url <url> ...] [options]
+      多站点公示价格/倍率扫描：按 schema 自动探测公开价接口，输出各站全模型倍率与 USD/百万
+      tokens 价（零模型消耗）；详见 model-xray pricing-scan --help。
 
 test Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
@@ -46,9 +50,12 @@ test Options:
   --quota-per-usd <n>       Quota units per $1 (new-api status.quota_per_unit); overrides /api/status, enables quota-unit reconciliation
   --declared-price-page <path>  Price web page fallback when /api/pricing is unavailable: origin-relative path
                             (e.g. /pricing) or same-origin absolute URL; scraped price is a low-trust hint, warn-only
+  --read-balance            Opt-in balance reconciliation: read balance before/after the probe sequence and compute
+                            the measured ratio (Δspend ÷ expected cost); requires --price-input/--price-output and
+                            the claimed price unit must match the reconciled balance unit (usually USD)
   --retries <n>             Retries per request on 200 empty bodies, integer in [0, 3] (default: 1)
   --http-retries <n>        Retries per request on 408/409/429/5xx gateway rejections (not billed, safe to retry), integer in [0, 6] (default: 2)
-                            注意：每次重试都会真实计费；默认重试 1 次以应对瞬时 5xx/空流，重试会令实测倍率判定作废（防重复计费污染）
+                             注意：每次重试都会真实计费；默认重试 1 次以应对瞬时 5xx/空流，重试会令实扣倍率判定作废（防重复计费污染）
   --baseline <path>         Compare fingerprints against a baseline file (seed is reused unless --seed)
   --baseline-out <path>     Where to write this run's baseline (default: reports/baseline-<model>-<YYYY-MM-DD_HH-mm-ss>.json)
   --token-reference <path>  Compare prompt token counts against a prior audit report of the SAME model（识别全量等比虚增：线性回归对此不可见；须为同名模型、同题集版本的本工具 JSON 报告）
@@ -68,9 +75,10 @@ test Options:
   --version                 Print version
 
 Notes:
-  价格为「每百万 tokens 的宣称价格」，核心输入/输出必须成对且为正数；缓存读可留空（按输入价），二档阶梯须同时提供阈值/二档输入/二档输出，二档缓存读留空按二档输入价。单位只需与该站余额显示单位一致，币种不限：直接照抄站方价目表上的数字，不要换算成另一种币种（会把倍率整体偏移一个汇率）。quota 单位余额由工具按 --quota-per-usd（或站点 /api/status 公示的 quota_per_unit）自行折算成计价单位后再与应缴额对账，缺换算率时该项保持 N/A 并给出原因。
-  计费审计会额外 GET 同源 /api/pricing 与 /api/status 读取站点公示倍率（免鉴权、绝不携带 API key）；站点未提供该接口时，若提供了 --price-* 会尝试抓取 --declared-price-page（或默认候选页）的网页价格作低信任参照（仅 warn 级提示，不产生 fail 判罚）；两者都不可得时明示「未核验金额/倍率」，不会伪造绝对值结论。
-  倍率漂移对照同时使用 --baseline 快照与本地价格账本快照（两者都存在时任一来源显著变化即告警并封顶 85，findings 逐项标注来源）；无 --baseline 时只对照本地账本。
+  价格为「每百万 tokens 的录入价」，核心输入/输出必须成对且为正数；缓存读可留空（按输入价），二档阶梯须同时提供阈值/二档输入/二档输出，二档缓存读留空按二档输入价。默认 test 只做同单位比值，币种不限；guard / 余额对账时录入价必须与余额折算后的单位一致（通常是 USD），价目表币种不同时先统一再录入，否则倍率会整体偏移一个汇率。quota 单位余额由工具按 --quota-per-usd（或站点 /api/status 公示的 quota_per_unit）自行折算成计价单位后再与应缴额对账，缺换算率时该项保持 N/A 并给出原因。
+  计费审计会额外 GET 同源公开价格接口读取站点公示倍率/价格（免鉴权、绝不携带 API key）：按 schema 自动探测 /api/pricing、/api/ratio_config、OpenRouter /api/v1/models、LiteLLM /model/info 与公开价表；站点未提供可解析接口时，若提供了 --price-* 会尝试抓取 --declared-price-page（或默认候选页）的网页价格作低信任参照（仅 warn 级提示，不产生 fail 判罚）；都不可得时明示「未核验金额/倍率」，不会伪造绝对值结论。
+  价格核对默认比较「你录入的价 ÷ 站点当前公示价」，两者一致时为 1×；站内「列表价折扣」（当前公示价÷列表价）是另一个促销口径，只披露，不是计费倍率。
+  倍率漂移对照同时使用 --baseline 快照与本地价格账本快照（两者都存在时逐项标注来源）：显著上调或口径断裂告警并封顶 85；明确下调视为更划算，只披露不扣分；无 --baseline 时只对照本地账本。
   账本按「主机+端口」归档：同一上游的反代路径别名（/v1 与 /relay/v1）共享同一账本与漂移历史，对照到不同路径的历史快照时以 info 披露。
   数值参数均按严格整数校验（不接受 "12abc"、前导空白等）；非法输入立即 exit 2 并给出正确示例。
   guard 子命令只读环境变量 MODEL_XRAY_KEY 作为密钥，且不提供 --key 旗标。
@@ -86,6 +94,10 @@ async function main(argv: string[]): Promise<number> {
   // pricing-watch 同样有专属参数集（--interval 等），独立解析。
   if (argv[0] === 'pricing-watch') {
     return runPricingWatch(argv.slice(1));
+  }
+  // pricing-scan 支持多站点与自定义端点，独立解析。
+  if (argv[0] === 'pricing-scan') {
+    return runPricingScan(argv.slice(1));
   }
 
   let parsed;
@@ -114,6 +126,7 @@ async function main(argv: string[]): Promise<number> {
         'expect-completion-ratio': { type: 'string' },
         'quota-per-usd': { type: 'string' },
         'declared-price-page': { type: 'string' },
+        'read-balance': { type: 'boolean', default: false },
         baseline: { type: 'string' },
         'baseline-out': { type: 'string' },
         'token-reference': { type: 'string' },
@@ -147,7 +160,7 @@ async function main(argv: string[]): Promise<number> {
   }
   if (positionals[0] !== 'test') {
     console.error(
-      `未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..."（一次性审计）、"model-xray guard ..."（常驻监控）或 "model-xray pricing-watch ..."（公示倍率看门狗），或 --help。`,
+      `未知命令：${positionals[0] ?? '(无)'}。使用 "model-xray test ..."（一次性审计）、"model-xray guard ..."（常驻监控）、"model-xray pricing-watch ..."（公示倍率看门狗）或 "model-xray pricing-scan ..."（多站点价格扫描），或 --help。`,
     );
     return 2;
   }
@@ -216,6 +229,12 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
   const price = priceFlags.price;
+  // --read-balance fail-fast：应缴分母来自录入价，缺价格时余额对账静默失效，必须拦下而不是「跑了但测不出」。
+  if (values['read-balance'] === true && price === null) {
+    console.error('--read-balance 必须与 --price-input/--price-output 成对使用：实扣倍率 = 实际扣费 ÷（录入价×自报 usage），没有录入价就算不出应缴分母。');
+    console.error('示例：model-xray test --base-url https://relay.example.com/v1 --model gpt-4o --price-input 2.5 --price-output 10 --read-balance');
+    return 2;
+  }
 
   // --group：站点分组名（new-api group 参数），仅用于挑选公示价格表里的 group_ratio 做展示对比
   const group = values.group !== undefined ? values.group.trim() : null;
@@ -366,6 +385,7 @@ async function main(argv: string[]): Promise<number> {
     priceInput2: price?.input2 ?? null,
     priceOutput2: price?.output2 ?? null,
     priceCachedRead2: price?.cachedRead2 ?? null,
+    readBalance: values['read-balance'] === true,
     group,
     expectModelRatio,
     expectCompletionRatio,
@@ -460,8 +480,8 @@ async function main(argv: string[]): Promise<number> {
   if (written.baselinePath) console.error(`  ${written.baselinePath}`);
 
   if (report.overall === 'fail') return 1;
-  // total=null 表示没有任何足够的可评分证据（哪怕个别维度给出 warn 线索）——按契约属于「未得出结论」，
-  // 退出码必须是 2，避免配额耗尽/端点全挂的一轮被脚本误当成「可疑但已完成」。
+  // total=null 表示没有任何足够的可评分证据——按契约属于「未得出结论」，
+  // 退出码必须是 2，避免配额耗尽/端点全挂的一轮被脚本误当成正常完成。
   // billing 仅有形状证据时不再悬置为 insufficient（本维度核验对象是 usage，形状全过给判定 85），
   // 因此 total null 只会来自真实样本不足。
   if (report.total === null || report.overall === 'unknown') {

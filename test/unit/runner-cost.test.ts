@@ -19,7 +19,7 @@ function record(usage: Usage | null): EvidenceRecord {
   return { response: { usage } } as EvidenceRecord;
 }
 
-test('totalAuditCostNote: 汇总全部带 usage 证据，按宣称价估算并提示余额自核', () => {
+test('totalAuditCostNote: 汇总全部带 usage 证据，按录入价估算并提示余额自核', () => {
   const note = totalAuditCostNote(
     [billingOutcome()],
     [
@@ -28,13 +28,13 @@ test('totalAuditCostNote: 汇总全部带 usage 证据，按宣称价估算并�
     ],
   );
   assert.ok(note !== null);
-  assert.match(note, /测试总费用/);
-  assert.match(note, /\$0\.660/);
+  assert.match(note, /测试总费用（按录入价估算/);
+  assert.match(note, /0\.660（与录入价同单位）/);
   assert.match(note, /输入 1000000 \/ 输出 500000 tokens/);
   assert.match(note, /余额消耗请自行核对/);
 });
 
-test('totalAuditCostNote: 无宣称价或无 usage 时不编造费用', () => {
+test('totalAuditCostNote: 无录入价或无 usage 时不编造费用', () => {
   assert.equal(totalAuditCostNote([{ ...billingOutcome(), metrics: {} }], [record(null)]), null);
   assert.equal(totalAuditCostNote([billingOutcome()], [record(null)]), null);
 });

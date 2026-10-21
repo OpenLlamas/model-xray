@@ -132,6 +132,28 @@ test('appendPricingSnapshot/readLastPricingSnapshot：追加-写回一致，锁�
   }
 });
 
+test('readLastPricingSnapshot：旧版 public-json 合成 500000 读取时清洗为 null；site/cli 来源保留', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'mx-ledger-'));
+  try {
+    appendPricingSnapshot(
+      dir,
+      buildLedgerEntry(declared({ source: 'public-json', quotaPerUnit: 500000 }), 'gpt-4o'),
+    );
+    const legacy = readLastPricingSnapshot(dir, ORIGIN);
+    assert.equal(legacy.kind, 'ok');
+    assert.equal(legacy.entry?.quotaPerUnit, null);
+    assert.equal(legacy.entry?.quotaPerUnitSource, undefined);
+
+    appendPricingSnapshot(
+      dir,
+      buildLedgerEntry(declared({ source: 'public-json', quotaPerUnit: 500000, quotaPerUnitSource: 'site' }), 'gpt-4o'),
+    );
+    assert.equal(readLastPricingSnapshot(dir, ORIGIN).entry?.quotaPerUnit, 500000);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('readLastPricingSnapshot：缺失=missing；尾部损坏跳过并标 tailCorrupt；半行=尾部损坏；全坏=error；空文件=error', () => {
   const dir = mkdtempSync(join(tmpdir(), 'mx-ledger-'));
   try {

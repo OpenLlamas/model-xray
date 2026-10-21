@@ -257,6 +257,25 @@ test('html/md：分项得分表含权重列（0 显示 -）', () => {
   assert.match(md, /\| identity \| PASS \| 100 \| 15 \|/);
 });
 
+test('html/md：检测详情与评分卡同源——fail 维度显示 scores 封顶分，不显示探针原始分', () => {
+  // 实锤封顶语义：探针原始分 70（PRICING_FAILED_SCORE）在聚合层被压到 45，
+  // 详情区标题必须与评分卡同为 45，否则同一份报告出现「评分卡 45 / 详情 70」的矛盾。
+  const report = reportWith(
+    [{ id: 'billing', weight: 25, score: 45, level: 'fail', headline: '换芯实锤', status: 'ok' }],
+    [
+      { id: 'billing', status: 'ok', score: 70, level: 'fail', headline: '换芯实锤', findings: [], metrics: {} },
+      { id: 'decoy', status: 'ok', score: null, level: 'unknown', headline: '诱饵', findings: [], metrics: {} },
+    ],
+  );
+  const md = renderMarkdown(report);
+  assert.match(md, /### billing — FAIL（45）/, '详情区必须显示封顶分 45');
+  assert.ok(!md.includes('（70）'), `详情区不得出现原始分 70：${md.split('\n').find((l) => l.includes('billing'))}`);
+  assert.match(md, /### decoy — N\/A（未判定）/, 'scores 未覆盖的观测项回退 outcome.score');
+  const html = renderHtml(report);
+  assert.match(html, /\(45\)<\/h3>/, 'HTML 详情区必须显示封顶分 45');
+  assert.ok(!html.includes('(70)</h3>'), 'HTML 详情区不得出现原始分 70');
+});
+
 test('html：每维度一行静态说明（id→测什么/评分依据）', () => {
   // 六个维度齐备的 fixture：说明随 score 条目逐行渲染
   const allDims: ScoreEntry[] = [
@@ -309,7 +328,11 @@ test('console：color=false 零 ANSI 且含异常要点块；color=true 着色�
 
 test('markdown：总分标签为「可信度总分：」且结论后置，null 总分记 未判定', () => {
   const md = renderMarkdown(sampleReport('x'));
-  assert.match(md, /> 可信度总分：\*\*88\/100\*\* · 结论：\*\*可疑\*\*/);
+  // warn 轮只展示分数，无结论词（「可疑」档已移除）
+  assert.match(md, /> 可信度总分：\*\*88\/100\*\*(?![^\n]*结论)/);
+  assert.ok(!md.includes('可疑'));
+  const fail = { ...sampleReport('x'), overall: 'fail' as const };
+  assert.match(renderMarkdown(fail), /> 可信度总分：\*\*88\/100\*\* · 结论：\*\*不通过\*\*/);
   const unknown = { ...sampleReport('x'), total: null, overall: 'unknown' as const };
   assert.match(renderMarkdown(unknown), /> 可信度总分：\*\*未判定\*\* · 结论：\*\*未判定\*\*/);
 });
@@ -318,8 +341,15 @@ test('html/console：总分标签同步为「可信度总分」', () => {
   const html = renderHtml(sampleReport('x'));
   assert.ok(html.includes('<strong>可信度总分 88/100</strong>'), html.slice(0, 600));
   assert.ok(!html.includes('<strong>总分 '));
+  assert.ok(!html.includes('可疑'), 'warn 轮 HTML 不出现「可疑」徽标/文案');
+  const failHtml = renderHtml({ ...sampleReport('x'), overall: 'fail' as const });
+  assert.ok(failHtml.includes('>不通过</span>'), failHtml.slice(0, 600));
   const console_ = renderConsole(sampleReport('x'), { color: false });
-  assert.match(console_, /可信度总分 88\/100 — 可疑/);
+  // warn 轮 console 只给分数，无结论后缀
+  assert.match(console_, /可信度总分 88\/100\n/);
+  assert.ok(!console_.includes('可疑'));
+  const failConsole = renderConsole({ ...sampleReport('x'), overall: 'fail' as const }, { color: false });
+  assert.match(failConsole, /可信度总分 88\/100 — 不通过/);
   const unknown = { ...sampleReport('x'), total: null, overall: 'unknown' as const };
   assert.match(renderConsole(unknown, { color: false }), /可信度总分 未判定 — 证据不足，无法得出结论/);
 });
@@ -449,7 +479,7 @@ function billingOutcome(metrics: Record<string, number | string | null> = {}): P
     status: 'ok',
     score: 85,
     level: 'pass',
-    headline: 'usage 计数核验通过，未发现造假证据（未做绝对对账，扣费金额真实性未验证）',
+    headline: 'token 计数核验通过，未发现造假证据；实扣倍率无法计算（该站没有可用的余额接口）；补充说明：实际扣款未核对（该站没有可用的余额接口）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）',
     findings: [],
     metrics: {
       pricing_state: 'ok',
@@ -465,43 +495,55 @@ function billingOutcome(metrics: Record<string, number | string | null> = {}): P
   };
 }
 
-test('markdown：计费维度输出「计费与倍率」摘要块（公示倍率 / 实测倍率 / 为何没有倍率的原因）', () => {
+test('markdown：计费维度输出「计费与倍率」摘要块（公示倍率 / 实扣倍率 / 为何没有倍率的原因）', () => {
   const md = renderMarkdown(reportWith([], [billingOutcome()]));
   assert.ok(md.includes('**计费与倍率**'), '计费维度必须有中文标签的倍率摘要块');
-  assert.ok(md.includes('| 公示输入倍率 | 2 |'), `缺公示输入倍率：${md}`);
-  assert.ok(md.includes('| 公示输出倍率 | 5 |'), `缺公示输出倍率：${md}`);
-  assert.ok(md.includes('| 实测倍率 | N/A |'), `缺实测倍率：${md}`);
+  assert.ok(md.includes('| 公示输入倍率（公开价表为反推值） | 2 |'), `缺公示输入倍率：${md}`);
+  assert.ok(md.includes('| 公示输出倍率（公开价表为反推值） | 5 |'), `缺公示输出倍率：${md}`);
+  assert.ok(md.includes('| 实扣倍率（实际扣费÷应缴） | N/A |'), `缺实扣倍率：${md}`);
   assert.ok(md.includes('| 余额探测原因 | 候选余额接口均不可用（origin https://relay.example.com） |'), '缺「为什么没有倍率」的原因字段');
-  assert.ok(md.includes('| 证据等级 | shape-only |'), '缺证据等级（形状证据 vs 绝对对账）');
+  assert.ok(md.includes('| 证据等级（shape-only / absolute） | shape-only |'), '缺证据等级（形状证据 vs 绝对对账）');
 });
 
 test('html：计费维度输出「计费与倍率」摘要块（与 markdown 同口径）', () => {
   const html = renderHtml(reportWith([], [billingOutcome()]));
   assert.ok(html.includes('<h4>计费与倍率</h4>'), 'HTML 计费维度缺倍率摘要块');
   assert.ok(html.includes('公示输入倍率'), 'HTML 缺公示输入倍率标签');
-  assert.ok(html.includes('实测倍率'), 'HTML 缺实测倍率标签');
+  assert.ok(html.includes('实扣倍率'), 'HTML 缺实扣倍率标签');
   assert.ok(html.includes('余额探测原因'), 'HTML 缺余额探测原因');
 });
 
 test('console：终端输出带倍率摘要行（实测 / 金额核验状态）', () => {
   const out = renderConsole(reportWith([], [billingOutcome()]), { color: false });
-  assert.match(out, /倍率: 实测 N\/A · 金额核验 not_applicable/);
+  assert.match(out, /倍率: 实扣 N\/A · 金额核验 not_applicable/);
 });
 
-test('console：实测不可得但有列表价倍率时，摘要行给出列表价倍率与实收未实测', () => {
+test('console：实测不可得但有录入价/当前公示价时，主位给 1×，列表折扣只作附注', () => {
   const out = renderConsole(
-    reportWith([], [billingOutcome({ public_price_ratio_input: 0.3, public_price_ratio_output: 0.3 })]),
+    reportWith(
+      [],
+      [
+        billingOutcome({
+          claimed_price_ratio_input: 1,
+          claimed_price_ratio_output: 1,
+          public_price_ratio_input: 0.3,
+          public_price_ratio_output: 0.3,
+        }),
+      ],
+    ),
     { color: false },
   );
   assert.match(
     out,
-    /倍率: 列表价 0\.3×（输入\/输出一致；公示价÷列表价） · 实收未实测 · 金额核验 not_applicable/,
+    /倍率: 你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣） · 站点现价÷官方列表价 0\.3×（输入\/输出一致，仅披露） · 实际扣款未核对 · 金额核验 not_applicable/,
   );
   assert.ok(!out.includes('实测 N/A'), out);
 });
 
 test('console：价格核验默认模式给出倍率与计费探针费用（不读余额）', () => {
   const outcome = billingOutcome({
+    claimed_price_ratio_input: 1,
+    claimed_price_ratio_output: 1,
     public_price_ratio_input: 0.3,
     public_price_ratio_output: 0.3,
     expected_cost_usd_declared: 0.016,
@@ -509,21 +551,37 @@ test('console：价格核验默认模式给出倍率与计费探针费用（不�
   });
   delete outcome.metrics['measured_ratio'];
   delete outcome.metrics['balance_probe_reason'];
+  outcome.headline =
+    'token 计数核验通过，未发现造假证据；按价目应扣 $0.016（估算，上界）；补充说明：实际扣款未核对（默认不读余额）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）';
   const out = renderConsole(reportWith([], [outcome]), { color: false });
   assert.match(
     out,
-    /倍率: 0\.3×（输入\/输出一致；公示价÷列表价） · 计费探针费用 \$0\.016（按公示价估算，上界） · 金额核验 not_applicable/,
+    /倍率: 你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣） · 站点现价÷官方列表价 0\.3×（输入\/输出一致，仅披露） · 本轮测试按价目应扣 \$0\.016（估算，上界） · 金额核验 not_applicable/,
   );
-  assert.ok(!out.includes('实测'), out);
-  assert.ok(!out.includes('余额'), out);
+  // 默认模式（不读余额）的倍率行不得泄漏余额探测产物（实测值/余额接口状态只属于余额模式）
+  const ratioLine = out.split('\n').find((line) => line.startsWith('倍率:')) ?? '';
+  assert.ok(!ratioLine.includes('实测'), ratioLine);
+  assert.ok(!ratioLine.includes('余额'), ratioLine);
 });
 
-test('markdown：价格倍率有指标标签（不埋在原始 JSON 里）', () => {
+test('markdown：录入价/当前公示价核对与列表价折扣各有独立标签（不埋在原始 JSON 里）', () => {
   const md = renderMarkdown(
-    reportWith([], [billingOutcome({ public_price_ratio_input: 0.3, public_price_ratio_output: 0.3 })]),
+    reportWith(
+      [],
+      [
+        billingOutcome({
+          claimed_price_ratio_input: 1,
+          claimed_price_ratio_output: 1,
+          public_price_ratio_input: 0.3,
+          public_price_ratio_output: 0.3,
+        }),
+      ],
+    ),
   );
-  assert.ok(md.includes('| 价格倍率（输入） | 0.3 |'), md);
-  assert.ok(md.includes('| 价格倍率（输出） | 0.3 |'), md);
+  assert.ok(md.includes('| 你填的单价÷站点现价（输入；只比价目，未看实扣） | 1 |'), md);
+  assert.ok(md.includes('| 你填的单价÷站点现价（输出；只比价目，未看实扣） | 1 |'), md);
+  assert.ok(md.includes('| 站点现价÷官方列表价（输入；仅披露） | 0.3 |'), md);
+  assert.ok(md.includes('| 站点现价÷官方列表价（输出；仅披露） | 0.3 |'), md);
 });
 
 test('无计费探针的报告不出现倍率摘要块（老报告不炸）', () => {
@@ -537,8 +595,19 @@ test('漂移钉子：控制台与 CLI 报告的倍率标签表同口径（键、
   const consoleLabels = extractBillingLabels(readFileSync(join(repoRoot(), 'web', 'app.js'), 'utf8'), 'const BILLING_METRIC_LABELS');
   assert.ok(reportLabels.length > 0 && consoleLabels.length > 0, '标签表不得为空');
   assert.deepEqual(consoleLabels, reportLabels, '控制台与报告的倍率标签表漂移了（web/app.js vs src/report/markdown.ts）');
-  // 关键标签必须在册（用户诉求：公示倍率 / 实测倍率 / 原因 / 证据等级）
-  for (const key of ['declared_model_ratio', 'declared_completion_ratio', 'measured_ratio', 'balance_probe_reason', 'evidence_level', 'money_check_state']) {
+  // 关键标签必须在册（用户诉求：公示倍率 / 实扣倍率 / 原因 / 证据等级）
+  for (const key of [
+    'declared_model_ratio',
+    'declared_completion_ratio',
+    'claimed_price_ratio_input',
+    'claimed_price_ratio_output',
+    'public_price_ratio_input',
+    'public_price_ratio_output',
+    'measured_ratio',
+    'balance_probe_reason',
+    'evidence_level',
+    'money_check_state',
+  ]) {
     assert.ok(reportLabels.some(([k]) => k === key), `标签表缺少关键指标 ${key}`);
   }
 });

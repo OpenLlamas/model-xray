@@ -451,8 +451,8 @@ export async function probeQuality(ctx: ProbeCtx): Promise<ProbeOutcome> {
     headline = `质量题集通过：首答 ${firstCorrect}/${usable}（控制题全对${excludedNote}${recoveredNote}）`;
   } else if (level === 'warn') {
     headline = whitewashRescued
-      ? `质量可疑：首答仅 ${firstCorrect}/${usable}，复采样恢复至 ${mainCorrect}/${usable}（随机失误不足以定罪${excludedNote}）`
-      : `质量可疑：首答 ${firstCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}${recoveredNote}`;
+      ? `质量未达通过线：首答仅 ${firstCorrect}/${usable}，复采样恢复至 ${mainCorrect}/${usable}（随机失误不足以定罪${excludedNote}）`
+      : `质量未达通过线：首答 ${firstCorrect}/${usable}，错误集中在 ${wrong.slice(0, 4).join('、')}${excludedNote}${recoveredNote}`;
   } else {
     headline = `疑似降智：首答仅 ${firstCorrect}/${usable} 正确，复采样后 ${mainCorrect}/${usable} 仍未达 0.6 线（控制题全对），已答错 ${wrong.length} 题${excludedNote}`;
   }

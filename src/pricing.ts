@@ -10,8 +10,19 @@
 const MAX_DECLARED_MODELS = 2000;
 /** 响应体上限：公示价 JSON 正常为几十 KB 量级，512KB 已足够覆盖大站且防止内存打爆。 */
 export const PRICING_BODY_LIMIT_BYTES = 512 * 1024;
-/** new-api 的倍率基价：model_ratio=1 对应 $0.002 / 1K tokens = $2 / 百万 tokens。 */
+/** new-api 的标准倍率基价：quota_per_unit=500000 时 model_ratio=1 ⇔ $2/百万 tokens。 */
 export const USD_PER_MILLION_PER_RATIO = 2;
+
+/**
+ * 按站点真实 quota_per_unit 计算「1 个 model_ratio 对应多少 USD/百万 tokens」。
+ * quota = tokens × ratio ⇒ USD/百万 = 1e6 / quota_per_unit × ratio。
+ * 未提供真实换算率时退回 new-api 标准基价（仅用于展示，调用方必须标记为合成口径）。
+ */
+export function usdPerMillionPerRatio(quotaPerUnit: number | null | undefined): number {
+  return typeof quotaPerUnit === 'number' && Number.isFinite(quotaPerUnit) && quotaPerUnit > 0
+    ? 1_000_000 / quotaPerUnit
+    : USD_PER_MILLION_PER_RATIO;
+}
 
 /** 公示价来源：api=/api/pricing；public-json=/public/model-prices 等公开 JSON；scrape=网页抓价；manual=人工。 */
 export type PricingSource = 'api' | 'public-json' | 'scrape' | 'manual';
@@ -220,7 +231,24 @@ export function lookupDeclaredModel<T extends DeclaredRatioEntry>(
       bestLength = keyBase.length;
     }
   }
-  return best;
+  if (best !== null) return best;
+
+  // OpenRouter/LiteLLM 聚合表常用 provider/model 作为 id（openai/gpt-4o）；裸模型名只在
+  // 「去 provider 前缀后唯一命中」时采用，避免 openai/gpt-4o 与 azure/gpt-4o 被静默混用。
+  const leafName = (value: string): string => {
+    const normalized = normalizeModelName(value);
+    const slash = normalized.lastIndexOf('/');
+    return stripVersionSuffix(slash >= 0 ? normalized.slice(slash + 1) : normalized);
+  };
+  const targetLeaf = leafName(target);
+  let leafMatch: { key: string; model: T } | null = null;
+  let leafMatches = 0;
+  for (const [key, model] of entries) {
+    if (leafName(key) !== targetLeaf) continue;
+    leafMatches += 1;
+    leafMatch = { key, model };
+  }
+  return leafMatches === 1 ? leafMatch : null;
 }
 
 /** 模型族系（首个字母段）：用于回显错配的粗分类，不参与 identity 维度判定。 */
@@ -241,7 +269,8 @@ export function expectedCostFromDeclared(
   totals: UsageTotals,
   options?: ExpectedCostOptions,
 ): DeclaredCostEstimate {
-  const inputUsdPerM = model.modelRatio * USD_PER_MILLION_PER_RATIO;
+  const ratioToUsd = usdPerMillionPerRatio(declared.quotaPerUnit);
+  const inputUsdPerM = model.modelRatio * ratioToUsd;
   const outputUsdPerM = inputUsdPerM * model.completionRatio;
   if (model.quotaType === 1) {
     return {
@@ -284,8 +313,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
+const NUMERIC_STRING = /^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?$/i;
+
 function finiteNumber(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (trimmed === '' || !NUMERIC_STRING.test(trimmed)) return null;
+  const parsed = Number(trimmed);
+  return Number.isFinite(parsed) ? parsed : null;
 }
 
 function finitePositive(value: unknown): number | null {

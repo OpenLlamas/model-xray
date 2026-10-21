@@ -276,7 +276,7 @@ test('cli: empty --price-input is rejected', async () => {
   const result = await runCli([...REMOTE_ARGS, '--price-input', '', '--price-output', '2', '--dry-run']);
   assert.equal(result.status, 2, result.stderr);
   assert.ok(result.stderr.includes('必须为正数'), result.stderr);
-  assert.ok(result.stderr.includes('每百万 tokens 宣称价格'), result.stderr);
+  assert.ok(result.stderr.includes('每百万 tokens 录入价'), result.stderr);
 });
 
 test('cli: negative --price-input is rejected', async () => {

@@ -1,5 +1,5 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
-import { levelLabel, PROBE_ORDER, statusTag } from '../scoring.js';
+import { PROBE_ORDER, statusTag, verdictLabel } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 import { CREDIBILITY_NOTE, HIDDEN_METRICS, billingSummaryRows } from './markdown.js';
 
@@ -7,7 +7,7 @@ import { CREDIBILITY_NOTE, HIDDEN_METRICS, billingSummaryRows } from './markdown
 const DIMENSION_DESC: Readonly<Record<string, string>> = {
   identity: '身份与指纹：多角度自述问答与行为指纹比对，识破换标签/套皮；评分依据：自述一致性与指纹命中',
   context: '长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率',
-  billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性 + completion_tokens 硬矛盾检查；绝对对账（--token-reference 或价格+余额实测倍率）缺失时判「未判定」，不给分',
+  billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性 + completion_tokens 硬矛盾检查；绝对对账（--token-reference 或价格+余额实扣倍率）缺失时判「未判定」，不给分',
   capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
   quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
   ttft: '流式首字延迟：采样 TTFT 分位数；观测项不计分，仅披露 p50/p95（非流式响应计至完整响应体到达）',
@@ -17,9 +17,16 @@ const DIMENSION_DESC: Readonly<Record<string, string>> = {
 export function renderHtml(report: AuditReport): string {
   const meta = report.meta;
   const totalText = report.total === null ? '未判定' : `${report.total}/100`;
-  const verdictClass = report.overall === 'pass' ? 'ok' : report.overall === 'fail' ? 'bad' : 'warn';
+  // 总评徽标：仅 fail（不通过，红）/unknown（未判定，灰）有结论徽标；pass/warn 只展示分数。
+  const verdict = verdictLabel(report.overall);
+  const verdictBadge =
+    verdict === null
+      ? ''
+      : `<span class="badge ${report.overall === 'fail' ? 'bad' : 'unknown'}">${esc(verdict)}</span>`;
   const anomalies = collectAnomalies(report);
   const boxLevel = anomalies.some((a) => a.level === 'fail') ? 'fail' : anomalies.length > 0 ? 'warn' : 'ok';
+  // 分项得分（含实锤封顶）按 id 建索引：检测详情区与评分卡同源展示，不显示探针原始分。
+  const scoreById = new Map(report.scores.map((s) => [s.id, s.score]));
   return `<!DOCTYPE html>
 <html lang="zh">
 <head>
@@ -35,7 +42,7 @@ h4{font-size:15px;margin:16px 0 6px}
 table{border-collapse:collapse;width:100%;background:#fff} th,td{border:1px solid var(--line);padding:6px 10px;text-align:left;vertical-align:top}
 th{background:#f0f0f0}
 .badge{display:inline-block;padding:6px 14px;border-radius:6px;font-weight:700;color:#fff;margin-right:8px}
-.badge.ok{background:var(--ok)} .badge.bad{background:var(--bad)} .badge.warn{background:var(--warn)}
+.badge.ok{background:var(--ok)} .badge.bad{background:var(--bad)} .badge.warn{background:var(--warn)} .badge.unknown{background:var(--muted)}
 .tag{font-weight:700;white-space:nowrap}.tag.pass{color:var(--ok)} .tag.fail{color:var(--bad)} .tag.warn{color:var(--warn)} .tag.unknown{color:var(--muted)}
 .ev{margin:8px 0;border:1px solid var(--line);background:#fff;border-radius:4px;padding:8px 12px}
 .ev summary{cursor:pointer;font-weight:600}
@@ -58,7 +65,7 @@ body{background:#161616;color:#e8e8e8}table{background:#1f1f1f}th{background:#2a
 </head>
 <body><main>
 <h1>model-xray 报告 — ${esc(meta.model)}</h1>
-<p><span class="badge ${verdictClass}">${esc(levelLabel(report.overall))}</span><strong>可信度总分 ${esc(totalText)}</strong></p>
+<p>${verdictBadge}<strong>可信度总分 ${esc(totalText)}</strong></p>
 <div class="anomaly ${boxLevel}">
 <div class="anomaly-title">异常要点${anomalies.length > 0 ? `（${anomalies.length} 项）` : ''}</div>
 ${
@@ -91,7 +98,9 @@ ${report.scores
 ${`<h2>说明</h2><ul>${[...report.notes, CREDIBILITY_NOTE].map((n) => `<li>${esc(n)}</li>`).join('')}</ul>`}
 
 <h2>检测详情</h2>
-${report.outcomes.map(renderOutcome).join('\n')}
+${report.outcomes
+  .map((o) => renderOutcome(o, scoreById.get(o.id)))
+  .join('\n')}
 
 ${
   report.evidence.length > 0
@@ -102,7 +111,11 @@ ${
 `;
 }
 
-function renderOutcome(outcome: ProbeOutcome): string {
+function renderOutcome(outcome: ProbeOutcome, scoreOverride?: number | null): string {
+  // 分数展示与评分卡同源：scores 里的分项分已经过聚合层实锤封顶（定罪维度不保留及格分），
+  // 详情区不得再显示探针原始分（否则同一份报告出现「评分卡 45 / 详情 70」的矛盾数字）。
+  // scores 未覆盖的观测项（如 decoy）回退 outcome.score；覆盖但分数 null（未判定）也按未判定展示。
+  const shownScore = scoreOverride !== undefined ? scoreOverride : outcome.score;
   const findings = outcome.findings
     .map((f) => {
       const cls = f.level === 'fail' ? 'fail' : f.level === 'warn' ? 'warn' : 'unknown';
@@ -124,7 +137,7 @@ function renderOutcome(outcome: ProbeOutcome): string {
           .map(([, label, value]) => `<tr><td>${esc(label)}</td><td>${esc(value)}</td></tr>`)
           .join('')}</tbody></table>`
       : '';
-  return `<h3>${esc(outcome.id)} — <span class="tag ${outcome.level}">${esc(statusTag(outcome.level))}</span> (${outcome.score ?? '未判定'})</h3>
+  return `<h3>${esc(outcome.id)} — <span class="tag ${outcome.level}">${esc(statusTag(outcome.level))}</span> (${shownScore ?? '未判定'})</h3>
 <p>${esc(outcome.headline)}</p>
 ${billingBlock}
 ${findings ? `<ul>${findings}</ul>` : ''}

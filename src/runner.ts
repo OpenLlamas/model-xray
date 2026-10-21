@@ -410,8 +410,8 @@ function escalateLevel(current: Level, next: Level): Level {
 
 /** 把基线漂移项落到对应 outcome：追加 finding；cap 仅在 score 为 number 时取 min 并按 cap 重算 level（导出供单测）。
  *  分项不可评分（score 非有限数）时 cap 无从落点，但漂移结论必须提升该分项 level——
- *  overall 由各分项 level 派生（computeTotal 的 anyFail/anyWarn），否则会出现
- *  「FAIL 级「疑似模型被更换」finding 之下 overall=warn/exit 0」的矛盾判定。 */
+ *  分项 level 仍驱动分数封顶与分项结论；overall 的 fail 仅由计费/身份维度 fail 触发
+ *  （computeTotal 的 hardFail），其余维度的 fail 只压分数。 */
 export function applyBaselineDiff(outcomes: ProbeOutcome[], diff: BaselineDiff): void {
   for (const item of diff.items) {
     const outcome = outcomes.find((o) => o.id === item.probeId);
@@ -430,7 +430,7 @@ export function applyBaselineDiff(outcomes: ProbeOutcome[], diff: BaselineDiff):
 }
 
 /**
- * 全量测试费用注记：按所有带 usage 的证据汇总 token，用计费探针抓到的宣称价折算。
+ * 全量测试费用注记：按所有带 usage 的证据汇总 token，用计费探针收到的录入价折算。
  * 这是给用户核对余额的估算口径，不读余额、不含缓存折扣/阶梯差异。
  */
 export function totalAuditCostNote(outcomes: ProbeOutcome[], evidence: EvidenceRecord[]): string | null {
@@ -452,7 +452,7 @@ export function totalAuditCostNote(outcomes: ProbeOutcome[], evidence: EvidenceR
   const cost = (prompt / 1_000_000) * inputPrice + (completion / 1_000_000) * outputPrice;
   const costText = cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3);
   return (
-    `测试总费用（按公示价估算，${calls} 条带 usage 请求）：$${costText}` +
+    `测试总费用（按录入价估算，${calls} 条带 usage 请求）：${costText}（与录入价同单位）` +
     `（输入 ${prompt} / 输出 ${completion} tokens；未含缓存折扣/阶梯差异，余额消耗请自行核对）。`
   );
 }
@@ -495,7 +495,7 @@ function gatewayDiagnosisNotes(outcomes: ProbeOutcome[], evidence: EvidenceRecor
   const billingEmpty = empty.filter((record) => record.probe === 'billing').length;
   if (billingEmpty > 0) {
     notes.push(
-      `计量维度有 ${billingEmpty} 条 200 空正文但携带 usage：按 usage 计分，未重试空正文（避免重复计费污染实测倍率）；倍率结论请结合该披露复核。`,
+      `计量维度有 ${billingEmpty} 条 200 空正文但携带 usage：按 usage 计分，未重试空正文（避免重复计费污染实扣倍率）；倍率结论请结合该披露复核。`,
     );
   }
   const identity = outcomes.find((outcome) => outcome.id === 'identity');

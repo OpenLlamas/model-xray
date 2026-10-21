@@ -133,10 +133,10 @@ export function buildCommand(input) {
       return fail('--price-input 与 --price-output 必须成对填写。示例：--price-input 2.5 --price-output 10');
     }
     if (!isPositiveNumberStr(priceInputRaw)) {
-      return fail(`--price-input 必须为正数（每百万 tokens 宣称价格，0 与负数无效）。收到：${JSON.stringify(priceInputRaw)}。示例：--price-input 2.5`);
+      return fail(`--price-input 必须为正数（每百万 tokens 录入价，0 与负数无效）。收到：${JSON.stringify(priceInputRaw)}。示例：--price-input 2.5`);
     }
     if (!isPositiveNumberStr(priceOutputRaw)) {
-      return fail(`--price-output 必须为正数（每百万 tokens 宣称价格，0 与负数无效）。收到：${JSON.stringify(priceOutputRaw)}。示例：--price-output 10`);
+      return fail(`--price-output 必须为正数（每百万 tokens 录入价，0 与负数无效）。收到：${JSON.stringify(priceOutputRaw)}。示例：--price-output 10`);
     }
     if (priceCachedReadRaw !== '' && !isNonNegativeNumberStr(priceCachedReadRaw)) {
       return fail(`--price-cached-read 必须为不小于 0 的数字（缓存读命中价，可免费）。收到：${JSON.stringify(priceCachedReadRaw)}。示例：--price-cached-read 0.5`);
@@ -253,6 +253,12 @@ export function buildCommand(input) {
   if (expectCompletionRatioRaw !== '') parts.push(`--expect-completion-ratio ${expectCompletionRatioRaw}`);
   if (quotaPerUsdRaw !== '') parts.push(`--quota-per-usd ${quotaPerUsdRaw}`);
   if (declaredPricePageRaw !== '') parts.push(`--declared-price-page ${quote(declaredPricePageRaw)}`);
+  if (input?.readBalance === true) {
+    if (!hasPriceInput) {
+      return { command: '', hints, error: '余额对账需要先填写输入/输出单价：实扣倍率 = 实际扣费 ÷（录入价×自报 usage），没有录入价就算不出应缴分母。' };
+    }
+    parts.push('--read-balance');
+  }
   if (timeoutRaw !== '') parts.push(`--timeout ${timeoutRaw}`);
   if (httpRetriesRaw !== '') parts.push(`--http-retries ${httpRetriesRaw}`);
   if (outRaw !== '') parts.push(`--out ${quote(outRaw)}`);
@@ -264,7 +270,8 @@ export function buildCommand(input) {
   return { command: parts.join(' '), hints, error: null };
 }
 
-const OVERALL_LABEL = { pass: '通过', warn: '可疑', fail: '不通过' };
+// 总评徽标：仅 fail 有结论词（不通过）；pass/warn/unknown 一律只展示分数（无「可疑/通过」档）
+const OVERALL_LABEL = { fail: '不通过' };
 
 function badgeClass(level) {
   return ['pass', 'warn', 'fail', 'unknown'].includes(level) ? level : 'unknown';
@@ -280,7 +287,7 @@ function fieldText(record, key) {
 // ---------------------------------------------------------------------------
 
 /**
- * 「计费与倍率」摘要块：中文标签 + 固定展示顺序（公示价 → 抓价 → 实测倍率 → 金额核验 → 价格 → 证据）。
+ * 「计费与倍率」摘要块：中文标签 + 固定展示顺序（公示价 → 抓价 → 实扣倍率 → 金额核验 → 价格 → 证据）。
  * 只渲染报告里实际存在的 key——缺失即不出现，绝不用占位值冒充结论。
  * 与 src/report/markdown.ts 的 BILLING_METRIC_LABELS 同口径（web/ 不参与 tsc 编译，无法直接 import），
  * 两侧一致性由 test/unit/report.test.ts 的漂移钉子守住。
@@ -293,10 +300,11 @@ const BILLING_METRIC_LABELS = [
   ['declared_group', '生效分组'],
   ['declared_group_ratio', '分组折扣倍率'],
   ['group_ratio_verified', '分组倍率可信'],
-  ['declared_model_ratio', '公示输入倍率'],
-  ['declared_completion_ratio', '公示输出倍率'],
+  ['declared_model_ratio', '公示输入倍率（公开价表为反推值）'],
+  ['declared_completion_ratio', '公示输出倍率（公开价表为反推值）'],
   ['cache_ratio', '缓存倍率'],
-  ['declared_drift_count', '公示价漂移项数'],
+  ['declared_drift_count', '公示价上调/口径断裂项数'],
+  ['declared_drift_down_count', '公示价下调项数（不扣分）'],
   ['declared_drift_fields', '公示价漂移字段'],
   ['public_price_state', '公开价表状态'],
   ['public_price_page', '公开价表页面'],
@@ -309,8 +317,10 @@ const BILLING_METRIC_LABELS = [
   ['public_price_list_input_usd_per_m', '公开价列表输入价（$/百万）'],
   ['public_price_list_output_usd_per_m', '公开价列表输出价（$/百万）'],
   ['public_price_list_cached_usd_per_m', '公开价列表缓存价（$/百万）'],
-  ['public_price_ratio_input', '价格倍率（输入）'],
-  ['public_price_ratio_output', '价格倍率（输出）'],
+  ['claimed_price_ratio_input', '你填的单价÷站点现价（输入；只比价目，未看实扣）'],
+  ['claimed_price_ratio_output', '你填的单价÷站点现价（输出；只比价目，未看实扣）'],
+  ['public_price_ratio_input', '站点现价÷官方列表价（输入；仅披露）'],
+  ['public_price_ratio_output', '站点现价÷官方列表价（输出；仅披露）'],
   ['scraped_price_state', '网页抓价状态'],
   ['scraped_price_reason', '网页抓价原因'],
   ['scraped_price_page', '抓价页面'],
@@ -319,9 +329,9 @@ const BILLING_METRIC_LABELS = [
   ['scraped_price_output_usd_per_m', '抓价输出价（$/百万）'],
   ['scraped_price_confidence', '抓价置信度'],
   ['scraped_price_currency', '抓价币种'],
-  ['measured_ratio', '实测倍率'],
-  ['ratio_verified', '实测倍率可信'],
-  ['ratio_masked_verdict', '实测倍率结论'],
+  ['measured_ratio', '实扣倍率（实际扣费÷应缴）'],
+  ['ratio_verified', '实扣倍率可信'],
+  ['ratio_masked_verdict', '实扣倍率底层判定（用户级口径永不判 fail）'],
   ['ratio_contaminated', '倍率被污染'],
   ['ratio_samples', '倍率样本数'],
   ['ratio_dropped', '丢弃样本数'],
@@ -329,34 +339,37 @@ const BILLING_METRIC_LABELS = [
   ['balance_probe_reason', '余额探测原因'],
   ['balance_unit', '余额读数单位'],
   ['balance_resolution', '余额读数刻度'],
-  ['balance_calibrated_unit', '校准后单位'],
-  ['balance_calibration_confidence', '单位校准置信度'],
+  ['balance_calibrated_unit', '校准后单位（推断口径）'],
+  ['balance_calibration_confidence', '单位校准置信度（推断 high/low）'],
   ['balance_scope', '余额口径'],
   ['balance_pre_settled', '前快照已结算'],
   ['balance_post_settled', '后快照已结算'],
   ['balance_before', '请求前余额读数'],
   ['balance_after', '请求后余额读数'],
-  ['spend_delta', '余额扣费差值'],
+  ['spend_delta', '本轮实际扣费（实测；单位校准采信后为估算）'],
   ['money_check_state', '金额核验状态'],
   ['money_verified', '金额已核验'],
-  ['absolute_reconciliation', '绝对对账'],
-  ['expected_cost_usd_declared', '计费探针费用（按公示价，USD）'],
-  ['expected_quota_declared', '计费探针费用（按公示价，quota）'],
-  ['cost_is_upper_bound', '应缴额为上界'],
-  ['cost_is_lower_bound', '应缴额为下界'],
-  ['calibration_confidence', '单位校准置信度'],
+  ['absolute_reconciliation', '与外部硬证据比对'],
+  ['expected_cost_usd_declared', '按价目应扣（USD，估算）'],
+  ['expected_cost_usd_basis', '费用来源（public_usd / quota）'],
+  ['expected_quota_declared', '按价目应扣（quota，估算）'],
+  ['cost_is_upper_bound', '应扣额为上界'],
+  ['cost_is_lower_bound', '应扣额为下界'],
+  ['calibration_confidence', '单位校准置信度（推断 high/low）'],
   ['reference_source', '令牌基准来源'],
   ['reference_verified', '令牌基准已核验'],
   ['quota_to_usd', 'quota→USD 系数'],
   ['quota_per_unit', '站点 quota 每美元'],
-  ['expected_cost', '本轮应缴额'],
-  ['price_input', '宣称输入价（$/百万）'],
-  ['price_output', '宣称输出价（$/百万）'],
-  ['price_cached_read', '宣称缓存读价（$/百万）'],
+  ['quota_per_unit_synthetic', 'quota 换算使用标准基价（1=是）'],
+  ['declared_ratio_synthetic', '公示倍率为公开价表反推（1=是）'],
+  ['expected_cost', '本轮应扣（按你填的单价，估算）'],
+  ['price_input', '录入输入价（与公示同单位/百万）'],
+  ['price_output', '录入输出价（与公示同单位/百万）'],
+  ['price_cached_read', '录入缓存读价（与公示同单位/百万）'],
   ['price_threshold', '阶梯阈值（tokens）'],
-  ['price_input2', '二档输入价（$/百万）'],
-  ['price_output2', '二档输出价（$/百万）'],
-  ['price_cached_read2', '二档缓存读价（$/百万）'],
+  ['price_input2', '二档输入价（与公示同单位/百万）'],
+  ['price_output2', '二档输出价（与公示同单位/百万）'],
+  ['price_cached_read2', '二档缓存读价（与公示同单位/百万）'],
   ['echo_model_mismatch', '回显模型不一致'],
   ['requests', '请求数'],
   ['details_reported_count', '已回报样本数'],
@@ -371,7 +384,7 @@ const BILLING_METRIC_LABELS = [
   ['slope_zh', '输入 token 斜率（中）'],
   ['r2_en', '回归 R²（英）'],
   ['r2_zh', '回归 R²（中）'],
-  ['evidence_level', '证据等级'],
+  ['evidence_level', '证据等级（shape-only / absolute）'],
 ];
 
 /** 大型内部指标：完整倍率表/抓价命中的 JSON 串（数百模型时能刷屏），与 src/report/markdown.ts HIDDEN_METRICS 同口径。 */
@@ -421,6 +434,43 @@ function metricText(value) {
   return text.length > 160 ? `${text.slice(0, 160)}…` : text;
 }
 
+/** N/A 原因短语：与 src/probes/billing.ts 的口径标签决策表同名同义，同一缺口只用一种说法。 */
+const BILLING_NA_REASON = {
+  balanceUnavailable: '该站没有可用的余额接口',
+  balanceUnstable: '余额读数不稳定',
+  windowUnattributable: '窗口内扣费混入其他消费，无法归因到本次测试',
+  balanceNotRead: '实际扣款未核对（默认不读余额）',
+  quotaPerUnit: '站点未公示 quota_per_unit 换算率',
+  publicRate: '站点未公示价格',
+  modelNotListed: '价目表中没有这个模型',
+  claimedPrice: '缺录入价或站点现价',
+};
+
+/** 某个指标取值为 N/A 时的原因；无法归因到枚举缺口时返回 null（不编造原因）。 */
+function billingNaReason(key, byKey) {
+  const flag = (metricKey) => String(byKey.get(metricKey) ?? '');
+  const balanceReason = () => {
+    if (byKey.has('balance_probe_reason')) return BILLING_NA_REASON.balanceUnavailable;
+    if (flag('ratio_contaminated') === '1') return BILLING_NA_REASON.windowUnattributable;
+    if (flag('balance_pre_settled') === '0' || flag('balance_post_settled') === '0') return BILLING_NA_REASON.balanceUnstable;
+    if (!byKey.has('balance_endpoint') && !byKey.has('balance_before') && !byKey.has('balance_after')) {
+      return BILLING_NA_REASON.balanceNotRead;
+    }
+    return BILLING_NA_REASON.windowUnattributable;
+  };
+  if (key === 'measured_ratio') return balanceReason();
+  if (key === 'claimed_price_ratio_input' || key === 'claimed_price_ratio_output') {
+    if (flag('quota_per_unit_synthetic') === '1') return BILLING_NA_REASON.quotaPerUnit;
+    if (flag('public_price_state') === 'failed' || flag('pricing_state') === 'failed') return BILLING_NA_REASON.publicRate;
+    return BILLING_NA_REASON.claimedPrice;
+  }
+  if (key === 'expected_cost_usd_declared' || key === 'expected_quota_declared' || key === 'expected_cost') {
+    if (flag('quota_per_unit_synthetic') === '1') return BILLING_NA_REASON.quotaPerUnit;
+    if (flag('public_price_state') === 'failed' || flag('pricing_state') === 'failed') return BILLING_NA_REASON.publicRate;
+  }
+  return null;
+}
+
 /** 计费探针的「倍率与金额」摘要块行；无对应指标（或报告里没有 billing 探针）返回空数组。 */
 function renderBillingMetrics(record) {
   const entries = metricEntries(record);
@@ -429,7 +479,10 @@ function renderBillingMetrics(record) {
   const cells = [];
   for (const [key, label] of BILLING_METRIC_LABELS) {
     if (!byKey.has(key)) continue;
-    cells.push(`          <div><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(metricText(byKey.get(key)))}</span></div>`);
+    const raw = metricText(byKey.get(key));
+    const naReason = raw === 'N/A' ? billingNaReason(key, byKey) : null;
+    const value = naReason === null ? raw : `${raw}（${naReason}）`;
+    cells.push(`          <div><span class="k">${escapeHtml(label)}</span><span class="v">${escapeHtml(value)}</span></div>`);
   }
   if (cells.length === 0) return [];
   return ['  <h4>计费与倍率</h4>', '  <div class="metrics-grid">', ...cells, '  </div>'];
@@ -488,8 +541,23 @@ export function renderScorecard(jsonText) {
     };
   }
 
-  const rows = data.outcomes.map((raw) => {
-    const record = raw !== null && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  // 评分卡行优先用 scores（聚合层实锤封顶后的分项分，与 CLI/Markdown/HTML 报告一致）；
+  // scores 为空（老报告）才回退 outcomes 原始分。outcomes 中未被 scores 覆盖的观测项
+  // （如 decoy）按原样追加，保持「详情可见、不计分」口径。
+  const scoreEntries = Array.isArray(data.scores)
+    ? data.scores.filter((raw) => raw !== null && typeof raw === 'object' && !Array.isArray(raw))
+    : [];
+  const scoreIds = new Set(scoreEntries.map((entry) => fieldText(entry, 'id')));
+  const scoreRows = (
+    scoreEntries.length > 0
+      ? [
+          ...scoreEntries,
+          ...data.outcomes.filter(
+            (raw) => raw !== null && typeof raw === 'object' && !Array.isArray(raw) && !scoreIds.has(fieldText(raw, 'id')),
+          ),
+        ]
+      : data.outcomes
+  ).map((record) => {
     const id = fieldText(record, 'id') ?? '（缺失）';
     const level = fieldText(record, 'level');
     const levelLabel = level ?? '缺失';
@@ -518,7 +586,8 @@ export function renderScorecard(jsonText) {
 
   const total = typeof data.total === 'number' && Number.isFinite(data.total) ? String(data.total) : '未判定';
   const overall = typeof data.overall === 'string' ? data.overall : '';
-  const overallLabel = OVERALL_LABEL[overall] ?? '未判定';
+  const overallLabel = OVERALL_LABEL[overall] ?? null;
+  const overallBadge = overallLabel === null ? '' : `<span class="badge badge-${badgeClass(overall)}">${escapeHtml(overallLabel)}</span>`;
 
   const billingOutcome = data.outcomes.find((raw) => fieldText(raw, 'id') === 'billing');
   const billingBlock = renderBillingMetrics(billingOutcome);
@@ -526,11 +595,11 @@ export function renderScorecard(jsonText) {
 
   const html = [
     '<section class="scorecard">',
-    `  <div class="scorecard-head"><span class="total">可信度总分：${escapeHtml(total)}</span><span class="badge badge-${badgeClass(overall)}">${escapeHtml(overallLabel)}</span></div>`,
+    `  <div class="scorecard-head"><span class="total">可信度总分：${escapeHtml(total)}</span>${overallBadge}</div>`,
     '  <table class="probes">',
     '    <thead><tr><th>探针</th><th>结论</th><th>得分</th><th>摘要</th></tr></thead>',
     '    <tbody>',
-    ...rows,
+    ...scoreRows,
     '    </tbody>',
     '  </table>',
     ...billingBlock,
@@ -679,11 +748,14 @@ export function classifyLogLine(text) {
   if (requestMatch !== null) {
     return `log-line log-line-request log-line-phase-${requestMatch[1].toLowerCase()}`;
   }
-  if (/\[(FAIL|ERROR)\]|异常|告警/i.test(text)) return 'log-line log-line-fail';
-  if (/\[WARN\]|可疑/i.test(text)) return 'log-line log-line-warn';
+  // 显式状态标签优先于正文关键词：`[PASS] … 未见异常` 里的「异常」是正常结论，
+  // 不能把整行染成失败红；只有无标签且确实含异常/告警的行才走关键词兜底。
+  if (/\[(FAIL|ERROR)\]/i.test(text)) return 'log-line log-line-fail';
+  if (/\[WARN\]/i.test(text)) return 'log-line log-line-warn';
   if (/\[PASS\]/i.test(text)) return 'log-line log-line-pass';
-  if (/\[UNKNOWN\]/i.test(text)) return 'log-line log-line-unknown';
+  if (/\[UNKNOWN\]|\[N\/A\]/i.test(text)) return 'log-line log-line-unknown';
   if (/\[INFO\]/i.test(text)) return 'log-line log-line-info';
+  if (/异常|告警|实锤/i.test(text)) return 'log-line log-line-fail';
   return 'log-line';
 }
 
@@ -889,6 +961,7 @@ if (typeof document !== 'undefined') {
       expectCompletionRatio: inputValue('f-expect-completion-ratio'),
       quotaPerUsd: inputValue('f-quota-per-usd'),
       declaredPricePage: inputValue('f-declared-price-page'),
+      readBalance: checkedValue('f-read-balance'),
       seed: inputValue('f-seed'),
       timeout: inputValue('f-timeout'),
       httpRetries: inputValue('f-http-retries'),
@@ -916,7 +989,7 @@ if (typeof document !== 'undefined') {
   ]) {
     byId(id)?.addEventListener('input', updateCommandPreview);
   }
-  for (const id of ['f-expect-vision', 'f-expect-tool', 'f-expect-thinking', 'f-deep', 'f-dry-run']) {
+  for (const id of ['f-expect-vision', 'f-expect-tool', 'f-expect-thinking', 'f-deep', 'f-dry-run', 'f-read-balance']) {
     byId(id)?.addEventListener('change', updateCommandPreview);
   }
   updateCommandPreview();
@@ -1059,9 +1132,9 @@ if (typeof document !== 'undefined') {
     wrap.removeAttribute('hidden');
     if (isDryRun) showRunBanner('pass', '预演完成：未发送任何请求（报告文件见上方链接）');
     else if (jobStatus === 'error') showRunBanner('fail', '⚠ 任务异常终止（子进程失败）：请查看日志');
-    else if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：存在异常，请查看下方评分卡与 findings');
-    else if (overall === 'warn') showRunBanner('warn', '⚠ 可疑：存在可疑迹象但未实锤，请查看评分卡与 findings');
-    else if (overall === 'pass') showRunBanner('pass', '✔ 检测通过：本轮未发现掺假/缩水证据');
+    else if (overall === 'fail') showRunBanner('fail', '⚠ 检测不通过：计费或身份维度存在实锤（乱收费/明显换壳），请查看下方评分卡与 findings');
+    else if (overall === 'warn') showRunBanner('warn', '本轮完成：未触发「不通过」（无乱收费/换壳实锤）；可信度总分与分项明细见下方评分卡');
+    else if (overall === 'pass') showRunBanner('pass', '✔ 本轮完成：未发现乱收费/换壳实锤，可信度总分与分项明细见下方评分卡');
     else if (exitCode === 1) showRunBanner('fail', '⚠ 检测不通过（exit 1）：请查看日志与报告');
     else if (exitCode === 2) showRunBanner('fail', '任务出错或未得出结论（exit 2）：请核对参数/key/端点后重试，详见日志');
   }
