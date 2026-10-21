@@ -280,9 +280,11 @@ export interface RunConfig {
   html: boolean;
   yes: boolean;
   quiet: boolean;
-  /** 宣称价格（每百万 tokens，单位需与端点余额显示单位一致）；启用实测倍率探针 */
+  /** 宣称价格（每百万 tokens）；启用价格核验与公示价倍率，不读取账户余额 */
   priceInput?: number | null;
   priceOutput?: number | null;
+  /** 库内显式开启余额前后对账（实测倍率）；CLI 不暴露此开关，缺省 false：只按公示价折算，不读余额 */
+  readBalance?: boolean;
   /** 缓存读命中价（缺省 = 按输入价）；二档阶梯：prompt > priceThreshold 时整单按二档价 */
   priceCachedRead?: number | null;
   priceThreshold?: number | null;

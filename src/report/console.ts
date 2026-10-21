@@ -35,7 +35,7 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
   }
 
   lines.push('');
-  // 倍率摘要：终端输出也要一眼看到「实测倍率 / 公示倍率 / 金额核验状态」，否则用户只看到
+  // 倍率摘要：终端输出也要一眼看到「价格倍率 / 实测倍率 / 金额核验状态」，否则用户只看到
   // "usage 计数核验通过" 这类文字，看不到任何倍率数字。
   const billing = report.outcomes.find((outcome) => outcome.id === 'billing');
   if (billing !== undefined) {
@@ -43,10 +43,56 @@ export function renderConsole(report: AuditReport, opts?: ConsoleRenderOptions):
     const measured = values.get('measured_ratio');
     const declaredModel = values.get('declared_model_ratio');
     const declaredCompletion = values.get('declared_completion_ratio');
-    if (measured !== undefined || declaredModel !== undefined || declaredCompletion !== undefined) {
-      lines.push(
-        `倍率: 实测 ${measured ?? '-'} · 公示 输入 ${declaredModel ?? '-'} / 输出 ${declaredCompletion ?? '-'} · 金额核验 ${values.get('money_check_state') ?? '-'}`,
-      );
+    if (
+      measured !== undefined ||
+      declaredModel !== undefined ||
+      declaredCompletion !== undefined ||
+      values.has('public_price_ratio_input') ||
+      values.has('expected_cost_usd_declared')
+    ) {
+      const fmtRatio = (value: unknown): string | null => {
+        // billingSummaryRows 统一把指标转成字符串；这里必须接受数字字符串，否则实测/列表价倍率永远读不到。
+        const parsed = typeof value === 'number' ? value : typeof value === 'string' && value.trim() !== '' ? Number(value) : NaN;
+        return Number.isFinite(parsed) ? `${Math.round(parsed * 1000) / 1000}×` : null;
+      };
+      const measuredText = fmtRatio(measured);
+      const listInValue = values.get('public_price_ratio_input');
+      const listOutValue = values.get('public_price_ratio_output');
+      const listIn = fmtRatio(listInValue);
+      const listOut = fmtRatio(listOutValue);
+      const listEqual =
+        listIn !== null &&
+        listOut !== null &&
+        Number.isFinite(Number(listInValue)) &&
+        Number.isFinite(Number(listOutValue)) &&
+        Math.abs(Number(listInValue) - Number(listOutValue)) < 1e-9;
+      let ratioText: string;
+      if (measuredText !== null) {
+        ratioText = `实测 ${measuredText}`;
+      } else if (listIn !== null || listOut !== null) {
+        // 价格核验模式（缺省）直接用公示价/列表价倍率；显式余额对账模式下才附加「实收未实测」。
+        const listText = listEqual
+          ? `${listIn}（输入/输出一致；公示价÷列表价）`
+          : `输入 ${listIn ?? '-'} / 输出 ${listOut ?? '-'}（公示价÷列表价）`;
+        ratioText = measured !== undefined ? `列表价 ${listText} · 实收未实测` : listText;
+      } else {
+        ratioText = measured !== undefined ? `实测 ${measured ?? '-'}` : '不可得（无列表价）';
+      }
+      const totalCostRaw = values.get('expected_cost_usd_declared');
+      const totalCost =
+        totalCostRaw !== undefined && totalCostRaw.trim() !== '' && Number.isFinite(Number(totalCostRaw))
+          ? Number(totalCostRaw)
+          : null;
+      const costText =
+        totalCost === null
+          ? null
+          : `计费探针费用 $${Math.round(totalCost * 1000) / 1000}（按公示价估算${
+              values.get('cost_is_upper_bound') === '1' ? '，上界' : ''
+            }）`;
+      const lineParts = [`倍率: ${ratioText}`];
+      if (costText !== null) lineParts.push(costText);
+      lineParts.push(`金额核验 ${values.get('money_check_state') ?? '-'}`);
+      lines.push(lineParts.join(' · '));
     }
   }
 

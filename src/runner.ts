@@ -259,6 +259,8 @@ export async function runAudit(
   // 运行级失败归因：N/M 笔请求被端点/网关拒绝等，让「为什么这么多未判定」一眼可读
   const runFailureNote = runFailureDigest(evidence.all());
   if (runFailureNote !== null) notes.push(runFailureNote);
+  const costNote = totalAuditCostNote(outcomes, evidence.all());
+  if (costNote !== null) notes.push(costNote);
 
   // 指纹基线：先构建本轮基线，再与输入基线对比；全部在 computeTotal 之前完成
   const currentBaseline = buildBaseline(outcomes, {
@@ -425,6 +427,34 @@ export function applyBaselineDiff(outcomes: ProbeOutcome[], diff: BaselineDiff):
     // headline 同步标注封顶，避免「标题说题集通过、分数却是 30」的矛盾呈现
     outcome.headline = `${outcome.headline}（基线漂移封顶 ${item.cap}：${item.message}）`;
   }
+}
+
+/**
+ * 全量测试费用注记：按所有带 usage 的证据汇总 token，用计费探针抓到的宣称价折算。
+ * 这是给用户核对余额的估算口径，不读余额、不含缓存折扣/阶梯差异。
+ */
+export function totalAuditCostNote(outcomes: ProbeOutcome[], evidence: EvidenceRecord[]): string | null {
+  const billing = outcomes.find((outcome) => outcome.id === 'billing');
+  const inputPrice = billing?.metrics['price_input'];
+  const outputPrice = billing?.metrics['price_output'];
+  if (typeof inputPrice !== 'number' || typeof outputPrice !== 'number') return null;
+  let prompt = 0;
+  let completion = 0;
+  let calls = 0;
+  for (const record of evidence) {
+    const usage = record.response.usage;
+    if (usage === null) continue;
+    prompt += usage.prompt_tokens;
+    completion += usage.completion_tokens;
+    calls += 1;
+  }
+  if (calls === 0) return null;
+  const cost = (prompt / 1_000_000) * inputPrice + (completion / 1_000_000) * outputPrice;
+  const costText = cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3);
+  return (
+    `测试总费用（按公示价估算，${calls} 条带 usage 请求）：$${costText}` +
+    `（输入 ${prompt} / 输出 ${completion} tokens；未含缓存折扣/阶梯差异，余额消耗请自行核对）。`
+  );
 }
 
 /**

@@ -80,7 +80,8 @@ test('e2e honest endpoint scores 100 with no failures', async () => {
   // 绝对对账：余额按 1.0 倍累加 usage 成本，billing 给 PASS 100（仅形状证据上限为 85）。
   const mock = await createMockServer({ mode: 'honest', balanceRate: 1 });
   try {
-    const report = await audit(mock, { claimedContext: 4000, priceInput: 2, priceOutput: 8 });
+    // 余额对账分支仍由库内 readBalance 显式开启；CLI 默认价格核验不读余额。
+    const report = await audit(mock, { claimedContext: 4000, priceInput: 2, priceOutput: 8, readBalance: true });
     assert.equal(report.total, 100);
     assert.equal(report.overall, 'pass');
     assert.ok(!report.scores.some((s) => s.level === 'fail'));
@@ -339,7 +340,7 @@ test('e2e dead endpoint yields insufficient probes, not a false pass', async () 
 test('e2e price flags produce measured-ratio metrics from balance delta', async () => {
   const mock = await createMockServer({ mode: 'honest', balanceSeries: [9950, 9950, 10000, 10000] });
   try {
-    const report = await audit(mock, { priceInput: 2.5, priceOutput: 10 });
+    const report = await audit(mock, { priceInput: 2.5, priceOutput: 10, readBalance: true });
     const billing = report.outcomes.find((o) => o.id === 'billing');
     assert.ok(billing);
     assert.equal(billing?.metrics['balance_endpoint'], '/dashboard/billing/usage');
@@ -443,7 +444,7 @@ test('e2e badusage endpoint flags inconsistent/negative usage and drops samples'
 test('e2e flaky500 with retries invalidates measured ratio (contamination gate)', async () => {
   const mock = await createMockServer({ mode: 'flaky500' });
   try {
-    const report = await audit(mock, { retries: 1, priceInput: 2.5, priceOutput: 10 });
+    const report = await audit(mock, { retries: 1, priceInput: 2.5, priceOutput: 10, readBalance: true });
     // 重试成功后的 evidence 记录 attempts 必须为 2
     assert.ok(report.evidence.some((e) => e.response.attempts === 2), 'no attempts===2 record');
     const billing = report.outcomes.find((o) => o.id === 'billing');
@@ -892,7 +893,7 @@ test('cli: --token-reference with malformed JSON exits 2 with zero requests', as
 });
 
 test('cli: honest audit subprocess exits within 20s with the right exit code', async () => {
-  // 用价格+余额对账构造绝对证据（billing 100），验证正常成功路径为退出码 0。
+  // 价格核验路径（CLI 默认不读余额，billing 85）验证正常成功路径为退出码 0。
   const mock = await createMockServer({ mode: 'honest', balanceRate: 1 });
   const dir = mkdtempSync(join(tmpdir(), 'mx-cli-audit-'));
   try {

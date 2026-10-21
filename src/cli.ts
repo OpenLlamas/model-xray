@@ -33,7 +33,7 @@ test Options:
   --model <model>           Model name to audit, e.g. gpt-4o
   --claimed-context <n>     Advertised context window in tokens, integer in [1000, 100000000] (enables context probe)
   --expect <list>           Claimed capabilities, comma-separated from: vision,tool,thinking (or "none"; default: vision,tool)
-  --price-input <n>         Claimed input price per 1M tokens, must be > 0 (with --price-output, enables measured-rate probe)
+  --price-input <n>         Claimed input price per 1M tokens, must be > 0 (with --price-output, enables price-based billing check)
   --price-output <n>        Claimed output price per 1M tokens, must be > 0 (must appear with --price-input)
   --price-cached-read <n>   Claimed cache-read price per 1M tokens, must be >= 0 (default: input price)
   --price-threshold <n>     Long-context tier threshold in prompt tokens, positive integer (requires --price-input2/--price-output2)
