@@ -575,7 +575,7 @@ test('identity: target model without X.Y version (gpt-4o) → no version verdict
   assert.ok(!outcome.findings.some((f) => /自述版本/.test(f.message)), JSON.stringify(outcome.findings));
 });
 
-test('identity: claimed_version metric records family+number form (GLM-4)', async () => {
+test('identity: family+number GLM-4 vs target 5.3 → version warn, score 90, not falsified', async () => {
   const results = [
     okResult('我是 GLM-4，由智谱开发。'),
     okResult('智谱 AI 的 GLM-4。'),
@@ -586,7 +586,89 @@ test('identity: claimed_version metric records family+number form (GLM-4)', asyn
   const { client } = stubClient([...results, schemaOk()]);
   const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
   const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
   assert.equal(outcome.metrics['claimed_version'], 'GLM-4');
+  const warn = outcome.findings.find((f) => /自述版本.*与目标模型.*不符/.test(f.message));
+  assert.ok(warn, JSON.stringify(outcome.findings));
+  assert.equal(warn?.level, 'warn');
+  assert.ok(!outcome.findings.some((f) => f.level === 'fail'), '版本旁证不定罪');
+  assert.equal(outcome.score, 90);
+  assert.equal(outcome.level, 'warn');
+  assert.notEqual(outcome.headline, '身份探针未见异常');
+});
+
+test('identity: concrete family version GLM-4-32B vs target 5.3 → version warn 90', async () => {
+  // 2026-10-21 02:40 报告回归：证据文本自报 GLM-4-32B，旧构建仍给 identity 100/pass。
+  const results = [
+    okResult('我的模型标识是 GLM-4-32B，由 Z.ai 开发。'),
+    okResult('我是由 Z.ai 开发的 GLM 大语言模型。'),
+    okResult('I am GLM, a large language model developed by Z.ai.'),
+    okResult('我是由 Z.ai 开发的 GLM 大语言模型。'),
+    okResult('GLM'),
+  ];
+  const { client } = stubClient([...results, schemaOk()]);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['claimed_version'], 'GLM-4');
+  assert.equal(outcome.score, 90);
+  assert.equal(outcome.level, 'warn');
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /自述版本.*与目标模型.*不符/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
+test('identity: negated other-family version (not GPT-4) is not counted as a claimed version', async () => {
+  const results = [
+    okResult('I am GLM, not GPT-4.'),
+    okResult('我是 GLM，不是 GPT-4。'),
+    okResult('This model is GLM; it is not GPT-4.'),
+    okResult('我是智谱 GLM，不是 GPT-4。'),
+    okResult('Model: GLM, not GPT-4.'),
+  ];
+  const { client } = stubClient([...results, schemaOk()]);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['claimed_version'], 'none');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.level, 'pass');
+  assert.ok(!outcome.findings.some((f) => /自述版本/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: family+major abbreviation GLM-5 vs target 5.3 is compatible, no version warn', async () => {
+  const results = [
+    okResult('我是 GLM-5，由智谱开发。'),
+    okResult('智谱 AI 的 GLM-5。'),
+    okResult('I am GLM-5.'),
+    okResult('我叫 GLM-5。'),
+    okResult('Model: GLM-5.'),
+  ];
+  const { client } = stubClient([...results, schemaOk()]);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.level, 'pass');
+  assert.ok(!outcome.findings.some((f) => /自述版本/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: strict JSON structure miss → warn + score 90, never PASS', async () => {
+  const { client } = stubClient([
+    ...glmNoVersionSelfResults(),
+    okResult('{"unexpected": "shape"}'),
+  ]);
+  const ctx = makeCtx(client, { model: 'glm-5.3-flash' });
+  const outcome = await probeIdentity(ctx);
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['schema_compliant'], 0);
+  assert.equal(outcome.score, 90);
+  assert.equal(outcome.level, 'warn');
+  assert.notEqual(outcome.headline, '身份探针未见异常');
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /严格 JSON 输出探针/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
 });
 
 // ---------- falsified 全体一致语义（v0.2.1） ----------

@@ -396,6 +396,8 @@ function billingCtx(client: OpenAIClient): ProbeCtx {
     html: false,
     yes: true,
     quiet: true,
+    // 旧用例覆盖余额对账分支；价格-only 的新默认行为由 publicPricingCtx 显式关闭。
+    readBalance: true,
   };
   return { client, cfg, rng: createRng(1), evidence: createEvidenceRecorder() };
 }
@@ -653,7 +655,7 @@ function publicPricingCtx(baseUrl: string, input: number, output: number): Probe
     },
   };
   const base = billingCtx(client);
-  return { ...base, cfg: { ...base.cfg, priceInput: input, priceOutput: output } };
+  return { ...base, cfg: { ...base.cfg, priceInput: input, priceOutput: output, readBalance: false } };
 }
 
 const PUBLIC_GPT4O = {
@@ -665,7 +667,7 @@ const PUBLIC_GPT4O = {
   price_list_output_usd: '2.8000',
 };
 
-test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline 含公示单价与实测 N/A', async () => {
+test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline 含公示单价与价格倍率，不读余额', async () => {
   await withPublicPricing([PUBLIC_GPT4O], async (baseUrl) => {
     const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
     assert.equal(outcome.status, 'ok');
@@ -679,14 +681,19 @@ test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline
     assert.equal(outcome.metrics['public_price_matched'], 'gpt-4o');
     assert.equal(outcome.metrics['public_price_input_usd_per_m'], 0.24);
     assert.equal(outcome.metrics['public_price_output_usd_per_m'], 0.84);
+    assert.equal(outcome.metrics['public_price_ratio_input'], 0.3);
+    assert.equal(outcome.metrics['public_price_ratio_output'], 0.3);
     // 公开价表锚：应缴只以 USD 披露，quota 单位未知（合成 500000 不得冒充站点单位写进报告）
     assert.equal(outcome.metrics['expected_quota_declared'], null);
     const expectedUsd = outcome.metrics['expected_cost_usd_declared'];
     assert.ok(typeof expectedUsd === 'number' && expectedUsd > 0, `应缴 USD 应为正数：${String(expectedUsd)}`);
     assert.equal(outcome.metrics['money_check_state'], 'declared_only');
+    assert.equal(outcome.metrics['measured_ratio'], undefined);
     assert.match(outcome.headline, /公示 输入 \$0\.24\/M · 输出 \$0\.84\/M/);
-    assert.match(outcome.headline, /实测倍率 N\/A（余额端点不可用）/);
-    assert.match(outcome.headline, /未与实收对账/);
+    assert.match(outcome.headline, /倍率 0\.3×（输入\/输出一致，公示价 ÷ 列表价）/);
+    assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+    assert.ok(!outcome.headline.includes('实测倍率 N/A'), outcome.headline);
+    assert.ok(!outcome.headline.includes('未与实收对账'), outcome.headline);
     assert.ok(!outcome.headline.includes('仅验证 usage 与输入长度线性'), outcome.headline);
     assert.ok(
       outcome.findings.some(
@@ -699,6 +706,50 @@ test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline
       JSON.stringify(outcome.findings),
     );
   });
+});
+
+test('probeBilling: 公开价表无列表价 → 不编造倍率，也不读余额', async () => {
+  await withPublicPricing(
+    [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_cached_usd: '0.0690' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.status, 'ok');
+      assert.equal(outcome.score, 85);
+      assert.equal(outcome.metrics['public_price_ratio_input'], null);
+      assert.equal(outcome.metrics['public_price_ratio_output'], null);
+      assert.ok(!outcome.headline.includes('倍率 '), outcome.headline);
+      assert.match(outcome.headline, /倍率不可得（站点未提供列表价）/);
+      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+      assert.ok(!outcome.headline.includes('实测倍率 N/A'), outcome.headline);
+    },
+  );
+});
+
+test('probeBilling: 列表价为 0 → 不除零、不编造倍率', async () => {
+  await withPublicPricing(
+    [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_list_input_usd: '0', price_list_output_usd: '0' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.metrics['public_price_ratio_input'], null);
+      assert.equal(outcome.metrics['public_price_ratio_output'], null);
+      assert.ok(!outcome.headline.includes('倍率 '), outcome.headline);
+      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+    },
+  );
+});
+
+test('probeBilling: 仅单侧列表价 → 只展示可得一侧，不声称输入/输出一致', async () => {
+  await withPublicPricing(
+    [{ code: 'gpt-4o', price_input_usd: '0.2400', price_output_usd: '0.8400', price_list_input_usd: '0.8000' }],
+    async (baseUrl) => {
+      const outcome = await probeBilling(publicPricingCtx(baseUrl, 0.24, 0.84));
+      assert.equal(outcome.metrics['public_price_ratio_input'], 0.3);
+      assert.equal(outcome.metrics['public_price_ratio_output'], null);
+      assert.match(outcome.headline, /倍率 输入 0\.3×（公示价 ÷ 列表价）/);
+      assert.ok(!outcome.headline.includes('输入/输出一致'), outcome.headline);
+      assert.ok(!outcome.headline.includes('实收未实测'), outcome.headline);
+    },
+  );
 });
 
 test('probeBilling: 公开价低于宣称价 → 仅 info，不产生 warn/fail', async () => {

@@ -483,9 +483,47 @@ test('html：计费维度输出「计费与倍率」摘要块（与 markdown 同
   assert.ok(html.includes('余额探测原因'), 'HTML 缺余额探测原因');
 });
 
-test('console：终端输出带倍率摘要行（实测 / 公示 / 金额核验状态）', () => {
+test('console：终端输出带倍率摘要行（实测 / 金额核验状态）', () => {
   const out = renderConsole(reportWith([], [billingOutcome()]), { color: false });
-  assert.match(out, /倍率: 实测 N\/A · 公示 输入 2 \/ 输出 5 · 金额核验 not_applicable/);
+  assert.match(out, /倍率: 实测 N\/A · 金额核验 not_applicable/);
+});
+
+test('console：实测不可得但有列表价倍率时，摘要行给出列表价倍率与实收未实测', () => {
+  const out = renderConsole(
+    reportWith([], [billingOutcome({ public_price_ratio_input: 0.3, public_price_ratio_output: 0.3 })]),
+    { color: false },
+  );
+  assert.match(
+    out,
+    /倍率: 列表价 0\.3×（输入\/输出一致；公示价÷列表价） · 实收未实测 · 金额核验 not_applicable/,
+  );
+  assert.ok(!out.includes('实测 N/A'), out);
+});
+
+test('console：价格核验默认模式给出倍率与计费探针费用（不读余额）', () => {
+  const outcome = billingOutcome({
+    public_price_ratio_input: 0.3,
+    public_price_ratio_output: 0.3,
+    expected_cost_usd_declared: 0.016,
+    cost_is_upper_bound: 1,
+  });
+  delete outcome.metrics['measured_ratio'];
+  delete outcome.metrics['balance_probe_reason'];
+  const out = renderConsole(reportWith([], [outcome]), { color: false });
+  assert.match(
+    out,
+    /倍率: 0\.3×（输入\/输出一致；公示价÷列表价） · 计费探针费用 \$0\.016（按公示价估算，上界） · 金额核验 not_applicable/,
+  );
+  assert.ok(!out.includes('实测'), out);
+  assert.ok(!out.includes('余额'), out);
+});
+
+test('markdown：价格倍率有指标标签（不埋在原始 JSON 里）', () => {
+  const md = renderMarkdown(
+    reportWith([], [billingOutcome({ public_price_ratio_input: 0.3, public_price_ratio_output: 0.3 })]),
+  );
+  assert.ok(md.includes('| 价格倍率（输入） | 0.3 |'), md);
+  assert.ok(md.includes('| 价格倍率（输出） | 0.3 |'), md);
 });
 
 test('无计费探针的报告不出现倍率摘要块（老报告不炸）', () => {

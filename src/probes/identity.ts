@@ -43,6 +43,7 @@ const EXACT_VERSION_QUESTION = '你的完整模型名称与精确版本号是什
 const CLAIMED_VERSION_RE = /\b(?:[a-z][\w-]*-)?\d+\.\d+(?:\.\d+)?\b|\b[a-z][\w-]*-\d+\b/i;
 // X.Y(.Z) 形式的可比版本号（目标模型名与自述文本的交集比较用），lowercase 后比较。
 const COMPARABLE_VERSION_RE = /\d+\.\d+(?:\.\d+)?/g;
+const FAMILY_INT_VERSION_RE = /\b[a-z][\w-]*-(\d+)\b/gi;
 
 interface IdentitySample {
   question: string;
@@ -243,15 +244,74 @@ function countEchoMismatch(
   return { total, match, suspicious, values };
 }
 
-/** 提取文本中首个具体版本号串（展示用）；提取不到返回 null。 */
+/** 提取文本中首个未被否定的具体版本号串（展示用）；提取不到返回 null。 */
 function extractClaimedVersion(text: string): string | null {
-  const m = text.match(CLAIMED_VERSION_RE);
-  return m ? m[0] : null;
+  const pattern = new RegExp(CLAIMED_VERSION_RE.source, `${CLAIMED_VERSION_RE.flags}g`);
+  for (const match of text.matchAll(pattern)) {
+    const index = match.index ?? -1;
+    if (index >= 0 && !isNegated(text, index, match[0].length)) return match[0];
+  }
+  return null;
 }
 
 /** 提取文本中全部 X.Y(.Z) 版本号（lowercase 集合，交集比较用）。 */
 function extractComparableVersions(text: string): Set<string> {
   return new Set((text.match(COMPARABLE_VERSION_RE) ?? []).map((v) => v.toLowerCase()));
+}
+
+/**
+ * 提取自述中未被否定的版本号。否定句（"I am GLM, not GPT-4"）不是自报版本；
+ * 若把被否定的他族版本也计入，会把正常回答误判为版本矛盾（2026-10-21 回归）。
+ */
+function extractClaimedVersions(text: string): Set<string> {
+  const versions = new Set<string>();
+  for (const match of text.matchAll(COMPARABLE_VERSION_RE)) {
+    const index = match.index ?? -1;
+    if (index >= 0 && !isNegated(text, index, match[0].length)) versions.add(match[0].toLowerCase());
+  }
+  for (const match of text.matchAll(FAMILY_INT_VERSION_RE)) {
+    const version = match[1];
+    const index = match.index ?? -1;
+    if (version !== undefined && index >= 0 && !isNegated(text, index, match[0].length)) versions.add(version);
+  }
+  return versions;
+}
+
+interface VersionParts {
+  major: number;
+  minor: number | null;
+  patch: number | null;
+}
+
+function parseVersionParts(value: string): VersionParts | null {
+  const match = /^(\d+)(?:\.(\d+))?(?:\.(\d+))?$/.exec(value);
+  if (match === null) return null;
+  return {
+    major: Number(match[1]),
+    minor: match[2] === undefined ? null : Number(match[2]),
+    patch: match[3] === undefined ? null : Number(match[3]),
+  };
+}
+
+function claimedVersionCompatible(target: VersionParts, claimed: VersionParts): boolean {
+  if (claimed.major !== target.major) return false;
+  if (claimed.minor !== null && claimed.minor !== target.minor) return false;
+  if (claimed.patch !== null && claimed.patch !== target.patch) return false;
+  return true;
+}
+
+function hasCompatibleClaimedVersion(claimed: Iterable<string>, target: Iterable<string>): boolean {
+  const targets = [...target]
+    .map(parseVersionParts)
+    .filter((version): version is VersionParts => version !== null);
+  if (targets.length === 0) return false;
+  for (const claim of claimed) {
+    const parsed = parseVersionParts(claim);
+    if (parsed !== null && targets.some((version) => claimedVersionCompatible(version, parsed))) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // —— 自述具体型号后缀比对（审计钉 ⑤：glm-5.3 实际是 glm-5.3-flash 的核心取证面）——
@@ -614,7 +674,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (claimedVersion === null) {
       claimedVersion = extractClaimedVersion(sample.result.text);
     }
-    for (const v of extractComparableVersions(sample.result.text)) claimedVersions.add(v);
+    for (const v of extractClaimedVersions(sample.result.text)) claimedVersions.add(v);
   }
   metrics['claimed_version'] = claimedVersion ?? 'none';
 
@@ -828,14 +888,17 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       });
     }
   } else if (claimedVersions.size > 0) {
-    // 版本矛盾旁证（仅 warn，不定罪）：前提是自述族与期望族有交集（falsified 不成立）。
-    // 双侧均有具体版本号且无交集才判；任一侧无版本（如 gpt-4o 无 X.Y 段）不判，metric 照记。
     const targetVersions = extractComparableVersions(stripVendorPrefix(ctx.cfg.model));
     const declaredOverlap = [...familyUnion].some((f) => expectedFamiliesFor([ctx.cfg.model]).has(f));
-    if (declaredOverlap && targetVersions.size > 0 && ![...claimedVersions].some((v) => targetVersions.has(v))) {
+    if (
+      declaredOverlap &&
+      targetVersions.size > 0 &&
+      !hasCompatibleClaimedVersion(claimedVersions, targetVersions)
+    ) {
+      const claimedVersionText = claimedVersion ?? [...claimedVersions].sort().join('/');
       findings.push({
         level: 'warn',
-        message: `自述版本（${[...claimedVersions].sort().join('/')}）与目标模型（${ctx.cfg.model}）不符。模型自述版本天然不可靠，仅作旁证，不构成换壳定罪。`,
+        message: `自述版本（${claimedVersionText}）与目标模型（${ctx.cfg.model}）不符。模型自述版本天然不可靠，仅作旁证，不构成换壳定罪。`,
         evidenceIds: samples.map((s) => s.evidenceId),
       });
       score = Math.min(score, 90);
@@ -969,6 +1032,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   if (!schemaStarved && !schemaBlank && schemaResult.ok && !schemaKeysOk) {
     findings.push({ level: 'warn', message: '严格 JSON 输出探针未按结构返回（弱指纹：网关可能重写响应）。', evidenceIds: schemaCall.evidenceIds });
     score = Math.min(score, 90);
+    if (level === 'pass') level = 'warn';
   }
 
   const starvedNote = starvedSelfId > 0 ? `（另有 ${starvedSelfId} 次自述因推理占满预算按无效样本处理）` : '';

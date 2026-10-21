@@ -543,8 +543,8 @@ test('renderScorecard：计费探针的公示倍率/实测倍率/金额核验指
   assert.ok(result.html.includes('total_usage_raw'), result.html);
   assert.ok(result.html.includes('500000'), result.html);
   // 公示价应缴额与校准置信度也在摘要块（倍率结论的可复核依据）
-  assert.ok(result.html.includes('按公示价应缴（USD）'), result.html);
-  assert.ok(result.html.includes('按公示价应缴（quota）'), result.html);
+  assert.ok(result.html.includes('计费探针费用（按公示价，USD）'), result.html);
+  assert.ok(result.html.includes('计费探针费用（按公示价，quota）'), result.html);
   assert.ok(result.html.includes('210000'), result.html);
   assert.ok(result.html.includes('单位校准置信度'), result.html);
   // 布尔值读作是/否（不是裸 true）
