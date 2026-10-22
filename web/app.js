@@ -561,7 +561,11 @@ export function renderScorecard(jsonText) {
     const id = fieldText(record, 'id') ?? '（缺失）';
     const level = fieldText(record, 'level');
     const levelLabel = level ?? '缺失';
-    const score = record?.score;
+    // 实锤封顶同源：fail 档位行无论来自 scores（已封顶，幂等）还是未覆盖的 outcomes 原始分，
+    // 一律执行封顶——「定罪维度不保留及格分」不依赖 scores 覆盖完整。
+    const raw = record?.score;
+    const score =
+      level === 'fail' && typeof raw === 'number' && raw > 45 ? 45 : raw;
     const scoreLabel = score === null || score === undefined ? '—' : String(score);
     const headline = fieldText(record, 'headline') ?? '—';
     return `        <tr><td>${escapeHtml(id)}</td><td><span class="badge badge-${badgeClass(level ?? '')}">${escapeHtml(levelLabel)}</span></td><td class="score">${escapeHtml(scoreLabel)}</td><td>${escapeHtml(headline)}</td></tr>`;

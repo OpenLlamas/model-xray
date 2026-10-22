@@ -237,6 +237,39 @@ test('实锤 fail 维度分项分与总分均封顶 45（换芯实锤时 billing
   assert.ok(result.notes.some((n) => n.includes('可信度总分上限 45')), JSON.stringify(result.notes));
 });
 
+test('实锤封顶与 null 总分路径的顺序锁定：唯一 fail 项（70）封顶 45，总分仍 null/不通过', () => {
+  // 锁定顺序：分项封顶在任何总分早退（可评分项不足/核心维度未判定/覆盖率不足）之前执行；
+  // null 总分路径绝不允许 Math.min(null, 45) 把「未判定」洗成 0。
+  const result = computeTotal([
+    { ...outcome('billing', 70), level: 'fail' as const },
+    outcome('identity', null, 'insufficient'),
+    outcome('context', null, 'insufficient'),
+    outcome('capability', null, 'insufficient'),
+    outcome('quality', null, 'insufficient'),
+  ]);
+  const billing = result.scores.find((s) => s.id === 'billing');
+  assert.equal(billing?.score, 45, `null 总分路径下分项仍必须封顶：${billing?.score}`);
+  assert.equal(result.total, null, '唯一可评分项 <2 → 总分必须保持 null，不得被封顶逻辑洗成 0');
+  assert.equal(result.overall, 'fail');
+  assert.ok(result.notes.some((n) => n.includes('实锤封顶')), JSON.stringify(result.notes));
+  assert.ok(!result.notes.some((n) => n.includes('可信度总分上限 45')), '总分封顶注记不得出现在 null 总分路径');
+});
+
+test('实锤总分封顶注记仅在封顶实际生效时出现（几何聚合已低于 45 不加注）', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    { ...outcome('billing', 35), level: 'fail' as const },
+    outcome('capability', 100),
+    outcome('quality', 10),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  assert.equal(result.overall, 'fail');
+  assert.ok(result.total !== null && result.total < 45, `几何聚合实值应低于 45：${result.total}`);
+  assert.ok(!result.notes.some((n) => n.includes('可信度总分上限 45')), JSON.stringify(result.notes));
+  assert.ok(result.notes.some((n) => n.includes('硬红线')), '低分走既有硬红线口径');
+});
+
 test('非实锤维度 fail（context/quality）不受实锤总分封顶影响（硬红线 45 照旧）', () => {
   const result = computeTotal([
     outcome('identity', 100),

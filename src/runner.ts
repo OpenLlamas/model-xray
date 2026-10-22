@@ -4,7 +4,7 @@ import { createEvidenceRecorder, recordCall } from './evidence.js';
 import { runFailureDigest } from './diagnostics.js';
 import { createRng } from './random.js';
 import { ASSETS_VERSION, DECOYS, PROBESET_VERSION } from './assets.js';
-import { computeTotal } from './scoring.js';
+import { computeTotal, FAIL_LEVEL_SCORE_CAP } from './scoring.js';
 import { buildBaseline, diffBaseline, loadBaseline, type BaselineDiff, type BaselineFile } from './baseline.js';
 import { deriveOrigin } from './pricing.js';
 import { redactUrl } from './redact.js';
@@ -229,7 +229,13 @@ export async function runAudit(
     activity?.(`[RUN] 阶段 ${id}（${PHASE_LABELS[id]}）开始${phaseHint(id, cfg)}`);
     const outcome = await guard(id, fn);
     const elapsedSec = ((Date.now() - phaseStartedMs) / 1000).toFixed(1);
-    const score = outcome.score === null ? '—' : `${outcome.score}/100`;
+    // 进度流分数与最终评分卡同源：fail 档位维度在聚合层会被 FAIL_LEVEL_SCORE_CAP 封顶，
+    // 实时日志若直读原始分会先显示 70 后显示 45，同一轮出现矛盾数字。
+    const shown =
+      outcome.level === 'fail' && outcome.score !== null && outcome.score > FAIL_LEVEL_SCORE_CAP
+        ? FAIL_LEVEL_SCORE_CAP
+        : outcome.score;
+    const score = shown === null ? '—' : `${shown}/100`;
     activity?.(`[RUN] 阶段 ${id}（${PHASE_LABELS[id]}）完成 · ${outcome.level.toUpperCase()} · 得分 ${score} · ${elapsedSec}s`);
     onProgress?.(id, outcome);
     return outcome;

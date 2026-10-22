@@ -168,8 +168,9 @@ export function computeTotal(outcomes: readonly ProbeOutcome[], scope: ScoreScop
 
   // 实锤总分封顶：计费/身份实锤时，总分与档位必须一致进入不及格区间，
   // 「不通过」结论不得配上及格区总分（换芯/乱收费实锤下「总分 82」违反常理）。
-  if (hardFail) {
-    total = Math.min(total, FAIL_LEVEL_SCORE_CAP);
+  // 上限注记仅在实际压低总分时出现——几何聚合已低于 45 时该注记只剩误导。
+  if (hardFail && total > FAIL_LEVEL_SCORE_CAP) {
+    total = FAIL_LEVEL_SCORE_CAP;
     notes.push(`存在实锤（计费/身份维度 fail），可信度总分上限 ${FAIL_LEVEL_SCORE_CAP}。`);
   }
 

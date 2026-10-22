@@ -1,5 +1,5 @@
 import type { AuditReport, EvidenceRecord, ProbeOutcome, ScoreEntry } from '../types.js';
-import { statusTag, verdictLabel } from '../scoring.js';
+import { FAIL_LEVEL_SCORE_CAP, statusTag, verdictLabel } from '../scoring.js';
 import { collectAnomalies } from './summary.js';
 
 /** 固定注记：报告输出可信度评分而非真伪断言（html.ts 同步使用）。 */
@@ -86,8 +86,11 @@ function renderOutcome(outcome: ProbeOutcome, scoreOverride?: number | null): st
   const lines: string[] = [];
   // 分数展示与评分卡同源：scores 里的分项分已经过聚合层实锤封顶（定罪维度不保留及格分），
   // 详情区不得再显示探针原始分（否则同一份报告出现「评分卡 45 / 详情 70」的矛盾数字）。
-  // scores 未覆盖的观测项（如 decoy）回退 outcome.score；覆盖但分数 null（未判定）也按未判定展示。
-  const shownScore = scoreOverride !== undefined ? scoreOverride : outcome.score;
+  // 覆盖完整性兜底：scores 未覆盖的观测项（如 decoy）回退 outcome.score，但 fail 档位
+  // 无论是否被 scores 覆盖一律执行封顶——「定罪维度不保留及格分」不依赖 scores 覆盖完整。
+  const base = scoreOverride !== undefined ? scoreOverride : outcome.score;
+  const shownScore =
+    outcome.level === 'fail' && base !== null && base > FAIL_LEVEL_SCORE_CAP ? FAIL_LEVEL_SCORE_CAP : base;
   lines.push(`### ${outcome.id} — ${statusTag(outcome.level)}（${shownScore ?? '未判定'}）`);
   lines.push('');
   // headline 可能内嵌上游错误消息（可含换行），单行化避免破坏 Markdown 段落结构。
