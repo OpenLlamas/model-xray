@@ -3,16 +3,17 @@ import { clampScore } from './stats.js';
 
 export const WEIGHTS: Record<ProbeId, number> = {
   billing: 25,
-  quality: 25,
-  identity: 15,
+  quality: 20,
+  identity: 10,
   context: 15,
   capability: 10,
+  params: 10,
   // TTFT 仅观测，不参与总分；权重必须为 0，避免未来误接分数时把观测项算进可信度。
   ttft: 0,
   decoy: 0,
 };
 
-export const PROBE_ORDER: readonly ProbeId[] = ['identity', 'context', 'billing', 'capability', 'quality', 'ttft'];
+export const PROBE_ORDER: readonly ProbeId[] = ['identity', 'context', 'billing', 'capability', 'params', 'quality', 'ttft'];
 
 export const HARD_RED: ReadonlySet<ProbeId> = new Set<ProbeId>(['billing', 'capability', 'context', 'quality']);
 

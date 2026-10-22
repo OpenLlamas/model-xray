@@ -9,6 +9,7 @@ const DIMENSION_DESC: Readonly<Record<string, string>> = {
   context: '长上下文实测：在标称窗口各深度埋 needle 验证真实可用量；评分依据：各深度命中率',
   billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性 + completion_tokens 硬矛盾检查；绝对对账（--token-reference 或价格+余额实扣倍率）缺失时判「未判定」，不给分',
   capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
+  params: '协议参数完整性：max_tokens/stop/response_format/n/logprobs 实测端点是否静默忽略或改写；不支持判「不适用」，不误判；评分依据：实测遵守项/有效项',
   quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
   ttft: '流式首字延迟：采样 TTFT 分位数；观测项不计分，仅披露 p50/p95（非流式响应计至完整响应体到达）',
   decoy: '诱饵对照项：不计分，仅用于识别「对固定题集特判」的端点',
@@ -151,10 +152,22 @@ function renderEvidence(record: EvidenceRecord): string {
   const usage = record.response.usage
     ? `usage: prompt=${record.response.usage.prompt_tokens} completion=${record.response.usage.completion_tokens} total=${record.response.usage.total_tokens}`
     : 'usage: 无';
+  const parsed = record.probe === 'params'
+    ? ` · choices=${record.response.choiceCount ?? 'n/a'} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
+    : '';
+  const protocol = [
+    record.request.stop != null ? `stop=${JSON.stringify(record.request.stop)}` : '',
+    record.request.seed != null ? `seed=${record.request.seed}` : '',
+    record.request.n != null ? `n=${record.request.n}` : '',
+    record.request.logprobs != null ? `logprobs=${record.request.logprobs}` : '',
+    record.request.topLogprobs != null ? `top_logprobs=${record.request.topLogprobs}` : '',
+    record.request.responseFormat != null ? `response_format=${record.request.responseFormat}` : '',
+  ].filter((part) => part.length > 0).join(' · ');
   return `<details class="ev"><summary>${esc(record.id)} · ${esc(record.probe)} · ${esc(record.label)}</summary>
-<p class="muted">HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''} · ${esc(usage)}</p>
+<p class="muted">HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${esc(parsed)} · ${esc(usage)}</p>
 ${record.response.error ? `<p class="muted">error: ${esc(record.response.error)}</p>` : ''}
 ${record.response.model !== null ? `<p class="muted">回显模型: ${esc(record.response.model)}${record.response.model === record.request.model ? '' : `（请求 ${esc(record.request.model)}）`}</p>` : ''}
+${protocol ? `<p class="muted">协议参数: ${esc(protocol)}</p>` : ''}
 <pre>请求${truncationNote(record.request.lastUserPreview, record.request.lastUserChars)}: ${esc(record.request.lastUserPreview)}</pre>
 ${record.request.lastUserTailPreview ? `<pre>请求结尾（长请求尾部摘要，用于核对问题是否在末尾）: ${esc(record.request.lastUserTailPreview)}</pre>` : ''}
 <pre>响应${truncationNote(record.response.textPreview, record.response.textChars)}: ${esc(record.response.textPreview)}</pre>

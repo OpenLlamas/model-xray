@@ -289,8 +289,8 @@ function parseSseBody(raw: string, status: number, durationMs: number): ChatResu
 
 /**
  * 解析 chat.completion 形状的 JSON 响应体。
- * 返回 null 表示「不是可解析的 chat.completion JSON」（非法 JSON / 无 choices），
- * 调用方据此区分「解析失败」与「SSE 路径的 JSON 回退无信号」。
+ * 返回 null 仅表示「非法 JSON」（交给调用方走 SSE/错误体兜底）；
+ * 解析成功但无 choices 时直接返回 errorResult，避免被误读成成功空正文。
  */
 function parseChatCompletionJson(raw: string, status: number, durationMs: number): ChatResult | null {
   let parsed: Record<string, unknown>;
@@ -299,8 +299,17 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
   } catch {
     return null;
   }
-  if (!Array.isArray(parsed['choices'])) return null;
-  const choice = parsed['choices'][0] as Record<string, unknown> | undefined;
+  const errorMessage = extractErrorMessage(parsed);
+  // 200 + 无 choices：不可能是可用的 chat.completion。带 error 的网关信封按上游失败；
+  // 既无 choices 也无 error 的畸形 JSON 同样归为请求失败，避免调用方把它误读成空正文。
+  const choices = parsed['choices'];
+  if (!Array.isArray(choices) || choices.length === 0) {
+    const detail = Array.isArray(choices)
+      ? 'response body has an empty choices array'
+      : 'response body is not a chat.completion payload';
+    return errorResult(`invalid chat completion payload（HTTP ${status}）：${errorMessage ?? detail}`, status, durationMs);
+  }
+  const choice = choices[0] as Record<string, unknown> | undefined;
   const message = choice && typeof choice['message'] === 'object' && choice['message'] !== null
     ? (choice['message'] as Record<string, unknown>)
     : {};
@@ -309,8 +318,7 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
   const { usage, reason } = validateUsage(parsed['usage']);
   const toolCalls = extractToolCalls(message['tool_calls']);
-  const errorMessage = extractErrorMessage(parsed);
-  // HTTP 200 + error 载荷 + 空 choices（欠费/熔断的常见形态）：按请求失败处理，
+  // HTTP 200 + error 载荷 + 有 choices/残缺正文：按请求失败处理，
   // 否则「成功但空正文」会被探针读成「未发起工具调用」「内容不可读」= 诬告。
   // 有正文/推理/工具调用时保留有效证据（error 仅作附注，不推翻已产出的内容）。
   if (errorMessage !== null) {
@@ -336,7 +344,41 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
     durationMs,
     error: null,
     raw,
+    choiceCount: choices.length,
+    choiceIndices: extractChoiceIndices(choices),
+    logprobsTokenCount: countLogprobsTokens(choice),
+    viaStream: false,
   };
+}
+
+/** 提取合法 choice index（非负整数）；缺失/非法 index 跳过，避免把畸形响应当成有效多 choice。 */
+function extractChoiceIndices(choices: unknown[]): number[] {
+  const indices: number[] = [];
+  for (const raw of choices) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const index = (raw as Record<string, unknown>)['index'];
+    if (typeof index === 'number' && Number.isInteger(index) && index >= 0) indices.push(index);
+  }
+  return indices;
+}
+
+/**
+ * 统计 choices[0].logprobs.content 中带有限数值 logprob 的 token 数。
+ * logprob 数学上通常 ≤0，本函数只数「存在有限数值的条目」，0 与负值都算有效；未携带 logprobs 返回 null。
+ */
+function countLogprobsTokens(choice: Record<string, unknown> | undefined): number | null {
+  if (choice === undefined) return null;
+  const logprobs = choice['logprobs'];
+  if (logprobs === null || logprobs === undefined || typeof logprobs !== 'object') return null;
+  const content = (logprobs as Record<string, unknown>)['content'];
+  if (!Array.isArray(content)) return 0;
+  let count = 0;
+  for (const entry of content) {
+    if (typeof entry !== 'object' || entry === null) continue;
+    const value = (entry as Record<string, unknown>)['logprob'];
+    if (typeof value === 'number' && Number.isFinite(value)) count += 1;
+  }
+  return count;
 }
 
 interface SseAggregate {
@@ -348,10 +390,11 @@ interface SseAggregate {
   model: string | null;
   errorMessage: string | null;
   toolAcc: Map<number, { id: string; name: string; args: string }>;
+  choiceIndices: Set<number>;
 }
 
 function createSseAggregate(): SseAggregate {
-  return { text: '', reasoning: '', usage: null, usageRejected: null, finishReason: null, model: null, errorMessage: null, toolAcc: new Map() };
+  return { text: '', reasoning: '', usage: null, usageRejected: null, finishReason: null, model: null, errorMessage: null, toolAcc: new Map(), choiceIndices: new Set() };
 }
 
 /** 累积 SSE 事件；onFirstDelta 用于流式路径打 TTFT 时间戳（整体读取的 JSON 误标路径不传）。 */
@@ -375,6 +418,7 @@ function applySseEvents(agg: SseAggregate, events: Array<{ data: string }>, onFi
       agg.usageRejected = chunk.usageReason;
     }
     if (chunk.finishReason) agg.finishReason = chunk.finishReason;
+    for (const index of chunk.choiceIndices ?? []) agg.choiceIndices.add(index);
     for (const delta of chunk.toolCallDeltas) mergeToolDelta(agg.toolAcc, delta);
   }
 }
@@ -412,6 +456,11 @@ function buildStreamResult(agg: SseAggregate, status: number, durationMs: number
     // 纯 reasoning 增量（即使 finish_reason 缺失）说明端点有产出，同样不算空流。
     error: agg.finishReason === null && agg.text.length === 0 && agg.reasoning.length === 0 && toolCalls.length === 0 ? 'empty stream' : null,
     raw,
+    // SSE 正文只聚合首个 choice；choiceIndices 用于 params 的 n 检查（端点强制流式时仍可计数），
+    // 未捕获到任何合法 choice index 时保持 undefined，由探针降级为 na。
+    choiceCount: agg.choiceIndices.size > 0 ? agg.choiceIndices.size : undefined,
+    choiceIndices: agg.choiceIndices.size > 0 ? [...agg.choiceIndices].sort((a, b) => a - b) : undefined,
+    viaStream: true,
   };
 }
 
@@ -527,13 +576,20 @@ async function safeReadBody(response: Response): Promise<string> {
   }
 }
 
+/** 错误文本落盘前脱敏：常见 API key 形态与 URL 查询参数中的凭证。 */
+function redactSecrets(text: string): string {
+  return text
+    .replace(/\bsk-[A-Za-z0-9_-]{16,}\b/g, 'sk-***')
+    .replace(/([?&](?:api[_-]?key|key|token|access_token)=)[^&\s]+/gi, '$1***');
+}
+
 function errorResult(message: string, status = 0, durationMs = 0, partialText = '', retryAfterMs: number | null = null): ChatResult {
   return {
     ok: false,
     status,
     finishReason: null,
     model: null,
-    text: partialText,
+    text: redactSecrets(partialText),
     reasoning: null,
     usage: null,
     usageRejected: null,
@@ -543,8 +599,12 @@ function errorResult(message: string, status = 0, durationMs = 0, partialText = 
     toolCalls: [],
     ttftMs: null,
     durationMs,
-    error: message,
+    error: redactSecrets(message),
     raw: '',
+    choiceCount: 0,
+    choiceIndices: [],
+    logprobsTokenCount: null,
+    viaStream: false,
   };
 }
 

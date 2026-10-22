@@ -258,10 +258,13 @@ export function billingSummaryRows(metrics: Record<string, number | string | nul
 
 function renderEvidence(record: EvidenceRecord): string {
   const lines: string[] = [];
+  const parsed = record.probe === 'params'
+    ? ` · choices=${record.response.choiceCount ?? 'n/a'} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
+    : '';
   lines.push(`#### ${record.id} · ${record.probe} · ${record.label}`);
   lines.push('');
   lines.push(
-    `- HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}`,
+    `- HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${parsed}`,
   );
   if (record.response.usage) {
     lines.push(
@@ -274,6 +277,15 @@ function renderEvidence(record: EvidenceRecord): string {
     const echo = record.response.model;
     lines.push(`- 回显模型: ${quote(echo)}${echo === record.request.model ? '' : `（请求 ${record.request.model}）`}`);
   }
+  const protocol = [
+    record.request.stop != null ? `stop=${quote(JSON.stringify(record.request.stop))}` : '',
+    record.request.seed != null ? `seed=${record.request.seed}` : '',
+    record.request.n != null ? `n=${record.request.n}` : '',
+    record.request.logprobs != null ? `logprobs=${record.request.logprobs}` : '',
+    record.request.topLogprobs != null ? `top_logprobs=${record.request.topLogprobs}` : '',
+    record.request.responseFormat != null ? `response_format=${record.request.responseFormat}` : '',
+  ].filter((part) => part.length > 0);
+  if (protocol.length > 0) lines.push(`- 协议参数: ${protocol.join(' · ')}`);
   const reqNote = record.request.lastUserChars > 500 ? '（Markdown 摘要最多 500 字符，JSON 保留 800 字符头部 + 400 字符尾部预览与完整字符数）' : '';
   const respNote = record.response.textChars > 500 ? '（Markdown 摘要最多 500 字符，JSON 保留 800 字符预览与完整字符数）' : '';
   lines.push(`- 请求摘要${reqNote}: ${quote(record.request.lastUserPreview)}`);

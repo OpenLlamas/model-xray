@@ -2,7 +2,7 @@ import type { TokenReference } from './token-reference.js';
 import type { DeclaredPricing, PricingSource, QuotaPerUnitSource } from './pricing.js';
 import type { PricingLedgerEntry, PricingLedgerWriteResult } from './pricing-ledger.js';
 
-export type ProbeId = 'identity' | 'context' | 'billing' | 'capability' | 'quality' | 'ttft' | 'decoy';
+export type ProbeId = 'identity' | 'context' | 'billing' | 'capability' | 'params' | 'quality' | 'ttft' | 'decoy';
 
 export type ProbeStatus = 'ok' | 'insufficient' | 'error';
 
@@ -94,6 +94,13 @@ export interface ChatRequest {
   max_tokens?: number;
   tools?: ToolDef[];
   tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
+  /** 协议完整性探针专用：验证端点是否真的遵守这些 OpenAI 兼容参数。 */
+  stop?: string | string[];
+  seed?: number;
+  n?: number;
+  logprobs?: boolean;
+  top_logprobs?: number;
+  response_format?: { type: 'json_object' };
   /**
    * 内部开关：本次请求是否允许 client 在 HTTP 200 空正文时重试（默认 true）。
    * billing 置 false：空响应已带 usage，重发只会重复计 prompt 并污染实扣倍率。
@@ -135,6 +142,23 @@ export interface ChatResult {
   durationMs: number;
   error: string | null;
   raw: string;
+  /**
+   * 响应中的 choice 数量（JSON 路径为 choices.length；SSE 路径按 chunk 内出现过的 choice index 去重计数）。
+   * undefined = 未解析（测试/自定义 client 可缺省），params 探针据此把 n 检查降级为 na。
+   */
+  choiceCount?: number;
+  /**
+   * 响应中可解析的 choice index 列表（JSON 路径按 choices[].index 提取，SSE 路径按帧去重）。
+   * 非法/缺失 index 不写入；undefined = 未解析，params 据此避免用重复 index 冒充多 choice。
+   */
+  choiceIndices?: number[];
+  /**
+   * choices[0].logprobs.content 中带有限数值 logprob 的 token 数（logprob 为 0 或负值都计数）。
+   * undefined = 未解析或不可判定；null = 已解析但响应未携带 logprobs；number = 实际条数。
+   */
+  logprobsTokenCount?: number | null;
+  /** 本次响应是否经 SSE 流式解析（流式口径下 logprobs 未聚合，params 的 logprobs 检查降级为 na）。 */
+  viaStream?: boolean;
 }
 
 export interface RequestProgressEvent {
@@ -212,6 +236,12 @@ export interface EvidenceRequest {
   lastUserTailPreview: string;
   lastUserChars: number;
   totalChars: number;
+  stop?: string[] | null;
+  seed?: number | null;
+  n?: number | null;
+  logprobs?: boolean | null;
+  topLogprobs?: number | null;
+  responseFormat?: string | null;
 }
 
 export interface EvidenceResponse {
@@ -230,6 +260,12 @@ export interface EvidenceResponse {
   toolCallCount: number;
   /** 首个 choice 的 finish_reason；报告 JSON 序列化为 snake_case finish_reason（见 report/json.ts） */
   finishReason: string | null;
+  /** 已解析的 choices 数量；null/缺省表示客户端未解析（旧结果/测试桩） */
+  choiceCount?: number | null;
+  /** 已解析的 logprobs token 数；null/缺省表示缺失或不可用 */
+  logprobsTokenCount?: number | null;
+  /** 响应是否来自 SSE 聚合；null/缺省表示旧报告未记录（未知），不能当作非流式 */
+  viaStream?: boolean | null;
   error: string | null;
   /** 原始响应体预览（最多 8KB，按 code point 截断）；rawChars 为客户端收到的完整字符数 */
   raw: string;

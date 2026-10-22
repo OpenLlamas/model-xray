@@ -63,7 +63,7 @@ test('runner: quota exhaustion aborts remaining phases and stops network traffic
     // 首个 429 是唯一真实网络请求：不得把熔断后的本地短路累积成多条「假失败」证据。
     assert.equal(report.evidence.length, 1, `证据应只含首个真实请求（实际 ${report.evidence.length} 条）`);
 
-    for (const id of ['context', 'billing', 'capability', 'decoy', 'quality', 'ttft']) {
+    for (const id of ['context', 'billing', 'capability', 'params', 'decoy', 'quality', 'ttft']) {
       const outcome = report.outcomes.find((o) => o.id === id);
       assert.ok(outcome !== undefined, `缺少 ${id} 结果`);
       assert.equal(outcome.status, 'insufficient');

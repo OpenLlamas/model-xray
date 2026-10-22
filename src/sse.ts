@@ -92,6 +92,8 @@ export interface StreamChunk {
   finishReason: string | null;
   /** 响应自述模型名（网关旁路观测用；payload 未带或非字符串时为 null） */
   model: string | null;
+  /** 本帧 choices 的合法 index 列表（仅 OpenAI chat.completion chunk；缺失/非法 index 跳过，不归 0） */
+  choiceIndices?: number[];
   /**
    * 上游错误载荷（HTTP 200 却带 `{"error":{...}}` 的 SSE/JSON 事件，常见于中转站欠费、限流、
    * 上游渠道熔断）。此前这类事件零信号 → 被误当作「成功但空正文」，探针据此指控
@@ -162,6 +164,15 @@ export function parseStreamPayload(data: string): StreamChunk | null {
   }
   if (typeof parsed !== 'object' || parsed === null) return null;
   const obj = parsed as Record<string, unknown>;
+  const rawChoices = Array.isArray(obj['choices']) ? (obj['choices'] as unknown[]) : [];
+  const choiceIndices: number[] = [];
+  for (const raw of rawChoices) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const index = (raw as Record<string, unknown>)['index'];
+    // 非法/缺失 index 不归 0：否则多个缺 index 的 choice 会被合并成同一个，
+    // 让诚实流式端点在 n 检查里被误判为少返回 choice。
+    if (typeof index === 'number' && Number.isInteger(index) && index >= 0) choiceIndices.push(index);
+  }
   const choice = Array.isArray(obj['choices']) ? (obj['choices'][0] as Record<string, unknown> | undefined) : undefined;
   // 端点兼容：部分中转站把完整的 chat.completion 对象塞进 SSE 的 data 帧（用 message 而非 delta），
   // 旧解析只读 delta 会漏掉正文/finish_reason，表现为「200 + usage 但 empty stream」。
@@ -202,7 +213,7 @@ export function parseStreamPayload(data: string): StreamChunk | null {
 
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
   const model = typeof obj['model'] === 'string' && obj['model'] !== '' ? (obj['model'] as string) : null;
-  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model, errorMessage: extractErrorMessage(obj) };
+  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model, errorMessage: extractErrorMessage(obj), choiceIndices };
 }
 
 /** 提取 `error` 载荷（字符串 / {message,type,code} 对象均可）；无 error 或空消息返回 null。 */

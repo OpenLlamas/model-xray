@@ -16,7 +16,7 @@ function outcome(id: ProbeOutcome['id'], score: number | null, status: ProbeOutc
 }
 
 test('weights sum to 90 across scored probes; TTFT is observation-only (weight 0)', () => {
-  const sum = WEIGHTS.billing + WEIGHTS.quality + WEIGHTS.identity + WEIGHTS.context + WEIGHTS.capability;
+  const sum = WEIGHTS.billing + WEIGHTS.quality + WEIGHTS.identity + WEIGHTS.context + WEIGHTS.capability + WEIGHTS.params;
   assert.equal(sum, 90);
   assert.equal(WEIGHTS.ttft, 0);
   assert.equal(WEIGHTS.decoy, 0);
@@ -67,6 +67,7 @@ test('unscorable probes are excluded and logged, weights renormalize', () => {
     outcome('context', null, 'insufficient'),
     outcome('billing', 90),
     outcome('capability', 90),
+    outcome('params', 90),
     outcome('quality', 90),
     outcome('ttft', null, 'insufficient'),
   ]);
@@ -203,6 +204,20 @@ test('non-billing/non-identity dim fails (context/quality) stay score-only, neve
   assert.equal(result.overall, 'warn');
 });
 
+test('params fail stays score-only, never overall fail', () => {
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    outcome('billing', 100),
+    outcome('capability', 100),
+    outcome('quality', 100),
+    outcome('params', 40),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  assert.notEqual(result.overall, 'fail');
+  assert.ok(result.total !== null && result.total > 0 && result.total < 100, `total=${result.total}`);
+});
+
 test('identity hard fail (明显换壳) forces overall fail', () => {
   const result = computeTotal([
     outcome('identity', 0),
@@ -325,12 +340,13 @@ test('未声明的 context/capability 不计入覆盖率分母（默认命令仍
       outcome('context', null, 'insufficient'),
       outcome('billing', 100),
       outcome('capability', null, 'insufficient'),
+      outcome('params', 100),
       outcome('quality', 100),
     ],
     { claimedContext: false, expectedCapabilities: [] },
   );
   assert.equal(result.total, 100);
-  assert.ok(result.notes.some((n) => n.includes('已判定 50/65 权重')), JSON.stringify(result.notes));
+  assert.ok(result.notes.some((n) => n.includes('已判定 55/65 权重')), JSON.stringify(result.notes));
 });
 
 test('覆盖率低于 60% 时总分不出（即使核心维度已判定）', () => {

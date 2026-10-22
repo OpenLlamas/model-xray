@@ -13,6 +13,7 @@ import { probeIdentity } from './probes/identity.js';
 import { probeContext } from './probes/context.js';
 import { probeBilling } from './probes/billing.js';
 import { probeCapability } from './probes/capability.js';
+import { probeParams } from './probes/params.js';
 import { probeQuality } from './probes/quality.js';
 import { probeTtft } from './probes/ttft.js';
 import { isBlankAnswer, isStarved } from './probes/starve.js';
@@ -37,6 +38,7 @@ const PHASE_LABELS: Record<ProbeId | 'decoy', string> = {
   context: '上下文',
   billing: '计量',
   capability: '能力',
+  params: '协议',
   decoy: '诱饵',
   quality: '质量',
   ttft: '首字时延',
@@ -245,16 +247,18 @@ export async function runAudit(
   const context = await runPhase('context', () => probeContext(ctx));
   const billing = await runPhase('billing', () => probeBilling(ctx));
   const capability = await runPhase('capability', () => probeCapability(ctx));
+  const params = await runPhase('params', () => probeParams(ctx));
   const decoy = await runPhase('decoy', () => decoyProbe(ctx));
   const quality = await runPhase('quality', () => probeQuality(ctx));
   const ttft = await runPhase('ttft', () => probeTtft(ctx));
 
-  const outcomes = [identity, context, billing, capability, decoy, quality, ttft];
+  const outcomes = [identity, context, billing, capability, params, decoy, quality, ttft];
 
   const notes = [
     `seed=${cfg.seed}：同一 seed 与同一端点可复现探针内容；真实模型输出仍可能因服务端非确定性略有波动。`,
     'TTFT 为观测项，不计入总分。',
     '诱饵请求仅记录行为供人工复核。',
+    'params 仅验证协议参数是否被端点遵守（不支持判「不适用」不计分），不能单独证明模型权重来源；有效计分项不足 3 项时该维度不出分。',
   ];
   if (client.quotaExhausted?.() === true) {
     notes.push(

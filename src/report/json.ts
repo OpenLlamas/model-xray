@@ -36,6 +36,9 @@ function serializeEvidenceRecord(record: EvidenceRecord): Record<string, unknown
       attempts: record.response.attempts,
       toolCallCount: record.response.toolCallCount,
       finish_reason: record.response.finishReason ?? null,
+      choiceCount: record.response.choiceCount ?? null,
+      logprobsTokenCount: record.response.logprobsTokenCount ?? null,
+      viaStream: record.response.viaStream ?? null,
       error: record.response.error ?? null,
       raw: record.response.raw,
       rawChars: record.response.rawChars,
@@ -57,6 +60,12 @@ function serializeRequest(request: EvidenceRequest): Record<string, unknown> {
     lastUserTailPreview: request.lastUserTailPreview,
     lastUserChars: request.lastUserChars,
     totalChars: request.totalChars,
+    stop: request.stop ?? null,
+    seed: request.seed ?? null,
+    n: request.n ?? null,
+    logprobs: request.logprobs ?? null,
+    topLogprobs: request.topLogprobs ?? null,
+    responseFormat: request.responseFormat ?? null,
   };
 }
 

@@ -116,7 +116,7 @@ test('runner activity: every phase logs start and completion with level/score/du
   try {
     const lines: string[] = [];
     await audit(mock, { claimedContext: 4000 }, (message) => lines.push(message));
-    for (const phase of ['identity', 'context', 'billing', 'capability', 'decoy', 'quality', 'ttft']) {
+    for (const phase of ['identity', 'context', 'billing', 'capability', 'params', 'decoy', 'quality', 'ttft']) {
       assert.ok(
         lines.some((line) => line.includes(`[RUN] 阶段 ${phase}（`)),
         `missing start line for ${phase}`,

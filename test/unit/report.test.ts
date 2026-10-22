@@ -56,6 +56,12 @@ function sampleReport(textPreview: string): AuditReport {
           lastUserTailPreview: '',
           lastUserChars: 10,
           totalChars: 10,
+          stop: null,
+          seed: null,
+          n: null,
+          logprobs: null,
+          topLogprobs: null,
+          responseFormat: null,
         },
         response: {
           status: 200,
@@ -68,6 +74,9 @@ function sampleReport(textPreview: string): AuditReport {
           temperatureDropped: false,
           toolCallCount: 0,
           finishReason: 'length',
+          choiceCount: 1,
+          logprobsTokenCount: null,
+          viaStream: false,
           error: null,
           raw: '',
           rawChars: 0,
@@ -124,6 +133,71 @@ test('recordCall：长请求保留尾部摘要（按 code point 截断），短�
     result,
   });
   assert.equal(short.request.lastUserTailPreview, '');
+});
+
+test('params evidence: JSON 序列化协议参数与解析计数，MD/HTML 同步展示', () => {
+  const report = sampleReport('ok');
+  report.evidence[0]!.probe = 'params';
+  const request = report.evidence[0]!.request;
+  request.stop = ['XRAYSTOPABC123'];
+  request.seed = 12345;
+  request.n = 2;
+  request.logprobs = true;
+  request.topLogprobs = 3;
+  request.responseFormat = 'json_object';
+  const response = report.evidence[0]!.response;
+  response.choiceCount = 2;
+  response.logprobsTokenCount = 2;
+  response.viaStream = false;
+
+  const json = JSON.parse(renderJson(report)) as {
+    evidence: Array<{
+      request: Record<string, unknown>;
+      response: Record<string, unknown>;
+    }>;
+  };
+  assert.deepEqual(json.evidence[0]!.request['stop'], ['XRAYSTOPABC123']);
+  assert.equal(json.evidence[0]!.request['seed'], 12345);
+  assert.equal(json.evidence[0]!.request['n'], 2);
+  assert.equal(json.evidence[0]!.request['logprobs'], true);
+  assert.equal(json.evidence[0]!.request['topLogprobs'], 3);
+  assert.equal(json.evidence[0]!.request['responseFormat'], 'json_object');
+  assert.equal(json.evidence[0]!.response['choiceCount'], 2);
+  assert.equal(json.evidence[0]!.response['logprobsTokenCount'], 2);
+
+  const md = renderMarkdown(report);
+  assert.match(md, /- 协议参数: stop=.*seed=12345.*n=2.*logprobs=true/);
+  const html = renderHtml(report);
+  assert.ok(html.includes('协议参数'));
+  assert.ok(html.includes('choices=2'));
+  assert.ok(html.includes('logprobs=2'));
+});
+
+test('旧报告 evidence 缺协议字段：渲染不出现 undefined，JSON 归一为 null', () => {
+  const report = sampleReport('ok');
+  const evidence = report.evidence[0]!;
+  evidence.probe = 'params';
+  delete evidence.request.stop;
+  delete evidence.request.seed;
+  delete evidence.request.n;
+  delete evidence.request.logprobs;
+  delete evidence.request.topLogprobs;
+  delete evidence.request.responseFormat;
+  delete evidence.response.choiceCount;
+  delete evidence.response.logprobsTokenCount;
+  delete evidence.response.viaStream;
+  const md = renderMarkdown(report);
+  const html = renderHtml(report);
+  assert.ok(!md.includes('undefined'));
+  assert.ok(!html.includes('undefined'));
+  const json = JSON.parse(renderJson(report)) as {
+    evidence: Array<{ request: Record<string, unknown>; response: Record<string, unknown> }>;
+  };
+  assert.equal(json.evidence[0]!.request['stop'], null);
+  assert.equal(json.evidence[0]!.response['choiceCount'], null);
+  assert.equal(json.evidence[0]!.response['viaStream'], null);
+  assert.ok(md.includes('viaStream=n/a'));
+  assert.ok(html.includes('viaStream=n/a'));
 });
 
 test('长请求：HTML/Markdown 保留结尾摘要，且同样转义', () => {

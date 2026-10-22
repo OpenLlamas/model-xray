@@ -6,8 +6,10 @@ import { estimateTokens } from './tokens.js';
 // 评分口径变化 → 旧基线不可比，需重新生成。
 // v0.2.1：identity 探针加强——自述样本 3→5（deep 8）、falsified 改全体一致判定、新增 claimed_version
 // 旁证；为此 IDENTITY_QUESTIONS 题池 5→7（deep 档需 7 道随机题 + 1 道固定版本自述题）。
+// v0.2.3：新增 params 协议参数完整性探针（max_tokens/stop/response_format/n/logprobs + seed 观测）；
+// 权重在合计 90 内重分配（quality 25→20、identity 15→10、params 10），旧基线不可比。
 // 题集内容与判定口径变化 → 基线不可比。
-export const PROBESET_VERSION = 'v0.2.2';
+export const PROBESET_VERSION = 'v0.2.3';
 export const ASSETS_VERSION = 'assets-v0.1.0';
 
 /** Base paragraphs used to construct long context probes. Deterministic given seed. */

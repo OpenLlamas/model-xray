@@ -119,7 +119,7 @@ test('classifyLogLine：阶段/请求/结果行颜色分类，且 CSS 有对应�
   assert.equal(classifyLogLine('[FAIL] quality — 质量异常'), 'log-line log-line-fail');
   assert.equal(classifyLogLine('plain text'), 'log-line');
   assert.equal(classifyLogLine('无标签但检测到异常'), 'log-line log-line-fail');
-  for (const phase of ['identity', 'context', 'billing', 'capability', 'decoy', 'quality', 'ttft']) {
+  for (const phase of ['identity', 'context', 'billing', 'capability', 'params', 'decoy', 'quality', 'ttft']) {
     assert.match(dashboardHtml, new RegExp(`\\.log-line-phase-${phase}\\s*\\{[^}]*color`), `missing CSS color for ${phase}`);
   }
   assert.match(dashboardHtml, /\.log-line-phase-start\s*\{[^}]*border-top/);
@@ -504,6 +504,7 @@ test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / f
       sampleOutcome('context'),
       sampleOutcome('billing'),
       sampleOutcome('capability'),
+      sampleOutcome('params'),
       sampleOutcome('quality'),
       sampleOutcome('ttft'),
       sampleOutcome('extra'),
@@ -517,7 +518,7 @@ test('renderScorecard：合法报告渲染可信度总分 / overall / 探针 / f
   const failResult = renderScorecard(JSON.stringify({ ...sampleReport({}), overall: 'fail' }));
   assert.equal(failResult.error, null);
   assert.ok(failResult.html.includes('>不通过</span>'), failResult.html);
-  for (const id of ['identity', 'context', 'billing', 'capability', 'quality', 'ttft', 'extra']) {
+  for (const id of ['identity', 'context', 'billing', 'capability', 'params', 'quality', 'ttft', 'extra']) {
     assert.ok(result.html.includes(id), `缺少探针 ${id}`);
   }
   assert.ok(result.html.includes('warn 线索'));

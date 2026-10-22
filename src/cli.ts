@@ -524,8 +524,9 @@ export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: numb
     15 + // quality 题集（与模式无关，恒 15 题）
     // quality 主问题复采样上限（仅干净答错时触发；最坏 +12）
     12 +
-    9; // ttft 观测：5 串行 + 1 轮 4 并发（重试不计入）
-  const inputTokens = contextTokens + billingInputTokens + 15000 + (cfg.expect.includes('vision') ? 1200 : 0);
+    9 + // ttft 观测：5 串行 + 1 轮 4 并发（重试不计入）
+    10; // params 协议完整性：max_tokens、stop 基线+正式、response_format 基线+正式、n、logprobs、seed 3 发
+  const inputTokens = contextTokens + billingInputTokens + 15000 + (cfg.expect.includes('vision') ? 1200 : 0) + 1200;
   return { calls, inputTokens };
 }
 

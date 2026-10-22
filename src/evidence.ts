@@ -34,6 +34,12 @@ export interface EvidenceInput {
     stream: boolean;
     temperature?: number | null;
     maxTokens?: number | null;
+    stop?: string | string[] | null;
+    seed?: number | null;
+    n?: number | null;
+    logprobs?: boolean | null;
+    topLogprobs?: number | null;
+    responseFormat?: string | null;
     messages: Array<{ content: unknown }>;
   };
   result: ChatResult;
@@ -61,6 +67,12 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       lastUserTailPreview: lastText.length > PREVIEW_CHARS ? truncateTail(lastText, TAIL_PREVIEW_CHARS) : '',
       lastUserChars: lastText.length,
       totalChars,
+      stop: request.stop == null ? null : Array.isArray(request.stop) ? [...request.stop] : [request.stop],
+      seed: request.seed ?? null,
+      n: request.n ?? null,
+      logprobs: request.logprobs ?? null,
+      topLogprobs: request.topLogprobs ?? null,
+      responseFormat: request.responseFormat ?? null,
     },
     response: {
       status: result.status,
@@ -73,6 +85,9 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
       temperatureDropped: result.temperatureDropped === true,
       toolCallCount: result.toolCalls.length,
       finishReason: result.finishReason,
+      choiceCount: result.choiceCount ?? null,
+      logprobsTokenCount: result.logprobsTokenCount ?? null,
+      viaStream: result.viaStream ?? null,
       error: result.error,
       raw: truncate(result.raw, RAW_LIMIT),
       rawChars: Array.from(result.raw).length,

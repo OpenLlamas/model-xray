@@ -28,9 +28,13 @@ export type MockMode =
   | 'sse-empty'
   | 'sse-comments'
   | 'error-payload'
+  | 'invalid-payload'
+  | 'empty-choices'
   | 'persona-inject'
   | 'usage-scale'
-  | 'retry-fix';
+  | 'retry-fix'
+  | 'params-honest'
+  | 'params-cheat';
 
 export interface MockBehavior {
   mode: MockMode;
@@ -70,6 +74,26 @@ export interface MockBehavior {
   retryFixPerturb: number;
   /** retry-fix：已扰动过的题面文本（同题面重放即返回正确答案，模拟「复采样答对」） */
   perturbed: Set<string>;
+  /** params-*：明确拒绝的参数名（400 + 错误文本点名），用于验证「不支持→na 不误判」 */
+  paramReject: Set<string>;
+  /** params-*：即使请求 stream=false 也强制 SSE 返回（验证 n/logprobs 降级为 na） */
+  paramForceSse: boolean;
+  /** params-*：response_format 的 JSON 用 ```json 围栏包裹（验证围栏容忍） */
+  paramFenceJson: boolean;
+  /** params-*：max_tokens=1 时模型自然只输出 1 token（finish_reason=stop），验证不判假 pass */
+  paramNaturalStop: boolean;
+  /** params-*：max_tokens=1 时 completion_tokens=0 且 finish_reason=length，验证不判假 pass */
+  paramZeroLength: boolean;
+  /** params-*：stop 正式请求返回空正文 + finish_reason=length，验证不判假 pass */
+  paramStopBlank: boolean;
+  /** params-*：stop 正式请求不含哨兵但 finish_reason=null，验证不判假 pass */
+  paramStopNoFinish: boolean;
+  /** params-*：n=2 时返回两个共用 index 0 的 choices，验证重复 index 不被当独立候选 */
+  paramDuplicateN: boolean;
+  /** params-*：logprobs 条目缺少有限 logprob 数值，验证不被误判为生效 */
+  paramLogprobsInvalid: boolean;
+  /** params-*：400 拒绝文本附加该字符串，用于验证错误落盘脱敏 */
+  errorEcho: string | null;
 }
 
 export interface MockOptions {
@@ -101,6 +125,26 @@ export interface MockOptions {
   scaleUsage?: number;
   /** retry-fix：允许首答错（+1 扰动）的题面数上限，默认 3（首答错、复采样对，两次机会口径下应 100 分） */
   retryFixPerturb?: number;
+  /** params-*：明确拒绝的参数名（stop/n/logprobs/response_format/seed/max_tokens） */
+  paramReject?: string[];
+  /** params-*：强制 SSE 返回，验证流式口径下 n/logprobs 降级为 na */
+  paramForceSse?: boolean;
+  /** params-*：response_format 的 JSON 用代码围栏包裹 */
+  paramFenceJson?: boolean;
+  /** params-*：max_tokens=1 时模型自然结束（finish_reason=stop），用于验证 na 而非假 pass */
+  paramNaturalStop?: boolean;
+  /** params-*：max_tokens=1 时 completion_tokens=0 且 finish_reason=length */
+  paramZeroLength?: boolean;
+  /** params-*：stop 正式请求返回空正文 + finish_reason=length，验证不判假 pass */
+  paramStopBlank?: boolean;
+  /** params-*：stop 正式请求不含哨兵但 finish_reason=null，验证不判假 pass */
+  paramStopNoFinish?: boolean;
+  /** params-*：n=2 时返回两个共用 index 0 的 choices */
+  paramDuplicateN?: boolean;
+  /** params-*：logprobs 条目缺少有限 logprob 数值，验证不被误判为生效 */
+  paramLogprobsInvalid?: boolean;
+  /** params-*：400 拒绝文本附加该字符串（脱敏测试） */
+  errorEcho?: string;
 }
 
 export const COLOR_TABLE: ReadonlyArray<{ name: string; rgb: [number, number, number] }> = [
@@ -154,6 +198,16 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     personaSeq: 0,
     retryFixPerturb: options.retryFixPerturb ?? 3,
     perturbed: new Set<string>(),
+    paramReject: new Set<string>(options.paramReject ?? []),
+    paramForceSse: options.paramForceSse === true,
+    paramFenceJson: options.paramFenceJson === true,
+    paramNaturalStop: options.paramNaturalStop === true,
+    paramZeroLength: options.paramZeroLength === true,
+    paramStopBlank: options.paramStopBlank === true,
+    paramStopNoFinish: options.paramStopNoFinish === true,
+    paramDuplicateN: options.paramDuplicateN === true,
+    paramLogprobsInvalid: options.paramLogprobsInvalid === true,
+    errorEcho: options.errorEcho ?? null,
   };
   const state: MockServer['state'] = { served: 0, balanceQueries: 0, authSeen: [], proxyAuthSeen: [], pathSeen: [] };
 
@@ -161,6 +215,21 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     // auth-required：所有路径统一 401（无效 key 场景，全部探针证据不足）
     if (behavior.mode === 'auth-required') {
       sendJson(res, 401, { error: { message: 'invalid api key', type: 'invalid_request_error', code: 'invalid_api_key' } });
+      return;
+    }
+    // invalid-payload：HTTP 200 但既无 choices 也无 error（畸形/非 chat.completion 信封）。
+    if (behavior.mode === 'invalid-payload') {
+      sendJson(res, 200, {});
+      return;
+    }
+    // empty-choices：HTTP 200 + 空 choices（畸形 chat.completion），client 应归为请求失败。
+    if (behavior.mode === 'empty-choices') {
+      sendJson(res, 200, {
+        id: 'mock-empty',
+        object: 'chat.completion',
+        choices: [],
+        usage: { prompt_tokens: 10, completion_tokens: 0, total_tokens: 10 },
+      });
       return;
     }
     if (req.method === 'GET' && req.url !== undefined && req.url.split('?')[0]?.endsWith('/dashboard/billing/usage')) {
@@ -238,6 +307,13 @@ function handle(res: ServerResponse, behavior: MockBehavior, body: Record<string
   // usage 校准门槛（标称 90% 深度核对）也依赖此口径。旧 mock 的 len/3.2 粗估 + 0.8 人为
   // 校准会掩盖「标称深度实际只发送了 ~50-75%」的真机缺陷（2026-10-18 审计缺陷 ③）。
   const usageBase = Math.max(10, estimateMessageTokens(messages as unknown as ChatMessage[]));
+
+  // params-honest / params-cheat：协议参数探针专用行为，绕过通用 solve()，
+  // 以便精确控制 usage、choices 数量、logprobs、stop 截断与 seed 复现。
+  if (behavior.mode === 'params-honest' || behavior.mode === 'params-cheat' || (behavior.mode === 'honest' && paramPromptKind(userText) !== null)) {
+    handleParams(res, behavior, body, userText, stream || behavior.paramForceSse, modelName, usageBase, maxTokens);
+    return;
+  }
 
   // slow-stream：先发一个内容 chunk 然后挂住连接不结束（guard 客户端断连 e2e 用）
   if (behavior.mode === 'slow-stream') {
@@ -616,6 +692,245 @@ function sendReply(
   );
   res.write('data: [DONE]\n\n');
   res.end();
+}
+
+type ParamPromptKind = 'max_tokens' | 'stop' | 'response_format' | 'n' | 'logprobs' | 'seed' | null;
+
+function paramPromptKind(userText: string): ParamPromptKind {
+  if (!userText.includes('__XRAY_PARAMS__')) return null;
+  if (/1 到 30/.test(userText)) return 'max_tokens';
+  if (/BEGIN XRAYSTOP/.test(userText)) return 'stop';
+  if (/缓存的作用，不要输出 JSON/.test(userText)) return 'response_format';
+  if (/三个不同的颜色名称/.test(userText)) return 'n';
+  if (/一个英文单词：hello/.test(userText)) return 'logprobs';
+  if (/10 个英文单词的句子/.test(userText)) return 'seed';
+  return null;
+}
+
+function paramsUsage(prompt: number, completion: number): MockUsage {
+  return {
+    prompt_tokens: prompt,
+    completion_tokens: completion,
+    total_tokens: prompt + completion,
+    prompt_tokens_details: { cached_tokens: 0 },
+    completion_tokens_details: { reasoning_tokens: 0 },
+  };
+}
+
+interface ParamChoice {
+  index: number;
+  message: { role: 'assistant'; content: string };
+  finish_reason: string | null;
+  logprobs?: { content: Array<{ token: string; logprob?: number; top_logprobs: unknown[] }> };
+}
+
+function sendParamsCompletion(
+  res: ServerResponse,
+  opts: { model: string; stream: boolean; choices: ParamChoice[]; usage: MockUsage },
+): void {
+  if (!opts.stream) {
+    sendJson(res, 200, { id: 'mock', object: 'chat.completion', model: opts.model, choices: opts.choices, usage: opts.usage });
+    return;
+  }
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  // 真实流式形态：每个增量帧都带各自 choice 的 index 与内容，而不是先发一帧全量 index 元数据。
+  const pieces = opts.choices.map((choice) => splitIntoPieces(choice.message.content));
+  const maxPieces = pieces.reduce((max, list) => Math.max(max, list.length), 0);
+  for (let i = 0; i < maxPieces; i += 1) {
+    const choices = opts.choices.map((choice, choiceIndex) => {
+      const piece = pieces[choiceIndex]![i];
+      return {
+        index: choice.index,
+        delta: piece === undefined ? {} : { content: piece },
+        finish_reason: null,
+      };
+    });
+    res.write(
+      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model: opts.model, choices })}\n\n`,
+    );
+  }
+  for (const [index, choice] of opts.choices.entries()) {
+    res.write(
+      `data: ${JSON.stringify({ id: 'mock', object: 'chat.completion.chunk', model: opts.model, choices: [{ index: choice.index, delta: {}, finish_reason: choice.finish_reason }], ...(index === opts.choices.length - 1 ? { usage: opts.usage } : {}) })}\n\n`,
+    );
+  }
+  res.write('data: [DONE]\n\n');
+  res.end();
+}
+
+function requestedParam(kind: ParamPromptKind, body: Record<string, unknown>): string | null {
+  switch (kind) {
+    case 'max_tokens':
+      return body['max_tokens'] === undefined ? null : 'max_tokens';
+    case 'stop':
+      return body['stop'] === undefined ? null : 'stop';
+    case 'response_format':
+      return body['response_format'] === undefined ? null : 'response_format';
+    case 'n':
+      return body['n'] === undefined ? null : 'n';
+    case 'logprobs':
+      return body['logprobs'] === true ? 'logprobs' : null;
+    case 'seed':
+      return body['seed'] === undefined ? null : 'seed';
+    default:
+      return null;
+  }
+}
+
+function handleParams(
+  res: ServerResponse,
+  behavior: MockBehavior,
+  body: Record<string, unknown>,
+  userText: string,
+  stream: boolean,
+  modelName: string,
+  usageBase: number,
+  maxTokens: number | null,
+): void {
+  const kind = paramPromptKind(userText);
+  const cheat = behavior.mode === 'params-cheat';
+  const requested = requestedParam(kind, body);
+  if (requested !== null && behavior.paramReject.has(requested)) {
+    const suffix = behavior.errorEcho === null ? '' : `（${behavior.errorEcho}）`;
+    sendJson(res, 400, {
+      error: {
+        message: `Unsupported parameter: '${requested}'${suffix}`,
+        type: 'invalid_request_error',
+        code: 'unsupported_parameter',
+        param: requested,
+      },
+    });
+    return;
+  }
+
+  if (kind === 'max_tokens') {
+    // honest：遵守 max_tokens=1（completion_tokens=1、finish_reason=length）；cheat：无视上限。
+    // paramNaturalStop：模型自然只输出 1 token（finish_reason=stop），探针应判 na 而非假 pass。
+    // paramZeroLength：completion_tokens=0 且 finish_reason=length，探针也应判 na。
+    const completion = cheat
+      ? 30
+      : behavior.paramZeroLength
+        ? 0
+        : behavior.paramNaturalStop
+          ? 1
+          : Math.max(1, Math.min(maxTokens ?? 30, 30));
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices: [{
+        index: 0,
+        message: { role: 'assistant', content: cheat ? '1 2 3 4 5 6 7 8 9 10 ... 30' : behavior.paramZeroLength ? '' : '1' },
+        finish_reason: cheat || behavior.paramNaturalStop ? 'stop' : 'length',
+      }],
+      usage: paramsUsage(usageBase, completion),
+    });
+    return;
+  }
+
+  if (kind === 'stop') {
+    const sentinel = /BEGIN (XRAYSTOP[A-Za-z0-9]+) END/.exec(userText)?.[1] ?? 'XRAYSTOPMOCK';
+    const stopValues = Array.isArray(body['stop'])
+      ? body['stop']
+      : typeof body['stop'] === 'string'
+        ? [body['stop']]
+        : [];
+    const applied = !cheat && stopValues.some((value) => value === sentinel);
+    if (behavior.paramStopBlank && stopValues.length > 0) {
+      sendParamsCompletion(res, {
+        model: modelName,
+        stream,
+        choices: [{ index: 0, message: { role: 'assistant', content: '' }, finish_reason: 'length' }],
+        usage: paramsUsage(usageBase, 0),
+      });
+      return;
+    }
+    const text = applied ? 'BEGIN ' : `BEGIN ${sentinel} END`;
+    const noFinish = behavior.paramStopNoFinish && stopValues.length > 0;
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: noFinish ? null : 'stop' }],
+      usage: paramsUsage(usageBase, Math.max(1, Math.ceil(text.length / 3.2))),
+    });
+    return;
+  }
+
+  if (kind === 'response_format') {
+    const rf = body['response_format'];
+    const wantsJson = typeof rf === 'object' && rf !== null && (rf as Record<string, unknown>)['type'] === 'json_object';
+    const json = behavior.paramFenceJson ? '```json\n{"answer":"缓存可以加速数据访问"}\n```' : '{"answer":"缓存可以加速数据访问"}';
+    const text = !cheat && wantsJson ? json : '缓存可以加速数据访问，降低后端压力。';
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: paramsUsage(usageBase, Math.max(1, Math.ceil(text.length / 3.2))),
+    });
+    return;
+  }
+
+  if (kind === 'n') {
+    const n = typeof body['n'] === 'number' ? body['n'] : 1;
+    const count = cheat ? 1 : Math.max(1, Math.min(n, 4));
+    const choices: ParamChoice[] = Array.from({ length: count }, (_, index) => ({
+      index: behavior.paramDuplicateN ? 0 : index,
+      message: { role: 'assistant', content: `颜色${index + 1}：红、绿、蓝` },
+      finish_reason: 'stop',
+    }));
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices,
+      usage: paramsUsage(usageBase, 10 * count),
+    });
+    return;
+  }
+
+  if (kind === 'logprobs') {
+    const wants = body['logprobs'] === true;
+    const include = wants && !cheat;
+    const choice: ParamChoice = {
+      index: 0,
+      message: { role: 'assistant', content: 'hello' },
+      finish_reason: 'stop',
+      ...(include
+        ? { logprobs: { content: behavior.paramLogprobsInvalid
+            ? [{ token: 'hello', top_logprobs: [] }, { token: '!', top_logprobs: [] }]
+              : [
+                { token: 'hello', logprob: -0.1, top_logprobs: [] },
+                { token: '!', logprob: 0, top_logprobs: [] },
+              ] } }
+        : {}),
+    };
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices: [choice],
+      usage: paramsUsage(usageBase, 2),
+    });
+    return;
+  }
+
+  if (kind === 'seed') {
+    const seed = typeof body['seed'] === 'number' ? body['seed'] : null;
+    const text = cheat || seed === null
+      ? `Seed random ${Math.random().toString(16).slice(2, 10)} database sentence with indexes queries storage caching replication sharding.`
+      : `Seed ${seed} database sentence with indexes queries storage caching replication sharding.`;
+    sendParamsCompletion(res, {
+      model: modelName,
+      stream,
+      choices: [{ index: 0, message: { role: 'assistant', content: text }, finish_reason: 'stop' }],
+      usage: paramsUsage(usageBase, Math.max(1, Math.ceil(text.length / 3.2))),
+    });
+    return;
+  }
+
+  sendParamsCompletion(res, {
+    model: modelName,
+    stream,
+    choices: [{ index: 0, message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: paramsUsage(usageBase, 1),
+  });
 }
 
 function splitIntoPieces(text: string): string[] {
