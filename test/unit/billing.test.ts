@@ -803,7 +803,7 @@ test('probeBilling: /api/pricing 404 → 公开价表模型级 anchor；headline
     assert.match(outcome.headline, /补充说明：站点分组折扣未知，按无折扣（×1）计算/, outcome.headline);
     assert.equal(outcome.headline.split('；')[0], 'token 计数核验通过', '主句只保留实测形状结论');
     assert.ok(!outcome.headline.includes('公示价÷列表价'), outcome.headline);
-    assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+    assert.match(outcome.headline, /实扣 未测（默认不读余额）/);
     assert.ok(!outcome.headline.includes('实扣倍率无法计算'), outcome.headline);
     assert.ok(!outcome.headline.includes('未与实收对账'), outcome.headline);
     assert.ok(!outcome.headline.includes('仅验证 usage 与输入长度线性'), outcome.headline);
@@ -926,7 +926,7 @@ test('probeBilling: 公开价表无列表价 → 仍按录入价/当前公示价
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
       assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
       assert.ok(!outcome.headline.includes('站点现价÷官方列表价'), outcome.headline);
-      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+      assert.match(outcome.headline, /实扣 未测（默认不读余额）/);
       assert.ok(!outcome.headline.includes('实扣倍率无法计算'), outcome.headline);
     },
   );
@@ -943,7 +943,7 @@ test('probeBilling: 列表价为 0 → 不除零、不编造列表折扣，但�
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
       assert.match(outcome.headline, /你填的单价÷站点现价 1×/);
       assert.ok(!outcome.headline.includes('站点现价÷官方列表价'), outcome.headline);
-      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+      assert.match(outcome.headline, /实扣 未测（默认不读余额）/);
     },
   );
 });
@@ -959,7 +959,7 @@ test('probeBilling: 仅单侧列表价 → 录入价/当前公示价仍两边核
       assert.equal(outcome.metrics['public_price_ratio_output'], null);
       assert.match(outcome.headline, /你填的单价÷站点现价 1×（输入\/输出一致；只比价目，未看实扣）/);
       assert.ok(!outcome.headline.includes('0.3×'), outcome.headline);
-      assert.match(outcome.headline, /实际扣款未核对（默认不读余额）/);
+      assert.match(outcome.headline, /实扣 未测（默认不读余额）/);
     },
   );
 });
@@ -1918,11 +1918,11 @@ test('composeMoneySide：固定顺序且每个数字带口径标签（实测/估
     }),
   );
   assert.match(text, /实扣倍率 1\.2×/, text);
-  assert.match(text, /本轮实际扣费（实测）0\.12 USD/, text);
+  assert.match(text, /实扣（实测）0\.12 USD/, text);
   assert.match(text, /按价目应扣 \$0\.12（估算，上界）/, text);
   assert.match(text, /你填的单价÷站点现价 输入 1\.2× · 输出 1\.4×（只比价目，未看实扣）/, text);
   assert.match(text, /站点现价：输入 \$2\/百万 · 输出 \$8\/百万/, text);
-  const order = ['实扣倍率', '本轮实际扣费', '按价目应扣', '你填的单价', '站点现价', '补充说明'].map((key) => text.indexOf(key));
+  const order = ['实扣倍率', '按价目应扣', '实扣（实测）', '你填的单价', '站点现价', '补充说明'].map((key) => text.indexOf(key));
   assert.ok(
     order.every((index) => index >= 0) && order.every((index, i) => i === 0 || (order[i - 1] ?? -1) < index),
     `后缀块顺序漂移：${text}`,
@@ -1953,7 +1953,7 @@ test('composeMoneySide：校准采信标「推断口径 + 置信档」，用户�
     }),
   );
   assert.match(text, /实扣倍率 238\.569×（扣费按 cents 口径换算，置信 high，换算值为估算）/, text);
-  assert.match(text, /本轮实际扣费 12 USD（按 cents 口径换算的估算值，置信 high）/, text);
+  assert.match(text, /实扣 12 USD（按 cents 口径换算的估算值，置信 high）/, text);
   assert.match(
     text,
     /补充说明：实扣倍率异常但说不清是谁多扣的（疑并发消费混入或单位错配），本次不判 fail（底层判定 fail 记录于 metrics）；余额为用户级口径（该用户所有 key 共享），无法排除其他 key 的消费，本次不判 fail（底层判定 fail 记录于 metrics）/,
@@ -1973,7 +1973,8 @@ test('composeMoneySide：按次计费/分组未核验进补充说明槽，不用
   );
   assert.ok(!text.includes('按价目应扣 N/A'), text);
   assert.ok(!text.includes('价目对比 N/A'), text);
-  assert.match(text, /补充说明：按次计费，金额未验证；站点分组折扣未知，按无折扣（×1）计算；实际扣款未核对（默认不读余额）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）/, text);
+  assert.match(text, /实扣 未测（默认不读余额）/, text);
+  assert.match(text, /补充说明：按次计费，金额未验证；站点分组折扣未知，按无折扣（×1）计算；未与外部硬证据比对（实扣倍率、历史用量基准均缺）/, text);
 });
 
 test('composeMoneySide：主句已带倍率数字时后缀去重，不重复同一测量值', () => {
@@ -1987,7 +1988,7 @@ test('composeMoneySide：主句已带倍率数字时后缀去重，不重复同�
     }),
   );
   assert.ok(!/实扣倍率 [\d.]+×/.test(text), `后缀不得重复主句数字：${text}`);
-  assert.match(text, /本轮实际扣费（实测）0\.23 USD/, text);
+  assert.match(text, /实扣（实测）0\.23 USD/, text);
 });
 
 test('ratioHeadline：主句保留原始倍率数字，fail/warn 结论不丢数据也不失真', () => {
@@ -2016,7 +2017,7 @@ test('composeMoneySide：N/A 一律带标准原因短语', () => {
   assert.match(synthetic, /按价目应扣 N\/A（站点未公示 quota_per_unit 换算率）/, synthetic);
   assert.match(synthetic, /价目对比 N\/A（站点未公示 quota_per_unit 换算率）/, synthetic);
   const unavailable = composeMoneySide(moneyArgs({ balanceEnabled: true, balanceEndpointUnavailable: true }));
-  assert.match(unavailable, /实扣倍率无法计算（该站没有可用的余额接口）/, unavailable);
+  assert.match(unavailable, /实扣 N\/A（该站没有可用的余额接口）/, unavailable);
   const contaminated = composeMoneySide(moneyArgs({ balanceEnabled: true, balanceContaminated: true }));
-  assert.match(contaminated, /实扣倍率无法计算（窗口内扣费混入其他消费，无法归因到本次测试）/, contaminated);
+  assert.match(contaminated, /实扣 N\/A（窗口内扣费混入其他消费，无法归因到本次测试）/, contaminated);
 });

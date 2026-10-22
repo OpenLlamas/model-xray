@@ -1959,16 +1959,28 @@ function formatListRatio(publicPrice: PublicUsdPrice | null): string {
 }
 
 /**
- * headline 金额侧标准后缀块。固定顺序：①实扣倍率 ②本轮实际扣费 ③按价目应扣 ④价目对比/站点现价
+ * headline 金额侧标准后缀块。固定顺序：①实扣倍率 ②按价目应扣 ③实扣（与应扣成对披露） ④价目对比/站点现价
  * ⑤价目漂移 ⑥N/A 连原因 ⑦补充说明。每个金额/倍率都带口径标签：
  * 「实测」只用于本轮直接采集的 Δ/回归/绝对对账；公式推算值一律标「估算」，只比价目时标「未看实扣」。
  */
+/** 余额侧 N/A 标准原因级联（端点不可用 > 窗口混入 > 读数不稳 > 默认不可归因）。 */
+function balanceNaReason(args: MoneySideArgs): string {
+  return args.balanceEndpointUnavailable
+    ? NA_BALANCE_UNAVAILABLE
+    : args.balanceContaminated
+      ? NA_WINDOW_UNATTRIBUTABLE
+      : args.balanceUnstable
+        ? NA_BALANCE_UNSTABLE
+        : NA_WINDOW_UNATTRIBUTABLE;
+}
+
 export function composeMoneySide(args: MoneySideArgs): string {
   const parts: string[] = [];
   const naItems: string[] = [];
   const safety: string[] = [];
   const up = Math.max(0, Math.trunc(args.driftUp));
   const down = Math.max(0, Math.trunc(args.driftDown));
+  const spend = args.spendDelta !== null && Number.isFinite(args.spendDelta) && args.spendDelta > 0 ? args.spendDelta : null;
 
   // ① 实扣倍率（calibratedUnit 非空时 Δ 为推断口径换算值，换算本身是估算）
   if (args.measuredRatio !== null && !args.measuredRatioInHeadline) {
@@ -1977,31 +1989,12 @@ export function composeMoneySide(args: MoneySideArgs): string {
         ? `（扣费按 ${args.calibratedUnit} 口径换算，置信 ${args.calibrationConfidence ?? 'low'}，换算值为估算）`
         : '';
     parts.push(`实扣倍率 ${round(args.measuredRatio)}×${calibrationTag}`);
-  } else if (args.measuredRatio === null && args.balanceEnabled) {
-    const reason = args.balanceEndpointUnavailable
-      ? NA_BALANCE_UNAVAILABLE
-      : args.balanceContaminated
-        ? NA_WINDOW_UNATTRIBUTABLE
-        : args.balanceUnstable
-          ? NA_BALANCE_UNSTABLE
-          : NA_WINDOW_UNATTRIBUTABLE;
-    naItems.push(`实扣倍率无法计算（${reason}）`);
+  } else if (args.measuredRatio === null && args.balanceEnabled && spend !== null) {
+    // Δ 拿到了但倍率算不出：实扣金额已在成对槽位披露，这里只补倍率缺因。
+    naItems.push(`实扣倍率无法计算（${balanceNaReason(args)}）`);
   }
 
-  // ② 本轮实际扣费：直接读数标实测；校准采信后的换算值标估算+推断口径
-  if (args.spendDelta !== null && Number.isFinite(args.spendDelta) && args.spendDelta > 0) {
-    const unitText =
-      args.balanceUnit === 'USD' ? ' USD' : args.balanceUnit !== null && args.balanceUnit !== '' ? ` ${args.balanceUnit}` : '';
-    if (args.calibratedUnit !== null) {
-      parts.push(
-        `本轮实际扣费 ${round(args.spendDelta)}${unitText}（按 ${args.calibratedUnit} 口径换算的估算值，置信 ${args.calibrationConfidence ?? 'low'}）`,
-      );
-    } else {
-      parts.push(`本轮实际扣费（实测）${round(args.spendDelta)}${unitText}`);
-    }
-  }
-
-  // ③ 按价目应扣（公式推算：公示价 × 自报 usage）
+  // ② 按价目应扣（公式推算：公示价 × 自报 usage）
   if (args.priceEnabled) {
     if (args.expectedUsd !== null) {
       parts.push(
@@ -2019,6 +2012,21 @@ export function composeMoneySide(args: MoneySideArgs): string {
     } else if (args.quotaPerUnitSynthetic) {
       naItems.push(`按价目应扣 N/A（${NA_QUOTA_PER_UNIT}）`);
     }
+  }
+
+  // ③ 实扣（与应扣成对披露）：直接读数标实测；校准采信后的换算值标估算+推断口径
+  if (spend !== null) {
+    const unitText =
+      args.balanceUnit === 'USD' ? ' USD' : args.balanceUnit !== null && args.balanceUnit !== '' ? ` ${args.balanceUnit}` : '';
+    if (args.calibratedUnit !== null) {
+      parts.push(
+        `实扣 ${round(spend)}${unitText}（按 ${args.calibratedUnit} 口径换算的估算值，置信 ${args.calibrationConfidence ?? 'low'}）`,
+      );
+    } else {
+      parts.push(`实扣（实测）${round(spend)}${unitText}`);
+    }
+  } else if (args.priceEnabled || args.balanceEnabled) {
+    parts.push(args.balanceEnabled ? `实扣 N/A（${balanceNaReason(args)}）` : '实扣 未测（默认不读余额）');
   }
 
   // ④ 价目对比（你填的单价÷站点现价）与站点现价基准
@@ -2065,7 +2073,7 @@ export function composeMoneySide(args: MoneySideArgs): string {
   // ⑥ N/A 原因（标准短语）
   parts.push(...naItems);
 
-  // ⑦ 补充说明槽：不可归因 / 用户级口径禁 fail / 按次计费 / 分组未核验 / 实际扣款未核对
+  // ⑦ 补充说明槽：不可归因 / 用户级口径禁 fail / 按次计费 / 分组未核验 / 价格与余额均未启用时的兜底
   if (args.ratioUnattributable && args.maskedVerdict !== null) {
     safety.push(`实扣倍率异常但说不清是谁多扣的（疑并发消费混入或单位错配），本次不判 fail（底层判定 ${args.maskedVerdict} 记录于 metrics）`);
   }
@@ -2074,20 +2082,8 @@ export function composeMoneySide(args: MoneySideArgs): string {
   }
   if (args.chargePerRequest) safety.push('按次计费，金额未验证');
   if (args.groupRatioUnverified) safety.push('站点分组折扣未知，按无折扣（×1）计算');
-  let unreconciled: string | null = null;
-  if (!args.balanceEnabled) {
-    unreconciled = '实际扣款未核对（默认不读余额）';
-  } else if (args.measuredRatio === null) {
-    const reason = args.balanceEndpointUnavailable
-      ? NA_BALANCE_UNAVAILABLE
-      : args.balanceContaminated
-        ? NA_WINDOW_UNATTRIBUTABLE
-        : args.balanceUnstable
-          ? NA_BALANCE_UNSTABLE
-          : NA_WINDOW_UNATTRIBUTABLE;
-    unreconciled = `实际扣款未核对（${reason}）`;
-  }
-  if (unreconciled !== null) safety.push(unreconciled);
+  // 实扣状态已随应扣成对披露（③）；仅当价格与余额都未启用、无金额槽位可承载时才在补充说明兜底。
+  if (!args.priceEnabled && !args.balanceEnabled) safety.push('实际扣款未核对（默认不读余额）');
   if (!args.absoluteVerified) {
     safety.push('未与外部硬证据比对（实扣倍率、历史用量基准均缺）');
   }

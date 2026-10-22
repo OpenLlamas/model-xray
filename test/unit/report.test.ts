@@ -552,7 +552,7 @@ test('console：价格核验默认模式给出倍率与计费探针费用（不�
   delete outcome.metrics['measured_ratio'];
   delete outcome.metrics['balance_probe_reason'];
   outcome.headline =
-    'token 计数核验通过，未发现造假证据；按价目应扣 $0.016（估算，上界）；补充说明：实际扣款未核对（默认不读余额）；未与外部硬证据比对（实扣倍率、历史用量基准均缺）';
+    'token 计数核验通过，未发现造假证据；按价目应扣 $0.016（估算，上界）；实扣 未测（默认不读余额）；补充说明：未与外部硬证据比对（实扣倍率、历史用量基准均缺）';
   const out = renderConsole(reportWith([], [outcome]), { color: false });
   assert.match(
     out,
