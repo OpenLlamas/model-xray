@@ -946,6 +946,6 @@ test('renderScorecard：计费块每个 N/A 连标准原因，比价标「未看
   assert.ok(html.includes('N/A（站点未公示 quota_per_unit 换算率）'), `缺换算率必须连原因：${html}`);
   assert.ok(html.includes('你填的单价÷站点现价（输入；只比价目，未看实扣）'), `比价必须标未看实扣：${html}`);
   assert.ok(html.includes('按价目应扣（USD，估算）'), `应缴必须标估算：${html}`);
-  assert.ok(html.includes('本轮实际扣费（实测；单位校准采信后为估算）'), `实际扣费必须标口径：${html}`);
+  assert.ok(html.includes('实扣（实测；单位校准采信后为估算）'), `实际扣费必须标口径：${html}`);
 });
 

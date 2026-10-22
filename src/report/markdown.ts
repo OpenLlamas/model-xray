@@ -197,7 +197,7 @@ export const BILLING_METRIC_LABELS: ReadonlyArray<readonly [string, string]> = [
   ['balance_post_settled', '后快照已结算'],
   ['balance_before', '请求前余额读数'],
   ['balance_after', '请求后余额读数'],
-  ['spend_delta', '本轮实际扣费（实测；单位校准采信后为估算）'],
+  ['spend_delta', '实扣（实测；单位校准采信后为估算）'],
   ['money_check_state', '金额核验状态'],
   ['money_verified', '金额已核验'],
   ['absolute_reconciliation', '与外部硬证据比对'],

@@ -483,6 +483,88 @@ export function detectPersonaBrands(text: string): string[] {
   return [...hits.values()];
 }
 
+// —— 模板/死板回复检测（2026-10-22 加强：防中转站固定话术回复模型名）——
+// 旧口径只认「全部非空自述逐字一致」，两个逃逸面：①固定话术只覆盖多数样本（部分缓存/按端点
+// 分流）；②逐字基础上微改写（加称呼、换标点/语序）。新增弱信号均只 warn 不定罪；近雷同比对
+// 设归一化长度下限，避免小模型对短问答的天然复读被误伤。
+const NEAR_DUP_JACCARD = 0.9;
+const NEAR_DUP_MIN_LEN = 24;
+
+/** 最大同文组：归一化文本中出现次数最多的那条文本及其计数。 */
+function largestIdenticalGroup(texts: readonly string[]): { text: string; count: number } {
+  const counts = new Map<string, number>();
+  let best = { text: '', count: 0 };
+  for (const text of texts) {
+    const n = (counts.get(text) ?? 0) + 1;
+    counts.set(text, n);
+    if (n > best.count) best = { text, count: n };
+  }
+  return best;
+}
+
+/** 归一化文本的字符二元组集合（长度 <2 为空集，Jaccard 恒 0）。中文无分词，字符二元组对中英文都稳定。 */
+function charBigrams(text: string): Set<string> {
+  const grams = new Set<string>();
+  for (let i = 0; i + 1 < text.length; i += 1) grams.add(text.slice(i, i + 2));
+  return grams;
+}
+
+function jaccard(a: Set<string>, b: Set<string>): number {
+  if (a.size === 0 || b.size === 0) return 0;
+  let inter = 0;
+  for (const gram of a) if (b.has(gram)) inter += 1;
+  return inter / (a.size + b.size - inter);
+}
+
+/** 近逐字雷同检测（全量两两比较 + 并查集连通簇）：归一化长度 ≥ minLen 的样本两两
+ * bigram Jaccard ≥ threshold 建边，返回最大连通簇大小。不用贪心代表归簇——贪心结果
+ * 依赖采样顺序且 A~B、B~C 链式关系会因代表选择断裂漏聚；全量两两连通与顺序无关
+ * （可复算）。样本量 ≤8，O(n²) 可忽略。逐字一致的文本天然 Jaccard=1，
+ * 调用方须先用「逐字一致」信号分流，避免同一现象重复告警。 */
+function largestNearDupGroup(texts: readonly string[], threshold: number, minLen: number): number {
+  const grams = texts.filter((t) => t.length >= minLen).map(charBigrams);
+  const parent = grams.map((_, i) => i);
+  const find = (start: number): number => {
+    let root = start;
+    for (;;) {
+      const p = parent[root];
+      if (p === undefined || p === root) break;
+      root = p;
+    }
+    let cur = start;
+    while (cur !== root) {
+      const next = parent[cur];
+      parent[cur] = root;
+      if (next === undefined) break;
+      cur = next;
+    }
+    return root;
+  };
+  for (let i = 0; i < grams.length; i += 1) {
+    const gi = grams[i];
+    if (gi === undefined) continue;
+    for (let j = i + 1; j < grams.length; j += 1) {
+      const gj = grams[j];
+      if (gj === undefined) continue;
+      if (jaccard(gi, gj) >= threshold) {
+        const ri = find(i);
+        const rj = find(j);
+        if (ri !== rj) parent[rj] = ri;
+      }
+    }
+  }
+  if (grams.length === 0) return 0;
+  const sizes = new Map<number, number>();
+  let max = 0;
+  for (let i = 0; i < grams.length; i += 1) {
+    const root = find(i);
+    const n = (sizes.get(root) ?? 0) + 1;
+    sizes.set(root, n);
+    if (n > max) max = n;
+  }
+  return max;
+}
+
 export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = {};
@@ -563,6 +645,16 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   // 参与相邻比较会把「多个空回答」误判成模板特判，冤枉限流/截断下的端点。
   const nonEmpty = normalized.filter((t) => t.length > 0);
   const identicalPairs = nonEmpty.filter((t, i) => i > 0 && t === nonEmpty[i - 1]).length;
+  const identical = largestIdenticalGroup(nonEmpty);
+  const identicalMaxGroup = identical.count;
+  // 逐字最大组在近雷同聚类中恒成簇（同文 Jaccard=1）：该组 ≥2 条时先整组剔除再聚类，
+  // 否则逐字侧（③已按 info/WARN 披露的同一现象）会在近雷同侧重复告警，且
+  // 「少数逐字一致 + 另一组近雷同」的复合形态无法区分两组、被互斥条件漏检。
+  const nearDupMaxGroup = largestNearDupGroup(
+    identicalMaxGroup >= 2 ? nonEmpty.filter((t) => t !== identical.text) : nonEmpty,
+    NEAR_DUP_JACCARD,
+    NEAR_DUP_MIN_LEN,
+  );
 
   const schemaProbe = ctx.rng.pick(SCHEMA_PROBES);
   const schemaCall = await chatWithBlankFallback(ctx, {
@@ -593,6 +685,8 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   metrics['samples'] = samples.length;
   metrics['identical_samples'] = identicalPairs;
+  metrics['identical_max_group'] = identicalMaxGroup;
+  metrics['near_dup_group'] = nearDupMaxGroup;
   metrics['schema_compliant'] = !schemaResult.ok || schemaStarved || schemaBlank ? 'N/A' : (schemaKeysOk && schemaValuesOk ? 1 : 0);
   if (starvedSelfId > 0) metrics['starved_samples'] = starvedSelfId;
   if (blankRetried > 0) metrics['blank_retried'] = blankRetried;
@@ -711,6 +805,40 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   // 与族判定无关的软信号（refusal / 逐字一致 / 格式合规 / 人格注入）：诚实降级分支里也应披露，
   // 不因降级而丢失；文案与下方主流程对应分支保持一致（主流程版本额外压分，降级分支无分可压）。
+  // 模板/死板回复告警（主流程与诚实降级分支共用同一口径，文案一致）：
+  // ① 全部非空逐字一致 → 疑似模板特判或缓存（压到 70）；
+  // ② 多数逐字一致（≥3 条且过半，但未覆盖全部）→ 疑似部分缓存/按题分流（压到 85）；
+  // ③ 少数逐字一致（≥3 条未过半）→ 仅 info 披露；
+  // ④ 近逐字雷同组 ≥3（逐字信号缺席时才查，避免同一现象重复告警）→ 疑似同一固定话术微改写（压到 85）。
+  const templateWarns = (): Finding[] => {
+    const out: Finding[] = [];
+    if (nonEmpty.length >= 3 && identicalMaxGroup >= nonEmpty.length) {
+      out.push({ level: 'warn', message: '多次采样回答逐字一致，疑似模板特判或缓存。', evidenceIds: [] });
+    } else if (identicalMaxGroup >= 3 && identicalMaxGroup >= Math.ceil(nonEmpty.length / 2)) {
+      out.push({
+        level: 'warn',
+        message: `${identicalMaxGroup}/${nonEmpty.length} 条非空自述逐字一致（其余存在差异），疑似部分缓存或模板特判。`,
+        evidenceIds: [],
+      });
+    } else if (identicalMaxGroup >= 3) {
+      out.push({
+        level: 'info',
+        message: `${identicalMaxGroup}/${nonEmpty.length} 条非空自述逐字一致：疑似缓存痕迹，证据较弱仅披露。`,
+        evidenceIds: [],
+      });
+    }
+    // 近雷同：仅当逐字信号未产出 warn（全部/多数一致已定档）时才告警，避免同一现象双重扣分；
+    // 复合形态（少数逐字一致仅 info + 另一组近雷同）也由此覆盖，不再被互斥条件漏检。
+    if (!out.some((f) => f.level === 'warn') && nearDupMaxGroup >= 3) {
+      out.push({
+        level: 'warn',
+        message: `${nearDupMaxGroup}/${nonEmpty.length} 条自述高度雷同（非逐字一致但几乎同文），疑似同一固定话术微改写或缓存。`,
+        evidenceIds: [],
+      });
+    }
+    return out;
+  };
+
   const personaMessage = (): string => {
     const list = [...personaHits.values()].map((v) => v.display).join('、');
     const total = [...personaHits.values()].reduce((n, v) => n + v.count, 0);
@@ -726,9 +854,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       findings.push({ level: 'warn', message: '自述问题全部被回避，行为指纹结论置信度低。', evidenceIds: [] });
     }
     // 分母只计非空自述：空响应不构成模板证据，但也不能稀释「其余有效样本全部逐字一致」的信号。
-    if (identicalPairs >= nonEmpty.length - 1 && nonEmpty.length >= 3) {
-      findings.push({ level: 'warn', message: '多次采样回答逐字一致，疑似模板特判或缓存。', evidenceIds: [] });
-    }
+    for (const warn of templateWarns()) findings.push(warn);
     if (!schemaStarved && !schemaBlank && schemaResult.ok && !schemaKeysOk) {
       findings.push({
         level: 'warn',
@@ -1022,12 +1148,13 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
     score = Math.min(score, 85);
     if (level === 'pass') level = 'warn';
   }
-  // 全体逐字一致（相邻对 = 有效样本数-1 时即所有非空自述完全相同）才疑似模板特判：
-  // 分母只用非空文本（空响应没有指纹含义），避免空样本稀释后漏检模板/缓存端点。
-  if (identicalPairs >= nonEmpty.length - 1 && nonEmpty.length >= 3) {
-    findings.push({ level: 'warn', message: '多次采样回答逐字一致，疑似模板特判或缓存。', evidenceIds: [] });
-    score = Math.min(score, 70);
-    if (level === 'pass') level = 'warn';
+  // 模板/死板回复告警：全部逐字一致压到 70，多数一致/近雷同压到 85（弱于实锤，强于无视）。
+  for (const warn of templateWarns()) {
+    findings.push(warn);
+    if (warn.level === 'warn') {
+      score = Math.min(score, /多次采样回答逐字一致/.test(warn.message) ? 70 : 85);
+      if (level === 'pass') level = 'warn';
+    }
   }
   if (!schemaStarved && !schemaBlank && schemaResult.ok && !schemaKeysOk) {
     findings.push({ level: 'warn', message: '严格 JSON 输出探针未按结构返回（弱指纹：网关可能重写响应）。', evidenceIds: schemaCall.evidenceIds });

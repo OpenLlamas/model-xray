@@ -66,7 +66,7 @@ test Options:
                             requires both price flags). Soft cap: pre-charges an estimate (input tokens × input price
                             + full output budget × output price) per request and stops sending once exceeded.
   --seed <n>                Random seed, integer in [1, 2147483646] (default: time-based; with --baseline defaults to baseline seed)
-  --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 60)
+  --timeout <seconds>       Per-request timeout in seconds, integer in [1, 3600] (default: 90)
   --out <dir>               Report output directory (default: reports)
   --yes                     Skip the token-cost confirmation on remote endpoints
   --dry-run                 Print the planned requests and token estimate, then exit
@@ -354,7 +354,7 @@ async function main(argv: string[]): Promise<number> {
   } else {
     seed = (Date.now() % 2147483646) + 1;
   }
-  const timeoutSeconds = values.timeout !== undefined ? strictInt(values.timeout, 1, 3600, 'timeout', '60') : 60;
+  const timeoutSeconds = values.timeout !== undefined ? strictInt(values.timeout, 1, 3600, 'timeout', '90') : 90;
   if (timeoutSeconds === null) return 2;
   const retries = values.retries !== undefined ? strictInt(values.retries, 0, 3, 'retries', '1') : 1;
   if (retries === null) return 2;

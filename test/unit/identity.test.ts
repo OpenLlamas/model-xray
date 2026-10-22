@@ -260,12 +260,13 @@ test('identity: 1 条混合声明 + 4 条目标自述 → warn 80，不得 PASS 
 });
 
 test('identity: 合法比较句「I am GPT-4o similar to Claude」不触发混合告警', async () => {
+  // 自述措辞各异：4 条逐字一致会另触发「部分缓存/模板特判」WARN（与比较句语义无关），干扰本用例目标
   const { client } = stubClient([
     okResult('I am GPT-4o similar to Claude.'),
     okResult('I am GPT-4o by OpenAI.'),
-    okResult('I am GPT-4o by OpenAI.'),
-    okResult('I am GPT-4o by OpenAI.'),
-    okResult('I am GPT-4o by OpenAI.'),
+    okResult("I'm the gpt-4o model, built by OpenAI."),
+    okResult('我是 GPT-4o，来自 OpenAI。'),
+    okResult('My model name is gpt-4o (OpenAI).'),
     okResult(COMPLETE_SCHEMA_JSON),
   ]);
   const outcome = await probeIdentity(makeCtx(client));
@@ -361,6 +362,112 @@ test('identity: identical non-empty self-ids amid blank samples → template WAR
     JSON.stringify(outcome.findings),
   );
   assert.ok(typeof outcome.score === 'number' && outcome.score <= 70);
+});
+
+test('identity: 多数逐字一致（3/5 非空，其余有差异）→ 模板 WARN 压到 85（不强刷全体一致线）', async () => {
+  // 中转站部分缓存/按题固定话术：固定回复只覆盖多数样本，旧口径（全体逐字一致才告警）漏检。
+  const same = 'I am gpt-4o, made by OpenAI.';
+  const { client } = stubClient([
+    okResult(same),
+    okResult(same),
+    okResult(same),
+    okResult('我是 gpt-4o，由 OpenAI 开发。'),
+    okResult('The model behind this endpoint is gpt-4o by OpenAI.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /部分缓存或模板特判/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+  assert.ok(!outcome.findings.some((f) => /多次采样回答逐字一致/.test(f.message)));
+  assert.equal(outcome.score, 85);
+  assert.equal(outcome.level, 'warn');
+});
+
+test('identity: 近逐字雷同（3 条仅差个别字符）→ 高度雷同 WARN 压到 85', async () => {
+  // 固定话术微改写（换标点/加尾缀）：非逐字一致，旧口径完全漏检；中转站固定回复模型名的典型形态。
+  const { client } = stubClient([
+    okResult('I am gpt-4o, a large language model trained by OpenAI for chat.'),
+    okResult('I am gpt-4o, a large language model trained by OpenAI for chat!'),
+    okResult('I am gpt-4o, a large language model trained by OpenAI for chat?'),
+    okResult('我是 gpt-4o，由 OpenAI 开发。'),
+    okResult('The model behind this endpoint is gpt-4o by OpenAI.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /高度雷同/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+  assert.equal(outcome.score, 85);
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.metrics['near_dup_group'], 3);
+});
+
+test('identity: 少数逐字一致（deep 模式 3/8 未过半）→ 仅 info 披露不压分', async () => {
+  // deep 档 8 次自述：3 条同文未过半（ceil(8/2)=4），不足以指控，仅 info 披露。
+  const same = 'I am gpt-4o, made by OpenAI.';
+  const { client } = stubClient([
+    okResult(same),
+    okResult(same),
+    okResult(same),
+    okResult('我是 gpt-4o，由 OpenAI 开发。'),
+    okResult('The model behind this endpoint is gpt-4o by OpenAI.'),
+    okResult("I'm the gpt-4o model built by OpenAI."),
+    okResult('gpt-4o is my model name, developed by OpenAI.'),
+    okResult('You are talking to gpt-4o, an OpenAI model.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client, { deep: true }));
+  assert.equal(outcome.status, 'ok');
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /疑似缓存痕迹/.test(f.message)));
+  assert.ok(!outcome.findings.some((f) => /部分缓存或模板特判/.test(f.message)));
+  assert.ok(!outcome.findings.some((f) => /高度雷同/.test(f.message)));
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.level, 'pass');
+});
+
+test('identity: 措辞各异的正常自述不触发近雷同/模板告警（不误伤）', async () => {
+  const { client } = stubClient([...gptSelfResults(), okResult(COMPLETE_SCHEMA_JSON)]);
+  const outcome = await probeIdentity(makeCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 100);
+  assert.ok(
+    !outcome.findings.some((f) => /逐字一致|高度雷同|部分缓存/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
+test('identity: 复合形态（3 条逐字一致 + 另 3 条近雷同，deep 8 样本）→ 近雷同 WARN 不被互斥漏检', async () => {
+  // 逐字组未过半走③仅 info；近雷同组若被「identicalMaxGroup<3」互斥排除则整体漏检——
+  // 固定话术端点同时存在「整组缓存」与「话术微改写」两组模板证据时应 warn。
+  const exact = 'I am gpt-4o, made by OpenAI.';
+  const near = 'You are chatting with gpt-4o, an OpenAI model for everyone.';
+  const { client } = stubClient([
+    okResult(exact),
+    okResult(exact),
+    okResult(exact),
+    okResult(`${near}.`),
+    okResult(`${near}!`),
+    okResult(`${near}?`),
+    okResult('我是 gpt-4o，由 OpenAI 开发。'),
+    okResult('The model behind this endpoint is gpt-4o by OpenAI.'),
+    okResult(COMPLETE_SCHEMA_JSON),
+  ]);
+  const outcome = await probeIdentity(makeCtx(client, { deep: true }));
+  assert.equal(outcome.status, 'ok');
+  assert.ok(outcome.findings.some((f) => f.level === 'info' && /疑似缓存痕迹/.test(f.message)));
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /高度雷同/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+  assert.ok(!outcome.findings.some((f) => /部分缓存或模板特判/.test(f.message)));
+  assert.equal(outcome.metrics['near_dup_group'], 3);
+  assert.equal(outcome.score, 85);
+  assert.equal(outcome.level, 'warn');
 });
 
 // ---------- v0.2.1：自述样本数 5（deep 8）+ 固定版本自述题 ----------
