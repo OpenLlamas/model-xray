@@ -91,7 +91,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 身份 Identity | 10 | 自我身份问答 + 行为指纹：换标签、换护栏、换变体都逃不过 |
 | 上下文 Context | 15 | 按标称深度埋 needle，验证窗口真实、usage 校准可信 |
 | 能力 Capability | 10 | 宣称的 vision / tool / thinking 逐项实测，而不只看宣称 |
-| 协议 Params | 10 | max_tokens / stop / response_format / n / logprobs 逐项实测；端点不支持判「不适用」，有效项不足 3 项不出分；参数 fail 只压分，不单独触发「不通过」 |
+| 协议 Params | 10 | max_tokens / stop / response_format / n / logprobs 逐项实测：n 校验独立且有内容的 choices，logprobs 校验 logprob 合法性与 top_logprobs 覆盖；端点不支持判「不适用」，有效项不足 3 项不出分；参数 fail 只压分，不单独触发「不通过」 |
 | 时延 TTFT | 仅观测 | 流式首字延迟 p50/p95，不计入总分 |
 
 权重合计 90；TTFT 仅观测，不计分。
@@ -118,7 +118,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 上下文 | 在标称窗口的深处埋「针」并要求原样找回；同时核对端点自报的 `prompt_tokens` 与实际发送量，防止「号称 128K、实际 32K」。 |
 | 计费 | 对端点自报 token 计数做线性回归与硬矛盾检查（非空正文报 0、total 对不上等）；默认核对「录入价 ÷ 当前公示价」（一致=1×），列表价折扣只披露；余额/guard 模式下再用「实际扣费 ÷（录入价 × 自报 usage）」实测真实倍率。 |
 | 能力 | 宣称支持视觉 / 工具调用 / 推理，就真的发对应请求逐项验收，不看参数表。 |
-| 协议 | 逐项发 max_tokens=1 / stop 哨兵 / response_format=json_object / n=2 / logprobs 请求；端点不支持判「不适用」不计分，支持但静默忽略才判 fail；seed 仅观测复现性。 |
+| 协议 | 逐项发 max_tokens=1 / stop 哨兵 / response_format=json_object / n=2 / logprobs 请求；n 校验独立 index 与非空内容，logprobs 校验 logprob 合法性 + top_logprobs 覆盖；端点不支持判「不适用」不计分，支持但静默忽略才判 fail；seed 仅观测复现性。 |
 | 时延 | 流式首字延迟采样 p50 / p95，只作观测，不参与评分。 |
 
 所有阈值、题库、needle 都带版本号，报告可复现；证据不足就标 `N/A`，绝不按 0 分算；每条结论都能顺着 `evidenceIds` 回查原始请求 / 响应。
@@ -248,7 +248,7 @@ The score is a weighted geometric credibility total (0–100); every dimension i
 | Identity | 10 | self-ID questions + behavioral fingerprints — catches relabeled / guardrail-swapped / variant-swapped models |
 | Context | 15 | needle test at claimed depth; usage-calibration cross-check |
 | Capability | 10 | advertised vision / tool / thinking actually exercised |
-| Params | 10 | max_tokens / stop / response_format / n / logprobs exercised individually; unsupported parameters are "not applicable", fewer than 3 scorable checks means no score; a params fail lowers the score but does not by itself trigger the fail verdict |
+| Params | 10 | max_tokens / stop / response_format / n / logprobs exercised individually: n requires distinct choices with content, logprobs validates logprob legality and top_logprobs coverage; unsupported parameters are "not applicable", fewer than 3 scorable checks means no score; a params fail lowers the score but does not by itself trigger the fail verdict |
 | TTFT | observation only | streaming first-token latency p50/p95, never scored |
 
 Weights total 90; TTFT is observation-only and never scored.
@@ -273,7 +273,7 @@ In one sentence: **it behaves like a real user and measures differences — in b
 | Context | Hides a needle at the claimed depth and asks for it back; cross-checks endpoint-reported `prompt_tokens` against what was actually sent — catches "claims 128K, serves 32K". |
 | Billing | Runs a within-run linearity regression and hard-contradiction checks on self-reported tokens; by default compares public vs list price for a price ratio, and in balance/guard mode measures the real multiplier as spend ÷ (claimed price × reported usage). |
 | Capability | Actually exercises advertised vision / tool calling / thinking instead of reading the spec sheet. |
-| Params | Sends max_tokens=1 / a stop sentinel / response_format=json_object / n=2 / logprobs requests individually; unsupported parameters are "not applicable" and excluded, while silent acceptance + ignoring fails; seed reproducibility is observation-only. |
+| Params | Sends max_tokens=1 / a stop sentinel / response_format=json_object / n=2 / logprobs requests individually; n requires distinct choices with content, logprobs validates logprob legality + top_logprobs coverage; unsupported parameters are "not applicable" and excluded, while silent acceptance + ignoring fails; seed reproducibility is observation-only. |
 | Latency | Samples streaming first-token latency (p50 / p95); observation only, never scored. |
 
 Thresholds, question banks, and needles are versioned so reports stay reproducible; insufficient evidence is marked `N/A` and never scored as 0; every finding traces back to raw request/response evidence via `evidenceIds`.

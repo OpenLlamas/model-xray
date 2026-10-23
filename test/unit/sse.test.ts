@@ -60,11 +60,19 @@ test('parseStreamPayload: content, reasoning, usage, tool deltas', () => {
     JSON.stringify({ choices: [{ index: 0, delta: { content: 'a' } }, { index: 1, delta: { content: 'b' } }] }),
   );
   assert.deepEqual(multi?.choiceIndices, [0, 1]);
+  assert.deepEqual(multi?.choiceContentIndices, [0, 1]);
 
   const missingIndex = parseStreamPayload(
     JSON.stringify({ choices: [{ delta: { content: 'a' } }, { delta: { content: 'b' } }] }),
   );
   assert.deepEqual(missingIndex?.choiceIndices, []);
+  assert.deepEqual(missingIndex?.choiceContentIndices, []);
+
+  const emptyChoice = parseStreamPayload(
+    JSON.stringify({ choices: [{ index: 0, delta: { content: 'a' } }, { index: 1, delta: { content: '' } }] }),
+  );
+  assert.deepEqual(emptyChoice?.choiceIndices, [0, 1]);
+  assert.deepEqual(emptyChoice?.choiceContentIndices, [0]);
 
   const toolChunk = parseStreamPayload(
     JSON.stringify({ choices: [{ index: 0, delta: { tool_calls: [{ index: 0, id: 'c1', function: { name: 'echo_nonce', arguments: '{"nonce":"A' } }] } }] }),

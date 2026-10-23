@@ -128,7 +128,7 @@ model-xray pricing-scan --base-url https://relay.example.com/v1 --pricing-endpoi
 | Token-count reference (`--token-reference`) | Compares per-tier prompt_tokens against a prior audit report of the SAME model (same probeset version): ratio > 1.25 → fail (score capped 30); 1.1–1.25 or < 0.8 → warn (capped 70); 0.8–1.1 → ok — the only check that catches uniform usage rescaling (invisible to the regression). Limitations: prompt_tokens only; trust of the reference report is on you; fetching official token counts automatically is still missing (TODO) |
 | Fingerprint baseline | Saves/compares a versioned baseline (model family, quality, capability, billing slopes) across runs to catch silent model swaps |
 | Capability gates | vision / tool-calling / thinking flags actually exercised, not just advertised |
-| Protocol parameters | max_tokens / stop / response_format / n / logprobs exercised with a unique probe each; unsupported parameters become `N/A`, fewer than 3 scorable checks yields no score, and a params fail only lowers the score |
+| Protocol parameters | max_tokens / stop / response_format / n / logprobs exercised with a unique probe each; n requires distinct choices with content, logprobs validates logprob legality and top_logprobs coverage; unsupported parameters become `N/A`, fewer than 3 scorable checks yields no score, and a params fail only lowers the score |
 | Fixed question bank | A versioned, reproducible set scored against reference answers for quality drift; reports disclose a 95% Wilson confidence interval for accuracy (informational only, thresholds unchanged) |
 | Streaming first-token latency | p50/p95 TTFT sampled under load, useful for spotting "queue-stretched" relays |
 
@@ -400,7 +400,7 @@ model-xray pricing-scan --base-url https://relay.example.com/v1 --pricing-endpoi
 | Token 计数参照对比（`--token-reference`） | 与同名模型历史报告的逐档 prompt_tokens 对比（同题集版本才生效）：比值 > 1.25 → fail（分数封顶 30）；1.1–1.25 或 < 0.8 → warn（封顶 70）；0.8–1.1 → ok——唯一能识别"全量等比缩放"型计数虚增的手段（回归对此不可见）。限制如实声明：仅对比 prompt_tokens；参考报告须用户自行确认为可信来源；自动获取官方计费计数的能力暂缺（TODO） |
 | 指纹基线对比 | 保存/对比版本化指纹基线（模型族、质量、能力、计费斜率），识别两次检测之间模型被偷换 |
 | 能力校验 | vision / tool calling / thinking 标称能力逐项实测，而非只看宣称 |
-| 协议参数完整性 | max_tokens / stop / response_format / n / logprobs 各发一个唯一探针实测；端点明确不支持判「不适用」，有效项不足 3 项不出分；params fail 只压分，不单独触发不通过 |
+| 协议参数完整性 | max_tokens / stop / response_format / n / logprobs 各发一个唯一探针实测；n 校验独立且有内容的 choices，logprobs 校验 logprob 合法性与 top_logprobs 覆盖；端点明确不支持判「不适用」，有效项不足 3 项不出分；params fail 只压分，不单独触发不通过 |
 | 固定题集质量打分 | 版本化可复现题集，对照参考答案量化质量（降智检测）；报告附准确率 95% Wilson 置信区间（仅披露，不改变判定阈值） |
 | 流式首字延迟 | 采样 p50/p95 TTFT，识别"排队拉长"型中转 |
 

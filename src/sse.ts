@@ -94,6 +94,8 @@ export interface StreamChunk {
   model: string | null;
   /** 本帧 choices 的合法 index 列表（仅 OpenAI chat.completion chunk；缺失/非法 index 跳过，不归 0） */
   choiceIndices?: number[];
+  /** 本帧带正文/推理/工具调用等内容信号的 choice index 列表（用于 n 检查防止空 choice 冒充候选） */
+  choiceContentIndices?: number[];
   /**
    * 上游错误载荷（HTTP 200 却带 `{"error":{...}}` 的 SSE/JSON 事件，常见于中转站欠费、限流、
    * 上游渠道熔断）。此前这类事件零信号 → 被误当作「成功但空正文」，探针据此指控
@@ -153,6 +155,21 @@ function extractDetailTokens(details: unknown, key: string, bound: number): numb
   return value;
 }
 
+/** 判断单个 choice 是否带正文/推理/工具调用信号（delta 优先，兼容 message 与 legacy text）。 */
+function choiceHasContentSignal(raw: Record<string, unknown>): boolean {
+  const deltaValue = typeof raw['delta'] === 'object' && raw['delta'] !== null
+    ? (raw['delta'] as Record<string, unknown>)
+    : null;
+  const messageValue = typeof raw['message'] === 'object' && raw['message'] !== null
+    ? (raw['message'] as Record<string, unknown>)
+    : null;
+  const source = deltaValue !== null && Object.keys(deltaValue).length > 0 ? deltaValue : (messageValue ?? {});
+  const text = extractText(source['content']) || extractText(raw['text']);
+  const reasoning = extractText(source['reasoning_content']) + extractText(source['reasoning']);
+  const toolCalls = source['tool_calls'];
+  return text.trim() !== '' || reasoning.trim() !== '' || (Array.isArray(toolCalls) && toolCalls.length > 0);
+}
+
 /** Parse one SSE data payload into a normalized chunk. Returns null for non-JSON or [DONE]. */
 export function parseStreamPayload(data: string): StreamChunk | null {
   if (data === '[DONE]') return null;
@@ -166,12 +183,17 @@ export function parseStreamPayload(data: string): StreamChunk | null {
   const obj = parsed as Record<string, unknown>;
   const rawChoices = Array.isArray(obj['choices']) ? (obj['choices'] as unknown[]) : [];
   const choiceIndices: number[] = [];
+  const choiceContentIndices: number[] = [];
   for (const raw of rawChoices) {
     if (typeof raw !== 'object' || raw === null) continue;
-    const index = (raw as Record<string, unknown>)['index'];
+    const record = raw as Record<string, unknown>;
+    const index = record['index'];
     // 非法/缺失 index 不归 0：否则多个缺 index 的 choice 会被合并成同一个，
     // 让诚实流式端点在 n 检查里被误判为少返回 choice。
-    if (typeof index === 'number' && Number.isInteger(index) && index >= 0) choiceIndices.push(index);
+    if (typeof index === 'number' && Number.isInteger(index) && index >= 0) {
+      choiceIndices.push(index);
+      if (choiceHasContentSignal(record)) choiceContentIndices.push(index);
+    }
   }
   const choice = Array.isArray(obj['choices']) ? (obj['choices'][0] as Record<string, unknown> | undefined) : undefined;
   // 端点兼容：部分中转站把完整的 chat.completion 对象塞进 SSE 的 data 帧（用 message 而非 delta），
@@ -213,7 +235,7 @@ export function parseStreamPayload(data: string): StreamChunk | null {
 
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
   const model = typeof obj['model'] === 'string' && obj['model'] !== '' ? (obj['model'] as string) : null;
-  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model, errorMessage: extractErrorMessage(obj), choiceIndices };
+  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model, errorMessage: extractErrorMessage(obj), choiceIndices, choiceContentIndices };
 }
 
 /** 提取 `error` 载荷（字符串 / {message,type,code} 对象均可）；无 error 或空消息返回 null。 */

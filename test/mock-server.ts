@@ -76,6 +76,8 @@ export interface MockBehavior {
   perturbed: Set<string>;
   /** params-*：明确拒绝的参数名（400 + 错误文本点名），用于验证「不支持→na 不误判」 */
   paramReject: Set<string>;
+  /** params-*：指定参数请求返回 500，用于验证错误不被静默忽略 */
+  paramError: Set<string>;
   /** params-*：即使请求 stream=false 也强制 SSE 返回（验证 n/logprobs 降级为 na） */
   paramForceSse: boolean;
   /** params-*：response_format 的 JSON 用 ```json 围栏包裹（验证围栏容忍） */
@@ -88,10 +90,20 @@ export interface MockBehavior {
   paramStopBlank: boolean;
   /** params-*：stop 正式请求不含哨兵但 finish_reason=null，验证不判假 pass */
   paramStopNoFinish: boolean;
+  /** params-*：stop 正式请求返回与基线无关的正文 + finish_reason=stop，验证不判假 pass */
+  paramStopUnrelated: boolean;
   /** params-*：n=2 时返回两个共用 index 0 的 choices，验证重复 index 不被当独立候选 */
   paramDuplicateN: boolean;
+  /** params-*：n=2 时第二个 choice 正文为空，验证空 choice 不被当独立候选 */
+  paramNEmptyChoice: boolean;
   /** params-*：logprobs 条目缺少有限 logprob 数值，验证不被误判为生效 */
   paramLogprobsInvalid: boolean;
+  /** params-*：logprobs 有合法条目但 top_logprobs 为空，验证 top_logprobs 未生效 */
+  paramLogprobsNoTop: boolean;
+  /** params-*：logprobs 条目 logprob>0（数学上非法），验证合法性校验 */
+  paramLogprobsPositive: boolean;
+  /** params-*：seed 观测返回不同文本（即使其余参数诚实），验证 seed 不单独升级告警 */
+  paramSeedUnstable: boolean;
   /** params-*：400 拒绝文本附加该字符串，用于验证错误落盘脱敏 */
   errorEcho: string | null;
 }
@@ -127,6 +139,8 @@ export interface MockOptions {
   retryFixPerturb?: number;
   /** params-*：明确拒绝的参数名（stop/n/logprobs/response_format/seed/max_tokens） */
   paramReject?: string[];
+  /** params-*：指定参数请求返回 500（验证错误不被静默忽略） */
+  paramError?: string[];
   /** params-*：强制 SSE 返回，验证流式口径下 n/logprobs 降级为 na */
   paramForceSse?: boolean;
   /** params-*：response_format 的 JSON 用代码围栏包裹 */
@@ -139,10 +153,20 @@ export interface MockOptions {
   paramStopBlank?: boolean;
   /** params-*：stop 正式请求不含哨兵但 finish_reason=null，验证不判假 pass */
   paramStopNoFinish?: boolean;
+  /** params-*：stop 正式请求返回与基线无关的正文 + finish_reason=stop，验证不判假 pass */
+  paramStopUnrelated?: boolean;
   /** params-*：n=2 时返回两个共用 index 0 的 choices */
   paramDuplicateN?: boolean;
+  /** params-*：n=2 时第二个 choice 正文为空 */
+  paramNEmptyChoice?: boolean;
   /** params-*：logprobs 条目缺少有限 logprob 数值，验证不被误判为生效 */
   paramLogprobsInvalid?: boolean;
+  /** params-*：logprobs 有合法条目但 top_logprobs 为空 */
+  paramLogprobsNoTop?: boolean;
+  /** params-*：logprobs 条目 logprob>0（数学上非法） */
+  paramLogprobsPositive?: boolean;
+  /** params-*：seed 观测返回不同文本 */
+  paramSeedUnstable?: boolean;
   /** params-*：400 拒绝文本附加该字符串（脱敏测试） */
   errorEcho?: string;
 }
@@ -199,14 +223,20 @@ export function createMockServer(options: MockOptions): Promise<MockServer> {
     retryFixPerturb: options.retryFixPerturb ?? 3,
     perturbed: new Set<string>(),
     paramReject: new Set<string>(options.paramReject ?? []),
+    paramError: new Set<string>(options.paramError ?? []),
     paramForceSse: options.paramForceSse === true,
     paramFenceJson: options.paramFenceJson === true,
     paramNaturalStop: options.paramNaturalStop === true,
     paramZeroLength: options.paramZeroLength === true,
     paramStopBlank: options.paramStopBlank === true,
     paramStopNoFinish: options.paramStopNoFinish === true,
+    paramStopUnrelated: options.paramStopUnrelated === true,
     paramDuplicateN: options.paramDuplicateN === true,
+    paramNEmptyChoice: options.paramNEmptyChoice === true,
     paramLogprobsInvalid: options.paramLogprobsInvalid === true,
+    paramLogprobsNoTop: options.paramLogprobsNoTop === true,
+    paramLogprobsPositive: options.paramLogprobsPositive === true,
+    paramSeedUnstable: options.paramSeedUnstable === true,
     errorEcho: options.errorEcho ?? null,
   };
   const state: MockServer['state'] = { served: 0, balanceQueries: 0, authSeen: [], proxyAuthSeen: [], pathSeen: [] };
@@ -790,6 +820,10 @@ function handleParams(
   const kind = paramPromptKind(userText);
   const cheat = behavior.mode === 'params-cheat';
   const requested = requestedParam(kind, body);
+  if (requested !== null && behavior.paramError.has(requested)) {
+    sendJson(res, 500, { error: { message: `Mock upstream failure for '${requested}'`, type: 'server_error' } });
+    return;
+  }
   if (requested !== null && behavior.paramReject.has(requested)) {
     const suffix = behavior.errorEcho === null ? '' : `（${behavior.errorEcho}）`;
     sendJson(res, 400, {
@@ -844,7 +878,11 @@ function handleParams(
       });
       return;
     }
-    const text = applied ? 'BEGIN ' : `BEGIN ${sentinel} END`;
+    const text = behavior.paramStopUnrelated && stopValues.length > 0
+      ? 'I cannot comply with that request.'
+      : applied
+        ? 'BEGIN '
+        : `BEGIN ${sentinel} END`;
     const noFinish = behavior.paramStopNoFinish && stopValues.length > 0;
     sendParamsCompletion(res, {
       model: modelName,
@@ -874,7 +912,7 @@ function handleParams(
     const count = cheat ? 1 : Math.max(1, Math.min(n, 4));
     const choices: ParamChoice[] = Array.from({ length: count }, (_, index) => ({
       index: behavior.paramDuplicateN ? 0 : index,
-      message: { role: 'assistant', content: `颜色${index + 1}：红、绿、蓝` },
+      message: { role: 'assistant', content: behavior.paramNEmptyChoice && index === 1 ? '' : `颜色${index + 1}：红、绿、蓝` },
       finish_reason: 'stop',
     }));
     sendParamsCompletion(res, {
@@ -889,6 +927,14 @@ function handleParams(
   if (kind === 'logprobs') {
     const wants = body['logprobs'] === true;
     const include = wants && !cheat;
+    const topFor = (token: string, logprob: number): unknown[] => behavior.paramLogprobsNoTop
+      ? []
+      : [
+        { token, logprob },
+        { token: 'a', logprob: -0.2 },
+        { token: 'b', logprob: -0.3 },
+      ];
+    const firstLogprob = behavior.paramLogprobsPositive ? 0.5 : -0.1;
     const choice: ParamChoice = {
       index: 0,
       message: { role: 'assistant', content: 'hello' },
@@ -897,8 +943,8 @@ function handleParams(
         ? { logprobs: { content: behavior.paramLogprobsInvalid
             ? [{ token: 'hello', top_logprobs: [] }, { token: '!', top_logprobs: [] }]
               : [
-                { token: 'hello', logprob: -0.1, top_logprobs: [] },
-                { token: '!', logprob: 0, top_logprobs: [] },
+                { token: 'hello', logprob: firstLogprob, top_logprobs: topFor('hello', firstLogprob) },
+                { token: '!', logprob: 0, top_logprobs: topFor('!', 0) },
               ] } }
         : {}),
     };
@@ -913,7 +959,7 @@ function handleParams(
 
   if (kind === 'seed') {
     const seed = typeof body['seed'] === 'number' ? body['seed'] : null;
-    const text = cheat || seed === null
+    const text = cheat || behavior.paramSeedUnstable || seed === null
       ? `Seed random ${Math.random().toString(16).slice(2, 10)} database sentence with indexes queries storage caching replication sharding.`
       : `Seed ${seed} database sentence with indexes queries storage caching replication sharding.`;
     sendParamsCompletion(res, {

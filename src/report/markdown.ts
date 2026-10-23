@@ -258,13 +258,18 @@ export function billingSummaryRows(metrics: Record<string, number | string | nul
 
 function renderEvidence(record: EvidenceRecord): string {
   const lines: string[] = [];
+  const choiceIndices = record.response.choiceIndices == null ? '' : `[${record.response.choiceIndices.join(',')}]`;
+  const nonEmpty = record.response.choiceNonEmptyCount == null ? '' : ` nonempty=${record.response.choiceNonEmptyCount}`;
+  const topLogprobs = record.response.topLogprobsTokenCount == null ? '' : ` top=${record.response.topLogprobsTokenCount}`;
+  const invalidLogprobs = record.response.logprobsInvalidCount == null ? '' : ` invalid=${record.response.logprobsInvalidCount}`;
+  const temperatureDropped = record.response.temperatureDropped ? ' · tempDropped=true' : '';
   const parsed = record.probe === 'params'
-    ? ` · choices=${record.response.choiceCount ?? 'n/a'} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
+    ? ` · choices=${record.response.choiceCount ?? 'n/a'}${choiceIndices}${nonEmpty} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'}${topLogprobs}${invalidLogprobs} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
     : '';
   lines.push(`#### ${record.id} · ${record.probe} · ${record.label}`);
   lines.push('');
   lines.push(
-    `- HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${parsed}`,
+    `- HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${parsed}${temperatureDropped}`,
   );
   if (record.response.usage) {
     lines.push(

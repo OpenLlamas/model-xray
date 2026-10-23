@@ -147,8 +147,13 @@ test('params evidence: JSON 序列化协议参数与解析计数，MD/HTML 同�
   request.responseFormat = 'json_object';
   const response = report.evidence[0]!.response;
   response.choiceCount = 2;
+  response.choiceIndices = [0, 1];
+  response.choiceNonEmptyCount = 2;
   response.logprobsTokenCount = 2;
+  response.logprobsInvalidCount = 0;
+  response.topLogprobsTokenCount = 2;
   response.viaStream = false;
+  response.temperatureDropped = true;
 
   const json = JSON.parse(renderJson(report)) as {
     evidence: Array<{
@@ -163,14 +168,21 @@ test('params evidence: JSON 序列化协议参数与解析计数，MD/HTML 同�
   assert.equal(json.evidence[0]!.request['topLogprobs'], 3);
   assert.equal(json.evidence[0]!.request['responseFormat'], 'json_object');
   assert.equal(json.evidence[0]!.response['choiceCount'], 2);
+  assert.deepEqual(json.evidence[0]!.response['choiceIndices'], [0, 1]);
+  assert.equal(json.evidence[0]!.response['choiceNonEmptyCount'], 2);
   assert.equal(json.evidence[0]!.response['logprobsTokenCount'], 2);
+  assert.equal(json.evidence[0]!.response['logprobsInvalidCount'], 0);
+  assert.equal(json.evidence[0]!.response['topLogprobsTokenCount'], 2);
+  assert.equal(json.evidence[0]!.response['temperatureDropped'], true);
 
   const md = renderMarkdown(report);
   assert.match(md, /- 协议参数: stop=.*seed=12345.*n=2.*logprobs=true/);
+  assert.match(md, /tempDropped=true/);
   const html = renderHtml(report);
   assert.ok(html.includes('协议参数'));
   assert.ok(html.includes('choices=2'));
   assert.ok(html.includes('logprobs=2'));
+  assert.ok(html.includes('tempDropped=true'));
 });
 
 test('旧报告 evidence 缺协议字段：渲染不出现 undefined，JSON 归一为 null', () => {
@@ -184,8 +196,13 @@ test('旧报告 evidence 缺协议字段：渲染不出现 undefined，JSON 归�
   delete evidence.request.topLogprobs;
   delete evidence.request.responseFormat;
   delete evidence.response.choiceCount;
+  delete evidence.response.choiceIndices;
+  delete evidence.response.choiceNonEmptyCount;
   delete evidence.response.logprobsTokenCount;
+  delete evidence.response.logprobsInvalidCount;
+  delete evidence.response.topLogprobsTokenCount;
   delete evidence.response.viaStream;
+  delete (evidence.response as { temperatureDropped?: boolean }).temperatureDropped;
   const md = renderMarkdown(report);
   const html = renderHtml(report);
   assert.ok(!md.includes('undefined'));
@@ -195,7 +212,10 @@ test('旧报告 evidence 缺协议字段：渲染不出现 undefined，JSON 归�
   };
   assert.equal(json.evidence[0]!.request['stop'], null);
   assert.equal(json.evidence[0]!.response['choiceCount'], null);
+  assert.equal(json.evidence[0]!.response['choiceIndices'], null);
+  assert.equal(json.evidence[0]!.response['choiceNonEmptyCount'], null);
   assert.equal(json.evidence[0]!.response['viaStream'], null);
+  assert.equal(json.evidence[0]!.response['temperatureDropped'], null);
   assert.ok(md.includes('viaStream=n/a'));
   assert.ok(html.includes('viaStream=n/a'));
 });

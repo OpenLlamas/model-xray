@@ -77,9 +77,13 @@ test('params honest: 5 项全部遵守 → pass 100，证据 10 条且无凭证�
   assert.equal(seedRequest.seed, 12345);
   const nRecord = evidence.find((record) => record.label.startsWith('params n=2'))!;
   assert.equal(nRecord.response.choiceCount, 2);
+  assert.deepEqual(nRecord.response.choiceIndices, [0, 1]);
+  assert.equal(nRecord.response.choiceNonEmptyCount, 2);
   const logprobsRecord = evidence.find((record) => record.label.startsWith('params logprobs'))!;
   // 第二项 logprob=0，仍应计入有效 token 数（不能把 0 当成缺失）。
   assert.equal(logprobsRecord.response.logprobsTokenCount, 2);
+  assert.equal(logprobsRecord.response.logprobsInvalidCount, 0);
+  assert.equal(logprobsRecord.response.topLogprobsTokenCount, 2);
 });
 
 test('params cheat: max_tokens/stop/response_format/n/logprobs 全被忽略 → fail 0 分，seed warn', async () => {
@@ -108,6 +112,15 @@ test('params unsupported(n): 400 点名参数 → na，不判 fail，其余 4 �
   assert.equal(outcome.metrics['scored_na'], 1);
   assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 0);
   assert.ok(outcome.findings.some((finding) => finding.level === 'info' && /n 未判定/.test(finding.message)));
+});
+
+test('params seed unsupported: 5 项照常计分，headline 仍披露 seed 观测不可判定', async () => {
+  const { outcome } = await run('params-honest', { paramReject: ['seed'] });
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['seed_state'], 'na');
+  assert.match(outcome.headline, /seed 观测不可判定/);
 });
 
 test('params all unsupported: 全部 400 → insufficient/unknown，不出分且无 fail', async () => {
@@ -182,6 +195,14 @@ test('params stop: 不含哨兵但 finish_reason=null → na，不把自然结�
   assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 0);
 });
 
+test('params stop: 无哨兵但正文与基线前缀无关 → na，不把无关回复判成 stop 生效', async () => {
+  const { outcome } = await run('params-honest', { paramStopUnrelated: true });
+  assert.equal(outcome.metrics['stop_state'], 'na');
+  assert.equal(outcome.metrics['scored_pass'], 4);
+  assert.equal(outcome.metrics['scored_na'], 1);
+  assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 0);
+});
+
 test('params n: 两个 choices 共用 index 0 → fail，重复索引不算独立候选', async () => {
   const { outcome } = await run('params-honest', { paramDuplicateN: true });
   assert.equal(outcome.metrics['n_state'], 'fail');
@@ -190,12 +211,55 @@ test('params n: 两个 choices 共用 index 0 → fail，重复索引不算独�
   assert.ok(outcome.findings.some((finding) => /n 参数被静默忽略/.test(finding.message)));
 });
 
+test('params n: 第二个 choice 空正文 → fail，空 choice 不算独立候选', async () => {
+  const { outcome } = await run('params-honest', { paramNEmptyChoice: true });
+  assert.equal(outcome.metrics['n_state'], 'fail');
+  assert.equal(outcome.metrics['scored_fail'], 1);
+  assert.equal(outcome.metrics['scored_pass'], 4);
+  assert.ok(outcome.findings.some((finding) => /空 choice/.test(finding.message)));
+});
+
 test('params logprobs: 条目缺少有限 logprob → fail，不把空对象当生效', async () => {
   const { outcome } = await run('params-honest', { paramLogprobsInvalid: true });
   assert.equal(outcome.metrics['logprobs_state'], 'fail');
   assert.equal(outcome.metrics['scored_fail'], 1);
   assert.equal(outcome.metrics['scored_pass'], 4);
   assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 1);
+});
+
+test('params logprobs: logprob>0 非法 → fail', async () => {
+  const { outcome } = await run('params-honest', { paramLogprobsPositive: true });
+  assert.equal(outcome.metrics['logprobs_state'], 'fail');
+  assert.equal(outcome.metrics['scored_fail'], 1);
+  assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 1);
+});
+
+test('params logprobs: top_logprobs 未覆盖 → fail，不再只看 content 非空', async () => {
+  const { outcome } = await run('params-honest', { paramLogprobsNoTop: true });
+  assert.equal(outcome.metrics['logprobs_state'], 'fail');
+  assert.equal(outcome.metrics['scored_fail'], 1);
+  assert.ok(outcome.findings.some((finding) => /top_logprobs 未完整覆盖/.test(finding.message)));
+});
+
+test('params seed: 同 seed 不一致只告警，不把整体级别拉成 warn', async () => {
+  const { outcome } = await run('params-honest', { paramSeedUnstable: true });
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['seed_state'], 'warn');
+  assert.ok(outcome.findings.some((finding) => finding.level === 'warn' && /同 seed 两次输出不同/.test(finding.message)));
+  assert.equal(outcome.findings.filter((finding) => finding.level === 'fail').length, 0);
+});
+
+test('params 单项请求错误: 4 项通过 + 1 项错误 → 部分通过，错误不被静默忽略', async () => {
+  const { outcome } = await run('params-honest', { paramError: ['n'] });
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['scored_error'], 1);
+  assert.equal(outcome.metrics['scored_pass'], 4);
+  assert.ok(outcome.findings.some((finding) => finding.level === 'warn' && /n 未判定（请求错误）/.test(finding.message)));
+  assert.match(outcome.headline, /1 项请求失败未计分/);
 });
 
 test('params 200 空 choices 数组：归为请求失败，不误判空正文', async () => {

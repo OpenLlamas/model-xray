@@ -327,6 +327,7 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
     const partial = [text, reasoning ?? ''].join(' ').trim();
     return errorResult(`upstream error payload（HTTP ${status}）：${errorMessage}`, status, durationMs, partial);
   }
+  const logprobs = analyzeLogprobs(choice);
   return {
     ok: true,
     status,
@@ -346,7 +347,10 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
     raw,
     choiceCount: choices.length,
     choiceIndices: extractChoiceIndices(choices),
-    logprobsTokenCount: countLogprobsTokens(choice),
+    choiceNonEmptyCount: countNonEmptyChoices(choices),
+    logprobsTokenCount: logprobs.tokenCount,
+    logprobsInvalidCount: logprobs.invalidCount,
+    topLogprobsTokenCount: logprobs.topTokenCount,
     viaStream: false,
   };
 }
@@ -362,23 +366,69 @@ function extractChoiceIndices(choices: unknown[]): number[] {
   return indices;
 }
 
-/**
- * 统计 choices[0].logprobs.content 中带有限数值 logprob 的 token 数。
- * logprob 数学上通常 ≤0，本函数只数「存在有限数值的条目」，0 与负值都算有效；未携带 logprobs 返回 null。
- */
-function countLogprobsTokens(choice: Record<string, unknown> | undefined): number | null {
-  if (choice === undefined) return null;
-  const logprobs = choice['logprobs'];
-  if (logprobs === null || logprobs === undefined || typeof logprobs !== 'object') return null;
-  const content = (logprobs as Record<string, unknown>)['content'];
-  if (!Array.isArray(content)) return 0;
+/** 统计实际带正文/推理/工具调用的 choices 数量（空 choice 不能冒充独立候选）。 */
+function countNonEmptyChoices(choices: unknown[]): number {
   let count = 0;
-  for (const entry of content) {
-    if (typeof entry !== 'object' || entry === null) continue;
-    const value = (entry as Record<string, unknown>)['logprob'];
-    if (typeof value === 'number' && Number.isFinite(value)) count += 1;
+  for (const raw of choices) {
+    if (typeof raw !== 'object' || raw === null) continue;
+    const record = raw as Record<string, unknown>;
+    const message = typeof record['message'] === 'object' && record['message'] !== null
+      ? (record['message'] as Record<string, unknown>)
+      : {};
+    const text = extractText(message['content']) || extractText(record['text']);
+    const reasoning = extractText(message['reasoning_content']) + extractText(message['reasoning']);
+    if (text.trim() !== '' || reasoning.trim() !== '' || extractToolCalls(message['tool_calls']).length > 0) count += 1;
   }
   return count;
+}
+
+interface LogprobsAnalysis {
+  tokenCount: number | null;
+  invalidCount: number | null;
+  topTokenCount: number | null;
+}
+
+function isFiniteLogprob(value: unknown): boolean {
+  return typeof value === 'number' && Number.isFinite(value) && value <= 0;
+}
+
+function isValidTopLogprob(value: unknown): boolean {
+  if (typeof value !== 'object' || value === null) return false;
+  const entry = value as Record<string, unknown>;
+  return typeof entry['token'] === 'string' && entry['token'] !== '' && isFiniteLogprob(entry['logprob']);
+}
+
+/**
+ * 校验 choices[0].logprobs.content：token 必须非空，logprob 必须有限且 ≤0；
+ * top_logprobs 每个 token 至少有一条合法条目。未携带 logprobs 返回 null。
+ */
+function analyzeLogprobs(choice: Record<string, unknown> | undefined): LogprobsAnalysis {
+  if (choice === undefined) return { tokenCount: null, invalidCount: null, topTokenCount: null };
+  const logprobs = choice['logprobs'];
+  if (logprobs === null || logprobs === undefined || typeof logprobs !== 'object') {
+    return { tokenCount: null, invalidCount: null, topTokenCount: null };
+  }
+  const content = (logprobs as Record<string, unknown>)['content'];
+  if (!Array.isArray(content)) return { tokenCount: 0, invalidCount: 0, topTokenCount: 0 };
+  let tokenCount = 0;
+  let invalidCount = 0;
+  let topTokenCount = 0;
+  for (const entry of content) {
+    if (typeof entry !== 'object' || entry === null) {
+      invalidCount += 1;
+      continue;
+    }
+    const record = entry as Record<string, unknown>;
+    const token = record['token'];
+    if (typeof token === 'string' && token !== '' && isFiniteLogprob(record['logprob'])) {
+      tokenCount += 1;
+    } else {
+      invalidCount += 1;
+    }
+    const top = record['top_logprobs'];
+    if (Array.isArray(top) && top.some(isValidTopLogprob)) topTokenCount += 1;
+  }
+  return { tokenCount, invalidCount, topTokenCount };
 }
 
 interface SseAggregate {
@@ -391,10 +441,22 @@ interface SseAggregate {
   errorMessage: string | null;
   toolAcc: Map<number, { id: string; name: string; args: string }>;
   choiceIndices: Set<number>;
+  choiceContentIndices: Set<number>;
 }
 
 function createSseAggregate(): SseAggregate {
-  return { text: '', reasoning: '', usage: null, usageRejected: null, finishReason: null, model: null, errorMessage: null, toolAcc: new Map(), choiceIndices: new Set() };
+  return {
+    text: '',
+    reasoning: '',
+    usage: null,
+    usageRejected: null,
+    finishReason: null,
+    model: null,
+    errorMessage: null,
+    toolAcc: new Map(),
+    choiceIndices: new Set(),
+    choiceContentIndices: new Set(),
+  };
 }
 
 /** 累积 SSE 事件；onFirstDelta 用于流式路径打 TTFT 时间戳（整体读取的 JSON 误标路径不传）。 */
@@ -419,6 +481,7 @@ function applySseEvents(agg: SseAggregate, events: Array<{ data: string }>, onFi
     }
     if (chunk.finishReason) agg.finishReason = chunk.finishReason;
     for (const index of chunk.choiceIndices ?? []) agg.choiceIndices.add(index);
+    for (const index of chunk.choiceContentIndices ?? []) agg.choiceContentIndices.add(index);
     for (const delta of chunk.toolCallDeltas) mergeToolDelta(agg.toolAcc, delta);
   }
 }
@@ -460,6 +523,7 @@ function buildStreamResult(agg: SseAggregate, status: number, durationMs: number
     // 未捕获到任何合法 choice index 时保持 undefined，由探针降级为 na。
     choiceCount: agg.choiceIndices.size > 0 ? agg.choiceIndices.size : undefined,
     choiceIndices: agg.choiceIndices.size > 0 ? [...agg.choiceIndices].sort((a, b) => a - b) : undefined,
+    choiceNonEmptyCount: agg.choiceIndices.size > 0 ? agg.choiceContentIndices.size : undefined,
     viaStream: true,
   };
 }
@@ -601,10 +665,6 @@ function errorResult(message: string, status = 0, durationMs = 0, partialText = 
     durationMs,
     error: redactSecrets(message),
     raw: '',
-    choiceCount: 0,
-    choiceIndices: [],
-    logprobsTokenCount: null,
-    viaStream: false,
   };
 }
 

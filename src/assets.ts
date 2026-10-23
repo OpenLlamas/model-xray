@@ -8,8 +8,10 @@ import { estimateTokens } from './tokens.js';
 // 旁证；为此 IDENTITY_QUESTIONS 题池 5→7（deep 档需 7 道随机题 + 1 道固定版本自述题）。
 // v0.2.3：新增 params 协议参数完整性探针（max_tokens/stop/response_format/n/logprobs + seed 观测）；
 // 权重在合计 90 内重分配（quality 25→20、identity 15→10、params 10），旧基线不可比。
+// v0.2.4：params 判定收紧——n 要求独立且有内容的 choices，logprobs 校验 logprob 数学合法性与
+// top_logprobs 覆盖率，stop 要求响应为基线哨兵前前缀；seed 仅告警不升级整体级别，请求错误不再静默。
 // 题集内容与判定口径变化 → 基线不可比。
-export const PROBESET_VERSION = 'v0.2.3';
+export const PROBESET_VERSION = 'v0.2.4';
 export const ASSETS_VERSION = 'assets-v0.1.0';
 
 /** Base paragraphs used to construct long context probes. Deterministic given seed. */

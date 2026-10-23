@@ -3,7 +3,7 @@
 - 审计日期：2026-10-22
 - 审计对象：model-xray v0.2.0（`src/` 全部探针、评分、客户端、guard）
 - 对照对象：proxy-sleuth、ai-check-model、model-verify、LogProbs，以及蒸馏检测论文（arXiv 2607.09692）
-- 审计方式：逐文件读码 + 逐层对照公开 README/方法说明；**本次未修改任何代码**
+- 审计方式：逐文件读码 + 逐层对照公开 README/方法说明；本审计初稿基于未修改基线，后续 P0 落地与判定收紧已单独标注
 - 结论口径：只陈述可复核的代码行为；无法验证的能力一律标为"未覆盖"，不按"应该能"推断
 
 ---
@@ -17,7 +17,7 @@
 - 最关键的失效场景：**同族降档**（如 `gpt-4o → gpt-4o-mini`、`glm-5.3 → glm-5.3-flash`）。现有 identity + quality 两层都拦不住，而这正是中转站最常见的手法。
 - 因此当前**不能声称"准确度可信度极高"**；能诚实声明的上限是"多维度行为筛查 + 部分计费实证"，且必须逐维度标注置信度。
 
-> **实施状态（2026-10-22 后续切片）**：本审计中的 P0「协议参数完整性」已落地为 `src/probes/params.ts`（max_tokens/stop/response_format/n/logprobs + seed 观测），题集版本升至 `v0.2.3`；其余未覆盖项（logprobs 分布指纹、tokenizer、知识截止、同族降档、混合路由等）仍未实现。params 只证明参数是否被端点遵守，不能单独证明模型权重来源。
+> **实施状态（2026-10-22 后续切片）**：本审计中的 P0「协议参数完整性」已落地为 `src/probes/params.ts`（max_tokens/stop/response_format/n/logprobs + seed 观测），题集版本升至 `v0.2.4`；`n` 要求独立且有内容的 choices，`logprobs` 校验 logprob 数学合法性与 `top_logprobs` 覆盖率，`stop` 要求响应为基线哨兵前前缀，seed 仅告警不升级整体级别，单次请求错误不再静默。其余未覆盖项（logprobs 分布指纹、tokenizer、知识截止、同族降档、混合路由等）仍未实现。params 只证明参数是否被端点遵守，不能单独证明模型权重来源。
 
 ---
 
@@ -112,7 +112,7 @@
 ### B3 分布级替换/量化/蒸馏（高）
 
 攻击：全精度换成量化版、同厂蒸馏版，行为接近但分布不同。
-- 当前无 logprobs 采集（全仓库 0 处），无 JS/KL 距离，无基线分布。
+- 当前已采集 `choices[0].logprobs.content` 的合法性与 `top_logprobs` 覆盖率（`src/client.ts`），但无 JS/KL 分布距离、无官方基线分布，因此仍不能做分布级身份判定。
 
 ### B4 tokenizer 差异（高）
 
@@ -326,10 +326,10 @@
 
 | 任务 | 落点 | 验收 |
 |---|---|---|
-| 参数完整性探针 | 新增 `src/probes/params.ts`；扩展 `ChatRequest`（top_p/stop/seed/logprobs/response_format/n） | 每项参数有 pass/fail/na + 证据（2026-10-22：max_tokens/stop/response_format/n/logprobs + seed 观测已完成；top_p/tools/penalties 待补） |
+| 参数完整性探针 | 新增 `src/probes/params.ts`；扩展 `ChatRequest`（stop/seed/logprobs/top_logprobs/response_format/n） | 每项参数有 pass/fail/na + 证据（2026-10-22：max_tokens/stop/response_format/n/logprobs + seed 观测已完成；top_p/tools/penalties 待补） |
 | 质量题升级 | `src/probes/quality.ts` + `src/assets.ts` | 题库含代码执行/指令遵循/知识/多语言；难度分层；仍可 seed 复现 |
 | 统计汇总层 | `src/stats.ts` + `src/scoring.ts` | BH-FDR、CI、四态结论；`not_refuted` 不再算 100 |
-| 校准框架 | `test/calibration/` + 现有 `test/mock-server.js` | 能跑 N=100 好/坏样本，输出 FAR/FRR 表 |
+| 校准框架 | 新建 `test/calibration/` + 复用现有 `test/mock-server.ts` | 能跑 N=100 好/坏样本，输出 FAR/FRR 表 |
 | 回归门禁 | `package.json` 脚本 | FAR/FRR 超线即 CI fail |
 
 ### P1（1–2 月）
@@ -391,7 +391,7 @@
 
 ## 10. 本次审计未做的事
 
-- 未修改任何源码、测试或配置。
+- 审计初稿未修改源码；后续 P0 params 与 v0.2.4 判定收紧已修改 `src/`、测试与文档，以实施状态注记为准。
 - 未运行真实端点（无 key 授权）。
 - 未对对照项目做代码级审计，仅依据其公开 README/方法说明。
 - 未给出工期与费用承诺；P0/P1 的时间仅为工程量级估计。

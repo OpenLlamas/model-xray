@@ -187,6 +187,16 @@ async function checkStop(ctx: ProbeCtx): Promise<CheckResult> {
       detail: `响应不含哨兵但 finish_reason=${result.finishReason ?? 'null'}，无法确认是 stop 截断还是自然结束`,
     };
   }
+  const sentinelAt = baseline.result.text.indexOf(sentinel);
+  const expectedPrefix = baseline.result.text.slice(0, sentinelAt).trimEnd();
+  const observedPrefix = result.text.trimEnd();
+  if (observedPrefix !== expectedPrefix) {
+    return {
+      state: 'na',
+      evidenceId,
+      detail: `响应不含哨兵但正文不是基线哨兵前前缀（期望「${expectedPrefix.slice(0, 80)}」，实际「${observedPrefix.slice(0, 80)}」），无法确认是 stop 截断`,
+    };
+  }
   return { state: 'pass', evidenceId, detail: 'stop 生效：哨兵及其后内容被截断（finish_reason=stop）' };
 }
 
@@ -268,21 +278,32 @@ async function checkN(ctx: ProbeCtx): Promise<CheckResult> {
     return { state: 'na', evidenceId, detail: '响应未提供 choice 数量，n 不可判定' };
   }
   if (result.choiceCount === 2) {
-    // choices.length=2 还不够：重复/缺失 index 可能是把同一个 choice 复制两份。
-    // JSON/SSE 路径都会给出 choiceIndices；缺失视为不可判定，重复视为参数未正确生效。
-    if (result.choiceIndices !== undefined) {
-      if (result.choiceIndices.length !== 2) {
-        return { state: 'na', evidenceId, detail: 'n=2 响应有 2 个 choices，但 choice index 缺失/非法，无法确认是独立候选' };
-      }
-      const distinct = new Set(result.choiceIndices);
-      if (distinct.size !== 2) {
-        return { state: 'fail', evidenceId, detail: `n=2 响应 2 个 choices 共用 choice index（${result.choiceIndices.join(',')}），不是独立候选` };
-      }
-      if (!distinct.has(0) || !distinct.has(1)) {
-        return { state: 'fail', evidenceId, detail: `n=2 响应 choice index 不是 0/1（${result.choiceIndices.join(',')}），与参数语义不符` };
-      }
+    // choices.length=2 还不够：重复/缺失 index 可能是把同一个 choice 复制两份，
+    // 空 choice 也可能是补齐数量；必须同时确认两个独立 index 都有实际内容。
+    if (result.choiceIndices === undefined) {
+      return { state: 'na', evidenceId, detail: 'n=2 响应有 2 个 choices，但 choice index 未解析，无法确认是独立候选' };
     }
-    return { state: 'pass', evidenceId, detail: 'n=2 生效：返回 2 个独立 choices' };
+    if (result.choiceIndices.length !== 2) {
+      return { state: 'na', evidenceId, detail: 'n=2 响应有 2 个 choices，但 choice index 缺失/非法，无法确认是独立候选' };
+    }
+    const distinct = new Set(result.choiceIndices);
+    if (distinct.size !== 2) {
+      return { state: 'fail', evidenceId, detail: `n=2 响应 2 个 choices 共用 choice index（${result.choiceIndices.join(',')}），不是独立候选` };
+    }
+    if (!distinct.has(0) || !distinct.has(1)) {
+      return { state: 'fail', evidenceId, detail: `n=2 响应 choice index 不是 0/1（${result.choiceIndices.join(',')}），与参数语义不符` };
+    }
+    if (result.choiceNonEmptyCount === undefined) {
+      return { state: 'na', evidenceId, detail: 'n=2 响应 choice 内容解析缺失，无法确认两个候选都有正文' };
+    }
+    if (result.choiceNonEmptyCount !== 2) {
+      return {
+        state: 'fail',
+        evidenceId,
+        detail: `n=2 响应仅 ${result.choiceNonEmptyCount}/2 个 choices 有正文/推理/工具调用，空 choice 不能算独立候选`,
+      };
+    }
+    return { state: 'pass', evidenceId, detail: 'n=2 生效：返回 2 个独立且有内容的 choices' };
   }
   if (result.choiceCount === 1) {
     return { state: 'fail', evidenceId, detail: 'n=2 被忽略：仅返回 1 个 choice' };
@@ -313,13 +334,37 @@ async function checkLogprobs(ctx: ProbeCtx): Promise<CheckResult> {
   if (result.logprobsTokenCount === undefined) {
     return { state: 'na', evidenceId, detail: '响应未解析 logprobs 字段，不可判定' };
   }
-  if (result.logprobsTokenCount !== null && result.logprobsTokenCount > 0) {
-    return { state: 'pass', evidenceId, detail: `logprobs 生效：返回 ${result.logprobsTokenCount} 个 token 的有限 logprob（0 与负值均有效）` };
-  }
   if (isBlankOk(result)) {
     return { state: 'na', evidenceId, detail: '响应为空正文/被内容过滤，无法判定 logprobs' };
   }
-  return { state: 'fail', evidenceId, detail: 'logprobs=true 被忽略：200 响应未携带 logprobs 内容' };
+  if (result.logprobsInvalidCount === undefined) {
+    return { state: 'na', evidenceId, detail: '响应未解析 logprobs 合法性，不可判定' };
+  }
+  if (result.logprobsInvalidCount !== null && result.logprobsInvalidCount > 0) {
+    return {
+      state: 'fail',
+      evidenceId,
+      detail: `logprobs 内容含 ${result.logprobsInvalidCount} 个非法条目（token 缺失、logprob 非有限值或 >0）`,
+    };
+  }
+  if (result.logprobsTokenCount !== null && result.logprobsTokenCount > 0) {
+    if (result.topLogprobsTokenCount === undefined || result.topLogprobsTokenCount === null) {
+      return { state: 'na', evidenceId, detail: '响应未解析 top_logprobs，无法确认 top_logprobs=3 是否生效' };
+    }
+    if (result.topLogprobsTokenCount !== result.logprobsTokenCount) {
+      return {
+        state: 'fail',
+        evidenceId,
+        detail: `top_logprobs 未完整覆盖：${result.topLogprobsTokenCount}/${result.logprobsTokenCount} 个 token 带合法 top_logprobs`,
+      };
+    }
+    return {
+      state: 'pass',
+      evidenceId,
+      detail: `logprobs 生效：${result.logprobsTokenCount} 个 token 的 logprob 合法，top_logprobs 覆盖 ${result.topLogprobsTokenCount}/${result.logprobsTokenCount} 个 token`,
+    };
+  }
+  return { state: 'fail', evidenceId, detail: 'logprobs=true 被忽略：200 响应未携带合法 logprobs 内容' };
 }
 
 async function checkSeed(ctx: ProbeCtx): Promise<{ state: 'pass' | 'warn' | 'na' | 'error'; evidenceIds: string[]; detail: string }> {
@@ -358,7 +403,7 @@ async function checkSeed(ctx: ProbeCtx): Promise<{ state: 'pass' | 'warn' | 'na'
   return { state: 'pass', evidenceIds, detail: 'seed 行为符合预期：同 seed 一致、不同 seed 分化' };
 }
 
-function stateText(state: CheckState): string {
+function stateText(state: CheckState | 'warn'): string {
   switch (state) {
     case 'pass':
       return '通过';
@@ -366,6 +411,8 @@ function stateText(state: CheckState): string {
       return '失败';
     case 'na':
       return '不适用';
+    case 'warn':
+      return '告警';
     default:
       return '错误';
   }
@@ -394,7 +441,13 @@ export async function probeParams(ctx: ProbeCtx): Promise<ProbeOutcome> {
         message: `${id} 参数被静默忽略：${result.detail}`,
         evidenceIds: result.evidenceId === null ? [] : [result.evidenceId],
       });
-    } else if (result.state === 'na' || result.state === 'error') {
+    } else if (result.state === 'error') {
+      findings.push({
+        level: 'warn',
+        message: `${id} 未判定（请求错误）：${result.detail}`,
+        evidenceIds: result.evidenceId === null ? [] : [result.evidenceId],
+      });
+    } else if (result.state === 'na') {
       findings.push({
         level: 'info',
         message: `${id} 未判定（${stateText(result.state)}）：${result.detail}`,
@@ -406,9 +459,9 @@ export async function probeParams(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const seed = await checkSeed(ctx);
   metrics['seed_state'] = seed.state;
   metrics['seed_evidence_count'] = seed.evidenceIds.length;
-  if (seed.state === 'warn') {
-    findings.push({ level: 'warn', message: seed.detail, evidenceIds: seed.evidenceIds });
-  } else if (seed.state === 'na' || seed.state === 'error') {
+  if (seed.state === 'warn' || seed.state === 'error') {
+    findings.push({ level: 'warn', message: `seed 未判定（${stateText(seed.state)}）：${seed.detail}`, evidenceIds: seed.evidenceIds });
+  } else if (seed.state === 'na') {
     findings.push({ level: 'info', message: `seed 未判定（${stateText(seed.state)}）：${seed.detail}`, evidenceIds: seed.evidenceIds });
   } else {
     findings.push({ level: 'info', message: seed.detail, evidenceIds: seed.evidenceIds });
@@ -434,13 +487,23 @@ export async function probeParams(ctx: ProbeCtx): Promise<ProbeOutcome> {
   }
 
   const score = Math.round((passCount / scored) * 100);
-  const level: ProbeOutcome['level'] = failCount > 0 ? 'fail' : seed.state === 'warn' ? 'warn' : 'pass';
+  const coverageNotes: string[] = [];
+  if (naCount > 0) coverageNotes.push(`${naCount} 项不适用/未判定`);
+  if (errorCount > 0) coverageNotes.push(`${errorCount} 项请求失败未计分`);
+  if (seed.state === 'na') coverageNotes.push('seed 观测不可判定');
+  const coverageSuffix = coverageNotes.length > 0 ? `（${coverageNotes.join('，')}）` : '';
+  // seed 只作观测：同 seed 不一致/请求错误把分项标记为 warn，但不把“确定性未确认”升级为参数篡改。
+  const level: ProbeOutcome['level'] = failCount > 0 ? 'fail' : errorCount > 0 || seed.state === 'error' ? 'warn' : 'pass';
   const failedNames = checks.filter((c) => c.state === 'fail').map((c) => c.id);
   const headline = failCount > 0
-    ? `协议参数被静默改写：${failedNames.join('、')} 已接受请求但行为不符合参数语义`
-    : seed.state === 'warn'
-      ? `协议参数完整性通过（${passCount}/${scored}），但同 seed 输出不一致，确定性未确认`
-      : `协议参数完整性通过：${passCount}/${scored} 项实测遵守${naCount > 0 ? `（${naCount} 项端点不支持/不可判定）` : ''}`;
+    ? `协议参数被静默改写：${failedNames.join('、')} 已接受请求但行为不符合参数语义${coverageSuffix}`
+    : errorCount > 0
+      ? `协议参数完整性部分通过：${passCount}/${scored} 项实测遵守${coverageSuffix}`
+      : seed.state === 'error'
+        ? `协议参数完整性通过（${passCount}/${scored}），但 seed 观测请求失败，确定性未确认${coverageSuffix}`
+        : seed.state === 'warn'
+          ? `协议参数完整性通过（${passCount}/${scored}），但同 seed 输出不一致，确定性未确认${coverageSuffix}`
+          : `协议参数完整性通过：${passCount}/${scored} 项实测遵守${coverageSuffix}`;
 
   return { id: 'params', status: 'ok', score, level, headline, findings, metrics };
 }

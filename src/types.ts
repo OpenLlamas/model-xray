@@ -153,10 +153,19 @@ export interface ChatResult {
    */
   choiceIndices?: number[];
   /**
-   * choices[0].logprobs.content 中带有限数值 logprob 的 token 数（logprob 为 0 或负值都计数）。
+   * 实际带正文/推理/工具调用的 choice 数（JSON 按 choices[] 统计，SSE 按带内容信号的 choice index 去重）。
+   * undefined = 未解析；number = 实际非空 choice 数。params 的 n 检查据此防止空 choice 冒充独立候选。
+   */
+  choiceNonEmptyCount?: number;
+  /**
+   * choices[0].logprobs.content 中合法 token 数（token 非空、logprob 有限且 ≤0）。
    * undefined = 未解析或不可判定；null = 已解析但响应未携带 logprobs；number = 实际条数。
    */
   logprobsTokenCount?: number | null;
+  /** choices[0].logprobs.content 中结构非法（缺 token / logprob 非有限值或 >0）的条目数。 */
+  logprobsInvalidCount?: number | null;
+  /** choices[0].logprobs.content 中带非空合法 top_logprobs 数组的 token 数。 */
+  topLogprobsTokenCount?: number | null;
   /** 本次响应是否经 SSE 流式解析（流式口径下 logprobs 未聚合，params 的 logprobs 检查降级为 na）。 */
   viaStream?: boolean;
 }
@@ -262,8 +271,16 @@ export interface EvidenceResponse {
   finishReason: string | null;
   /** 已解析的 choices 数量；null/缺省表示客户端未解析（旧结果/测试桩） */
   choiceCount?: number | null;
-  /** 已解析的 logprobs token 数；null/缺省表示缺失或不可用 */
+  /** 已解析的 choice index 列表；null/缺省表示未解析 */
+  choiceIndices?: number[] | null;
+  /** 带正文/推理/工具调用的 choice 数；null/缺省表示未解析 */
+  choiceNonEmptyCount?: number | null;
+  /** 已解析的合法 logprobs token 数；null/缺省表示缺失或不可用 */
   logprobsTokenCount?: number | null;
+  /** logprobs.content 中结构非法的条目数；null/缺省表示缺失或不可用 */
+  logprobsInvalidCount?: number | null;
+  /** 带非空合法 top_logprobs 的 token 数；null/缺省表示缺失或不可用 */
+  topLogprobsTokenCount?: number | null;
   /** 响应是否来自 SSE 聚合；null/缺省表示旧报告未记录（未知），不能当作非流式 */
   viaStream?: boolean | null;
   error: string | null;

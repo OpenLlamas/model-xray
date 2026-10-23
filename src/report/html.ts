@@ -152,8 +152,13 @@ function renderEvidence(record: EvidenceRecord): string {
   const usage = record.response.usage
     ? `usage: prompt=${record.response.usage.prompt_tokens} completion=${record.response.usage.completion_tokens} total=${record.response.usage.total_tokens}`
     : 'usage: 无';
+  const choiceIndices = record.response.choiceIndices == null ? '' : `[${record.response.choiceIndices.join(',')}]`;
+  const nonEmpty = record.response.choiceNonEmptyCount == null ? '' : ` nonempty=${record.response.choiceNonEmptyCount}`;
+  const topLogprobs = record.response.topLogprobsTokenCount == null ? '' : ` top=${record.response.topLogprobsTokenCount}`;
+  const invalidLogprobs = record.response.logprobsInvalidCount == null ? '' : ` invalid=${record.response.logprobsInvalidCount}`;
+  const temperatureDropped = record.response.temperatureDropped ? ' · tempDropped=true' : '';
   const parsed = record.probe === 'params'
-    ? ` · choices=${record.response.choiceCount ?? 'n/a'} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
+    ? ` · choices=${record.response.choiceCount ?? 'n/a'}${choiceIndices}${nonEmpty} · logprobs=${record.response.logprobsTokenCount ?? 'n/a'}${topLogprobs}${invalidLogprobs} · viaStream=${record.response.viaStream === true ? 'true' : record.response.viaStream === false ? 'false' : 'n/a'}`
     : '';
   const protocol = [
     record.request.stop != null ? `stop=${JSON.stringify(record.request.stop)}` : '',
@@ -164,7 +169,7 @@ function renderEvidence(record: EvidenceRecord): string {
     record.request.responseFormat != null ? `response_format=${record.request.responseFormat}` : '',
   ].filter((part) => part.length > 0).join(' · ');
   return `<details class="ev"><summary>${esc(record.id)} · ${esc(record.probe)} · ${esc(record.label)}</summary>
-<p class="muted">HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${esc(parsed)} · ${esc(usage)}</p>
+<p class="muted">HTTP ${record.response.status} · ${record.durationMs}ms${record.ttftMs !== null ? ` · TTFT ${record.ttftMs}ms` : ''}${esc(parsed)}${esc(temperatureDropped)} · ${esc(usage)}</p>
 ${record.response.error ? `<p class="muted">error: ${esc(record.response.error)}</p>` : ''}
 ${record.response.model !== null ? `<p class="muted">回显模型: ${esc(record.response.model)}${record.response.model === record.request.model ? '' : `（请求 ${esc(record.request.model)}）`}</p>` : ''}
 ${protocol ? `<p class="muted">协议参数: ${esc(protocol)}</p>` : ''}
