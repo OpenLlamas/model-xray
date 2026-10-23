@@ -80,7 +80,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 
 ![案例：换壳 + 1.5 倍率，45/100 不通过（端点地址已打码）](docs/audit-case-glm-5.3-webui.png)
 
-*图中端点地址仅对子域名中段打码。*
+*图中端点主机名仅保留首字母 x 与末位 1，其余已打码。*
 
 ### 三、衡量维度标准
 

@@ -226,7 +226,7 @@
 - **重试分层（src/client.ts）**：新增 `--http-retries <n>`（[0,6]，默认 2）——429/503「网关层拒绝」（未进入推理、通常不计费）用独立预算重试，`Retry-After` 优先采纳（上限 5s）+ 抖动退避；与 `--retries`（200 空正文）分开计预算；运行级 `retryBudget`（默认 24，跨请求共享）限制端点整体过载时的重试放大。
 - **污染口径收窄（层 3 审查 3 必修全采纳）**：① `contaminatingRetry` 请求级**粘性**（`200空→503→200` 交错序列不得被后续 5xx 复位）；② 豁免仅限 429/503——408/409/500/502/504/超时/网络错误仍判「可能已计费」污染（POST 非幂等）；③ 配额耗尽（429 quota）不消耗重试预算维持不变。
 - **billing 指标拆分**：`retried_requests`（attempts>1 观测计数）与 `contaminating_retries`（可能已计费的重试）分开；只有后者作废实测倍率、封顶 70；`retried_requests` 不再触发任何惩罚（诚实披露）。billing insufficient 标题改为带主导错误归因（「计费探针有效样本不足，无法运行回归；主因：端点/网关拒绝（N/M 笔）：HTTP 503…」）。
-- **失败归因（新建 src/diagnostics.ts）**：`categorizeFailure`（gateway/auth/not-found/network/endpoint-error/other）+ `summarizeFailures` + `failureDigest` + `runFailureDigest`；错误详情白名单化（状态码+截断 90 字+去控制字符防 ANSI 注入）；文案称「端点/网关」而非「上游」（natapp 隧道场景 503 实为网关返回）；identity「无有效样本」标题与 runner notes（运行级失败汇总+建议）接入；明确不做：端点预检/健康门、放宽 billing 每档 ≥3 样本门槛、把 5xx 记为模型问题。
+- **失败归因（新建 src/diagnostics.ts）**：`categorizeFailure`（gateway/auth/not-found/network/endpoint-error/other）+ `summarizeFailures` + `failureDigest` + `runFailureDigest`；错误详情白名单化（状态码+截断 90 字+去控制字符防 ANSI 注入）；文案称「端点/网关」而非「上游」（中转隧道场景 503 实为网关返回）；identity「无有效样本」标题与 runner notes（运行级失败汇总+建议）接入；明确不做：端点预检/健康门、放宽 billing 每档 ≥3 样本门槛、把 5xx 记为模型问题。
 - **范围外**：不自动放宽任何 fail 判据；UNKNOWN 仍如实呈现，只是说清是谁的问题并给建议（错峰重测等）。
 - **验证**：全量 `npm test` **672/672**（新增：client 重试分层×4、billing 污染口径×2、identity 归因标题×1、diagnostics 单测×5；既有断言按新口径对齐：billing insufficient 标题、e2e flaky500 污染指标）；`tsc --noEmit` exit 0；`git diff --check` exit 0。README 中英文同步（--http-retries、污染豁免口径、503/UNKNOWN 排查行）。
 

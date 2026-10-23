@@ -237,7 +237,7 @@ Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): 
 
 Same case audited from the web console (form with claimed prices entered, in-place scorecard): ![Web console: glm-5.3-flash standing in for glm-5.3, claimed prices entered, score 45/100 fail (endpoint redacted)](audit-case-glm-5.3-webui.png)
 
-The middle segment of the endpoint subdomain is pixelated in both screenshots.
+Only the first character `x` and the trailing `1` of the endpoint host remain visible; the rest of the hostname is pixelated in both screenshots.
 
 ### Web console (local, executable)
 
@@ -510,7 +510,7 @@ model-xray pricing-watch --base-url https://relay.example.com/v1 --model gpt-4o 
 
 同一案例在 Web 控制台实测（表单已录入价格、评分卡原位渲染）：![Web 控制台：glm-5.3-flash 冒充 glm-5.3，已录入价格，总分 45/100 不通过（端点已打码）](audit-case-glm-5.3-webui.png)
 
-两张图中的端点地址仅对子域名中段打码。
+两张图中的端点主机名仅保留首字母 x 与末位 1，其余已打码。
 
 ### Web 控制台（本地、可执行）
 
