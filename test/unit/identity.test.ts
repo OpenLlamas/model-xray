@@ -829,7 +829,7 @@ test('identity: one sample declares no family → unanimity broken, lands in maj
   assert.equal(outcome.score, 60);
 });
 
-// ---------- 真实事故回归：全程自述他族不再「假清白」（某中转站 事故） ----------
+// ---------- 真实事故回归：全程自述他族不再「假清白」（某中转站事故） ----------
 
 test('identity: incident regression — glm-5.3-flash endpoint self-describes MiniMax-M3 5 times → falsified fail, families=minimax', async () => {
   // 真实事故：以 glm-5.3-flash 名义请求，5 次自述全部回答 MiniMax-M3（reports/report-2026-10-11T16-00-32-484Z ev-001..003）。

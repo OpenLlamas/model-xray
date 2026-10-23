@@ -233,9 +233,11 @@ Best run from the web console (see "Web console" below): tick the claimed capabi
 
 Real case (scorecard below, from `reports/report-glm-5.3-2026-10-20_03-25-22`): a relay served `glm-5.3-flash` in place of `glm-5.3` and set the rate to 1.5×. One "Start test" run caught it: all 6 identity probes echoed back a different model (requested `glm-5.3`, upstream echoed `glm-5.3-flash` — suspected swap/channel change), the measured rate came out 1.5 > 1.5 claimed (fail, capped at 30), plus 32/62 empty non-streaming bodies as further evidence — final score 45 · fail (billing hard red line caps the total). The sticker prices on the page looked perfectly normal; without entering them and actually measuring, nothing would have surfaced.
 
-![Case: `glm-5.3-flash` standing in for `glm-5.3` with a 1.5× markup — score 45/100, fail](audit-case-glm-5.3.png)
+![Case: `glm-5.3-flash` standing in for `glm-5.3` with a 1.5× markup — score 45/100, fail (endpoint redacted)](audit-case-glm-5.3.png)
 
-Same case audited from the web console (form with claimed prices entered, in-place scorecard): ![Web console: glm-5.3-flash standing in for glm-5.3, claimed prices entered, score 45/100 fail](audit-case-glm-5.3-webui.png)
+Same case audited from the web console (form with claimed prices entered, in-place scorecard): ![Web console: glm-5.3-flash standing in for glm-5.3, claimed prices entered, score 45/100 fail (endpoint redacted)](audit-case-glm-5.3-webui.png)
+
+The middle segment of the endpoint subdomain is pixelated in both screenshots.
 
 ### Web console (local, executable)
 
@@ -504,9 +506,11 @@ model-xray pricing-watch --base-url https://relay.example.com/v1 --model gpt-4o 
 
 真实案例（见下图，取自 `reports/report-glm-5.3-2026-10-20_03-25-22`）：某中转站拿 `glm-5.3-flash` 冒充 `glm-5.3`，并把倍率设到 1.5×。一次「开始检测」即被抓：identity 6 次身份探针全部回显不符（请求 `glm-5.3`，上游回显 `glm-5.3-flash`，疑似换壳/换通道），billing 实扣倍率 1.5 > 1.5 → fail（封顶 30），另有 32/62 笔非流式空正文佐证——最终可信度总分 45 · 不通过（计费硬红线触发总分封顶）。页面上录入的标价完全正常；不录价格、不实测，这些问题根本不会浮出水面。（该案例使用余额对账模式；当前 `test` 默认给出「你填的单价÷站点现价」，不读余额。）
 
-![案例：`glm-5.3-flash` 冒充 `glm-5.3` 且倍率 1.5×——总分 45/100，不通过](audit-case-glm-5.3.png)
+![案例：`glm-5.3-flash` 冒充 `glm-5.3` 且倍率 1.5×——总分 45/100，不通过（端点已打码）](audit-case-glm-5.3.png)
 
-同一案例在 Web 控制台实测（表单已录入价格、评分卡原位渲染）：![Web 控制台：glm-5.3-flash 冒充 glm-5.3，已录入价格，总分 45/100 不通过](audit-case-glm-5.3-webui.png)
+同一案例在 Web 控制台实测（表单已录入价格、评分卡原位渲染）：![Web 控制台：glm-5.3-flash 冒充 glm-5.3，已录入价格，总分 45/100 不通过（端点已打码）](audit-case-glm-5.3-webui.png)
+
+两张图中的端点地址仅对子域名中段打码。
 
 ### Web 控制台（本地、可执行）
 

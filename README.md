@@ -78,7 +78,9 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 
 真实案例：某站拿 `glm-5.3-flash` 冒充 `glm-5.3` 并设 1.5× 倍率，一次检测即被抓——身份 6 个探针全部回显不符 + 实扣倍率 1.5，最终 45 分不通过（计费硬红线封顶）。更多细节见[完整文档](docs/README-detailed.md)。
 
-![案例：换壳 + 1.5 倍率，45/100 不通过](docs/audit-case-glm-5.3-webui.png)
+![案例：换壳 + 1.5 倍率，45/100 不通过（端点地址已打码）](docs/audit-case-glm-5.3-webui.png)
+
+*图中端点地址仅对子域名中段打码。*
 
 ### 三、衡量维度标准
 
