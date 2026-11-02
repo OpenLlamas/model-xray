@@ -48,6 +48,17 @@ test('buildBaseline extracts fingerprints from probe metrics', () => {
   assert.deepEqual(baseline.billing, { slopeEn: 1.0, slopeZh: 1.2 });
 });
 
+test('buildBaseline records the quality question-bank round count', () => {
+  const baseline = buildBaseline([outcome('quality', { main: '30/36', metric_version: 'pass1', quality_samples: 3 })], META);
+  assert.deepEqual(baseline.quality, {
+    accuracy: 30 / 36,
+    mainCorrect: 30,
+    mainTotal: 36,
+    metricVersion: 'pass1',
+    samples: 3,
+  });
+});
+
 test('buildBaseline maps families none and N/A schema to null/false', () => {
   const baseline = buildBaseline([outcome('identity', { families: 'none', schema_compliant: 'N/A', samples: 0, refusals: 0 })], META);
   assert.deepEqual(baseline.identity?.families, []);
@@ -197,6 +208,15 @@ test('validateBaseline rejects malformed shapes with field-path errors', () => {
     assert.throws(() => loadBaseline(write('k.json', validBaselineJson({ identity: 'oops' }))), /baseline\.identity 应为对象/);
     // l. createdAt 缺类型
     assert.throws(() => loadBaseline(write('l.json', validBaselineJson({ createdAt: 42 }))), /baseline\.createdAt/);
+    // l2. quality.samples 非整数/越界（--quality-samples 有效域 [1,5]）
+    assert.throws(
+      () => loadBaseline(write('l2a.json', validBaselineJson({ quality: { accuracy: 0.5, mainCorrect: 1, mainTotal: 2, samples: 0 } }))),
+      /baseline\.quality\.samples/,
+    );
+    assert.throws(
+      () => loadBaseline(write('l2b.json', validBaselineJson({ quality: { accuracy: 0.5, mainCorrect: 1, mainTotal: 2, samples: 6 } }))),
+      /baseline\.quality\.samples/,
+    );
     // m. quality.mainTotal 为负
     assert.throws(
       () => loadBaseline(write('m.json', validBaselineJson({ quality: { accuracy: 0.5, mainCorrect: -1, mainTotal: -2 } }))),
@@ -296,6 +316,28 @@ test('diffBaseline quality thresholds just below/above 0.15 and 0.30', () => {
   assert.equal(fail?.cap, 30);
   assert.equal(DRIFT_QUALITY_WARN, 0.15);
   assert.equal(DRIFT_QUALITY_FAIL, 0.3);
+});
+
+function qualityBaselineWithSamples(accuracy: number, samples: number = 1): BaselineFile {
+  const perRoundMain = 12;
+  const mainTotal = perRoundMain * samples;
+  const mainCorrect = Math.round(accuracy * mainTotal);
+  return baselineOf({
+    quality: { accuracy: mainCorrect / mainTotal, mainCorrect, mainTotal, samples },
+  });
+}
+
+test('diffBaseline skips quality drift when question-bank rounds differ (same seed)', () => {
+  // 同 seed 但 1 轮 vs 3 轮：题面与分母都不同（12 题 vs 36 题），准确率混比会假漂移。
+  const diff = diffBaseline(qualityBaselineWithSamples(0.95, 1), qualityBaselineWithSamples(0.5, 3));
+  assert.equal(diff.comparable, true);
+  assert.equal(diff.items.find((i) => i.probeId === 'quality'), undefined);
+  assert.ok(diff.notes.some((n) => n.includes('轮数')), JSON.stringify(diff.notes));
+});
+
+test('diffBaseline still compares quality when both sides record the same sample count', () => {
+  const warn = diffBaseline(qualityBaselineWithSamples(0.75, 1), qualityBaselineWithSamples(0.55, 1));
+  assert.equal(warn.items.find((i) => i.probeId === 'quality')?.level, 'warn');
 });
 
 test('diffBaseline skips quality when seeds differ but compares other probes', () => {

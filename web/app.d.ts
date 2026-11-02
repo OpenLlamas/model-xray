@@ -30,6 +30,8 @@ export interface BuildCommandInput {
   httpRetries?: string;
   out: string;
   baseline: string;
+  /** 质量题集轮数（1-5，空串=未指定；留空时 --deep 默认 3）。 */
+  qualitySamples?: string;
   deep: boolean;
   dryRun: boolean;
   yes: boolean;

@@ -1,5 +1,15 @@
 import { basename } from 'node:path';
-import type { ChatMessage, DeclaredPricingSnapshot, Finding, Level, ProbeCtx, ProbeOutcome, RunConfig } from '../types.js';
+import type {
+  ChatMessage,
+  ChatResult,
+  DeclaredPricingSnapshot,
+  EvidenceRecord,
+  Finding,
+  Level,
+  ProbeCtx,
+  ProbeOutcome,
+  RunConfig,
+} from '../types.js';
 import { computeCostUsd, type ModelPrice } from '../gateway/pricing.js';
 import { estimateMessageTokens, estimateTokens } from '../tokens.js';
 import { linearRegression, mean } from '../stats.js';
@@ -38,6 +48,16 @@ const FILLER_EN =
 
 /** billing 请求的 max_tokens：completion_tokens 超过该值即为与请求上限矛盾的硬异常。 */
 const BILLING_MAX_TOKENS = 16;
+
+type BillingLanguage = 'en' | 'zh';
+
+/**
+ * 短输出回退提示的固定回复句：部分中转站忽略 max_tokens，收到「逐字复述」指令会复读整段
+ * 输入，生成数千 token 后触发客户端超时（2026-11-01 真机 gpt-6.1-sol 6/10 超时）。
+ * 回退提示只要求固定短句，正文仍随档位增长，保留 prompt 侧回归的输入梯度。
+ */
+const BILLING_SHORT_REPLY_EN = 'Billing audits require measurable and reproducible evidence.';
+const BILLING_SHORT_REPLY_ZH = '计费审计需要可测量且可复现的证据。';
 
 /**
  * 仅形状证据（线性 + 一致性 + 输出侧核验通过，无绝对对账）时的通过分：
@@ -609,49 +629,109 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let contaminatingRetries = 0;
   const contaminatingEvidenceIds: string[] = [];
 
+  /** 单轨道有效样本 / 失败样本：insufficient 归因用，避免只看到总样本数。 */
+  const trackValid: Record<BillingLanguage, number> = { en: 0, zh: 0 };
+  const trackFailures: Record<BillingLanguage, number> = { en: 0, zh: 0 };
+  let shortOutputRequests = 0;
+  const shortOutputFallbackLangs = new Set<BillingLanguage>();
+  const shortOutputSwitchedLangs = new Set<BillingLanguage>();
+
+  interface BillingSample {
+    result: ChatResult;
+    evidence: EvidenceRecord;
+    messages: ChatMessage[];
+    shortOutput: boolean;
+  }
+
+  const recordFailure = (lang: BillingLanguage, targetTokens: number, sample: BillingSample): void => {
+    const suffix = sample.shortOutput ? ' (short-output)' : '';
+    failures.push(`${lang}@${targetTokens}${suffix}: ${sample.result.error ?? 'error'}`);
+    failureErrors.push(sample.result.error ?? 'error');
+    failureEvidenceIds.push(sample.evidence.id);
+    trackFailures[lang] += 1;
+  };
+
+  /** 客户端超时（status=0）：端点可能正按「逐字复述」生成整段输入，换短输出提示重采同一档位。 */
+  const isTimeoutFailure = (result: ChatResult): boolean =>
+    result.status === 0 && /^timeout[：:]/.test(result.error ?? '');
+
+  const performRequest = async (
+    lang: BillingLanguage,
+    targetTokens: number,
+    shortOutput: boolean,
+  ): Promise<BillingSample> => {
+    const body = lang === 'en' ? buildEnglish(targetTokens) : buildChinese(targetTokens);
+    const prompt = buildBillingPrompt(lang, body, ctx.rng.nonce(5), shortOutput);
+    const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
+    const result = await ctx.client.chat({
+      model: ctx.cfg.model,
+      messages,
+      temperature: 0,
+      max_tokens: BILLING_MAX_TOKENS,
+      // 200 空响应仍带 usage：重发只会重复计 prompt 并令实扣倍率 N/A，故不在 client 层重试空正文；
+      // HTTP 5xx/429 等状态错误仍按 --retries 正常重试。
+      retryEmpty: false,
+    });
+    const evidence = recordCall(ctx.evidence, {
+      probe: 'billing',
+      label: `billing ${lang} target=${targetTokens}${shortOutput ? ' (short-output)' : ''}`,
+      request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: BILLING_MAX_TOKENS, messages },
+      result,
+    });
+    requests += 1;
+    // 重试观测（attempts>1，全窗口如实计数）与污染口径（contaminatingRetry，仅「可能已
+    // 计费」的重试：200 空正文 / 408/409/500/502/504 / 超时后重试；429/503 网关拒绝后的
+    // 重试无产出不污染）分开统计。
+    if (result.attempts > 1) {
+      retriedRequests += 1;
+      retryEvidenceIds.push(evidence.id);
+    }
+    if (result.contaminatingRetry === true) {
+      contaminatingRetries += 1;
+      contaminatingEvidenceIds.push(evidence.id);
+    }
+    if (shortOutput) shortOutputRequests += 1;
+    return { result, evidence, messages, shortOutput };
+  };
+
   for (const lang of langs) {
+    let shortOutput = false;
     for (const targetTokens of levels) {
       const track = tracks.find((t) => t.lang === lang) as Track;
-      const nonce = ctx.rng.nonce(5);
-      const body =
-        lang === 'en'
-          ? buildEnglish(targetTokens)
-          : buildChinese(targetTokens);
-      const prompt = `请逐字复述下面这段文本，不要添加任何其他内容。\n\n${body}\n\n（本段校验编号 ${nonce}）`;
-      const messages: ChatMessage[] = [{ role: 'user', content: prompt }];
-      const result = await ctx.client.chat({
-        model: ctx.cfg.model,
-        messages,
-        temperature: 0,
-        max_tokens: BILLING_MAX_TOKENS,
-        // 200 空响应仍带 usage：重发只会重复计 prompt 并令实扣倍率 N/A，故不在 client 层重试空正文；
-        // HTTP 5xx/429 等状态错误仍按 --retries 正常重试。
-        retryEmpty: false,
-      });
-      const evidence = recordCall(ctx.evidence, {
-        probe: 'billing',
-        label: `billing ${lang} target=${targetTokens}`,
-        request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: 16, messages },
-        result,
-      });
-      requests += 1;
-      // 重试观测（attempts>1，全窗口如实计数）与污染口径（contaminatingRetry，仅「可能已
-      // 计费」的重试：200 空正文 / 408/409/500/502/504 / 超时后重试；429/503 网关拒绝后的
-      // 重试无产出不污染）分开统计。
-      if (result.attempts > 1) {
-        retriedRequests += 1;
-        retryEvidenceIds.push(evidence.id);
+      let sample = await performRequest(lang, targetTokens, shortOutput);
+      if (!sample.result.ok && !sample.shortOutput && isTimeoutFailure(sample.result)) {
+        // 首笔超时：原失败如实记录（样本缺口 + 实扣倍率污染），同档位用短输出提示重采一次；
+        // 重采成功则该轨道后续档位沿用短输出，避免再次复读整段输入。
+        recordFailure(lang, targetTokens, sample);
+        shortOutput = true;
+        shortOutputFallbackLangs.add(lang);
+        const fallback = await performRequest(lang, targetTokens, true);
+        if (!fallback.result.ok) {
+          recordFailure(lang, targetTokens, fallback);
+          findings.push({
+            level: 'info',
+            message: `计费请求（${lang}@${targetTokens}）客户端超时后改用短输出提示重采仍失败；已停止 ${lang} 轨道，避免继续等待超时。`,
+            evidenceIds: [fallback.evidence.id],
+          });
+          break;
+        }
+        sample = fallback;
+        findings.push({
+          level: 'info',
+          message:
+            `计费请求（${lang}@${targetTokens}）客户端超时后改用短输出提示重采成功：` +
+            `原请求仍计入样本缺口与实扣倍率污染；后续 ${lang} 档位沿用短输出提示，避免端点忽略 max_tokens 时复读整段输入再次超时。`,
+          evidenceIds: [sample.evidence.id, fallback.evidence.id],
+        });
       }
-      if (result.contaminatingRetry === true) {
-        contaminatingRetries += 1;
-        contaminatingEvidenceIds.push(evidence.id);
-      }
-      if (!result.ok) {
-        failures.push(`${lang}@${targetTokens}: ${result.error ?? 'error'}`);
-        failureErrors.push(result.error ?? 'error');
-        failureEvidenceIds.push(evidence.id);
+      if (!sample.result.ok) {
+        recordFailure(lang, targetTokens, sample);
+        // 短输出提示下仍超时说明不是生成长度问题，停止该轨道而不是重复等满 timeout。
+        if (sample.shortOutput && isTimeoutFailure(sample.result)) break;
         continue;
       }
+      const result = sample.result;
+      const evidence = sample.evidence;
       // 回显模型收集（与 usage 是否可用无关：只要响应成功就检查计价错配线索）
       if (result.model !== null && result.model.trim() !== '') {
         echoModels.push({ model: result.model.trim(), evidenceId: evidence.id });
@@ -691,6 +771,19 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       if (completion > BILLING_MAX_TOKENS) {
         completionOverCap += 1;
         completionAnomalyEvidenceIds.push(evidence.id);
+        if (!sample.shortOutput) {
+          // 端点忽略 max_tokens：保留这笔异常样本作为硬证据，但后续档位改用短输出提示，
+          // 否则生成量随输入档位增长，最终会以客户端超时丢掉整条轨道。
+          shortOutput = true;
+          shortOutputSwitchedLangs.add(lang);
+          findings.push({
+            level: 'info',
+            message:
+              `端点对 ${lang}@${targetTokens} 返回 completion_tokens=${completion} > max_tokens=${BILLING_MAX_TOKENS}（忽略输出上限）；` +
+              `后续 ${lang} 档位改用短输出提示以避免复读整段输入超时；该样本仍计入输出侧硬矛盾。`,
+            evidenceIds: [evidence.id],
+          });
+        }
       }
       // 输出侧灌水比对采集：finish=stop + 非空正文 + completion>0 才计入对（见 completionSums 注释）。
       // 归因口径：reasoning_tokens 是 completion 的子集（真机实证中转对普通复读也常报 1），
@@ -716,7 +809,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
         expectedCost += computeCostUsd(result.usage, price as ModelPrice);
         ratioSamples += 1;
       }
-      const estimated = estimateMessageTokens(messages);
+      const estimated = estimateMessageTokens(sample.messages);
       track.xs.push(estimated);
       track.ys.push(result.usage.prompt_tokens);
       track.raws.push(result.usage.prompt_tokens);
@@ -726,6 +819,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       promptTotal += result.usage.prompt_tokens;
       completionTotal += result.usage.completion_tokens;
       usageValidSamples += 1;
+      trackValid[lang] += 1;
       metrics[`prompt_tokens_${lang}_${targetTokens}`] = result.usage.prompt_tokens;
       refPairs[`${lang}_${targetTokens}`] = result.usage.prompt_tokens;
       // details 明细累计：仅统计通过校验的样本；!= null 判定保证 cached=0 也计数
@@ -779,7 +873,8 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       // 已过作废门只是略噪：不补采（省用户花费），维持现有判定
     } else if (expectedCost < gateFloor) {
       const topupBody = buildEnglish(TOPUP_PROMPT_TOKENS);
-      const topupPrompt = `请逐字复述下面这段文本，不要添加任何其他内容。\n\n${topupBody}\n\n（本段校验编号 ${ctx.rng.nonce(5)}）`;
+      // 补采正文最大档，同样使用短输出提示：端点忽略 max_tokens 时避免复读 48k 正文超时。
+      const topupPrompt = buildBillingPrompt('en', topupBody, ctx.rng.nonce(5), true);
       const topupMessages: ChatMessage[] = [{ role: 'user', content: topupPrompt }];
       const estPrompt = estimateMessageTokens(topupMessages);
       const perReqExpected = computeCostUsd(
@@ -802,7 +897,7 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
           });
           const evidence = recordCall(ctx.evidence, {
             probe: 'billing',
-            label: `billing topup ${topupRequests + 1} target=${TOPUP_PROMPT_TOKENS}`,
+            label: `billing topup ${topupRequests + 1} target=${TOPUP_PROMPT_TOKENS} (short-output)`,
             request: { model: ctx.cfg.model, stream: false, temperature: 0, maxTokens: BILLING_MAX_TOKENS, messages: topupMessages },
             result,
           });
@@ -909,6 +1004,13 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
   metrics['completion_over_cap'] = completionOverCap;
   metrics['retried_requests'] = retriedRequests;
   metrics['contaminating_retries'] = contaminatingRetries;
+  metrics['valid_samples_en'] = trackValid.en;
+  metrics['valid_samples_zh'] = trackValid.zh;
+  metrics['failed_samples_en'] = trackFailures.en;
+  metrics['failed_samples_zh'] = trackFailures.zh;
+  metrics['short_output_requests'] = shortOutputRequests;
+  metrics['short_output_fallback_langs'] = [...shortOutputFallbackLangs].join(',') || null;
+  metrics['short_output_switched_langs'] = [...shortOutputSwitchedLangs].join(',') || null;
 
   const defaultHeadline = 'Token 计数与长度线性关系正常';
   let score = 100;
@@ -1660,7 +1762,12 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
     level = 'fail';
     headline = '多数请求不返回 usage，计费不可核验';
     findings.push({ level: 'fail', message: `全部 ${requests} 次请求中 ${usageMissing} 次缺少 usage 字段。`, evidenceIds: [] });
-  } else if (allResponses.length < 3 || (!regressionRan && !constantUsage)) {
+  } else if (
+    (allResponses.length < 3 || (!regressionRan && !constantUsage)) &&
+    // 输出侧硬矛盾是可直接定性的异常，不能因回归样本不足被 insufficient 吞掉；
+    // 此时按「completion 异常封顶 70」出 warn，样本缺口在 finding 与 metrics 中如实披露。
+    completionZeroWithText + completionOverCap === 0
+  ) {
     // status=insufficient（score=null）：倍率只出独立 finding，不碰 score/status/level
     if (ratioDecision) findings.push(ratioDecision.finding);
     // 归因：失败是主因时说清是谁的问题（端点拒绝/鉴权/网络），不让用户猜
@@ -1676,6 +1783,16 @@ export async function probeBilling(ctx: ProbeCtx): Promise<ProbeOutcome> {
       findings,
       metrics,
     };
+  }
+
+  if (!regressionRan && level !== 'fail' && completionZeroWithText + completionOverCap > 0) {
+    findings.push({
+      level: 'warn',
+      message:
+        `计费 prompt 回归因有效样本不足未运行（en ${trackValid.en} 笔、zh ${trackValid.zh} 笔，单轨需 ≥3）；` +
+        '输出侧存在 completion 硬矛盾，按「completion 异常封顶 70」出分而非 N/A，样本缺口仍计入实扣倍率污染。',
+      evidenceIds: [...completionAnomalyEvidenceIds],
+    });
   }
 
   let ratioHeadlineApplied = false;
@@ -1874,6 +1991,18 @@ function buildEnglish(tokens: number): string {
 function buildChinese(tokens: number): string {
   const unit = '工程实践中必须以测量结果为准绳，而不是依赖直觉或者厂商的自我声明，只有可复现的证据链条才能支撑可靠的结论。';
   return unit.repeat(Math.max(1, Math.ceil(tokens / unit.length)));
+}
+
+/**
+ * 计费请求提示：默认「逐字复述」可放大可见输出、暴露 usage 灌水；端点忽略 max_tokens 时
+ * 该指令会让生成量随输入档位线性增长并超时，故失败/超上限后切换为固定短句回退。
+ */
+function buildBillingPrompt(lang: BillingLanguage, body: string, nonce: string, shortOutput: boolean): string {
+  if (shortOutput) {
+    const reply = lang === 'en' ? BILLING_SHORT_REPLY_EN : BILLING_SHORT_REPLY_ZH;
+    return `请只回复下面这句话，不要复述输入文本，也不要添加任何其他内容：\n${reply}\n\n${body}\n\n（本段校验编号 ${nonce}）`;
+  }
+  return `请逐字复述下面这段文本，不要添加任何其他内容。\n\n${body}\n\n（本段校验编号 ${nonce}）`;
 }
 
 /** 公示价压缩为 baseline/账本快照用的 JSON（名字 → [modelRatio, completionRatio, cacheRatio, modelPrice, quotaType]）。 */

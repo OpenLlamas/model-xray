@@ -7,14 +7,15 @@ export const WEIGHTS: Record<ProbeId, number> = {
   identity: 15,
   context: 15,
   capability: 10,
+  tokenizer: 5,
   // TTFT 仅观测，不参与总分；权重必须为 0，避免未来误接分数时把观测项算进可信度。
   ttft: 0,
   decoy: 0,
 };
 
-export const PROBE_ORDER: readonly ProbeId[] = ['identity', 'context', 'billing', 'capability', 'quality', 'ttft'];
+export const PROBE_ORDER: readonly ProbeId[] = ['identity', 'context', 'billing', 'capability', 'tokenizer', 'quality', 'ttft'];
 
-export const HARD_RED: ReadonlySet<ProbeId> = new Set<ProbeId>(['billing', 'capability', 'context', 'quality']);
+export const HARD_RED: ReadonlySet<ProbeId> = new Set<ProbeId>(['billing', 'capability', 'context', 'quality', 'tokenizer']);
 
 const HARD_RED_CAP = 45;
 
@@ -105,6 +106,9 @@ export function computeTotal(outcomes: readonly ProbeOutcome[], scope: ScoreScop
   // 无总分时也只在有实锤时判 fail，否则一律 unknown（warn 不再作为结论档外露）。
   const hardFail = scores.some((s) => (s.id === 'billing' || s.id === 'identity') && s.level === 'fail');
   const anyWarn = scores.some((s) => s.level === 'warn');
+  // 任一维度被判 fail（如实锤封顶后的 45 分）就不得给出 pass 总评：分数几何聚合后可能仍 >75，
+  // 会出现「分项 FAIL 45 + 总评 pass」的自相矛盾报告。整体档位至少降到 warn。
+  const anyFail = scores.some((s) => s.level === 'fail');
   const inconclusiveLevel: Level = hardFail ? 'fail' : 'unknown';
 
   if (scorable.length < 2) {
@@ -177,7 +181,7 @@ export function computeTotal(outcomes: readonly ProbeOutcome[], scope: ScoreScop
   const rounded = clampScore(total);
   let overall: Level;
   if (hardFail) overall = 'fail';
-  else if (rounded < 75 || anyWarn) overall = 'warn';
+  else if (rounded < 75 || anyWarn || anyFail) overall = 'warn';
   else overall = 'pass';
 
   return { total: rounded, overall, scores, notes };

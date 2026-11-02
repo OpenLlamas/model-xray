@@ -232,6 +232,7 @@ button.armed:hover { border-color: #f0b64d; background: #2c2618; color: #ffe3a8;
         <div class="row"><div><label for="f-seed">随机种子（可选，复测时固定）</label><input id="f-seed" type="text" inputmode="numeric" placeholder="12345"></div><div><label for="f-timeout">单次请求超时（秒）</label><input id="f-timeout" type="text" inputmode="numeric" placeholder="90"></div></div>
         <div class="row"><div><label for="f-http-retries">网关拒绝重试次数（429/5xx，可选）</label><input id="f-http-retries" type="text" inputmode="numeric" placeholder="默认 2，0-6"></div><div></div></div>
         <div class="row"><div><label for="f-out">报告目录</label><input id="f-out" type="text" placeholder="reports"></div><div><label for="f-baseline">对照基线（可选）</label><input id="f-baseline" type="text" placeholder="reports/baseline-xxx.json"></div></div>
+        <div class="row"><div><label for="f-quality-samples">质量题集轮数（1-5，可选）</label><input id="f-quality-samples" type="text" inputmode="numeric" placeholder="例如 3；留空默认 1，增强样本默认 3"></div><div></div></div>
         <div class="checks"><label><input id="f-deep" type="checkbox">增强样本（耗时和费用更高）</label><label><input id="f-dry-run" type="checkbox">仅预演，不发送请求</label></div>
         <button id="btn-run" class="primary" type="button"><span id="run-button-label">开始检测</span> <span aria-hidden="true">→</span></button>
         <div id="run-error" class="error" hidden></div><div id="run-banner" hidden></div>

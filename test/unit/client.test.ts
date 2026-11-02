@@ -879,3 +879,41 @@ test('client: 无 temperature 的请求遇 400 不触发去参路径', async () 
     server.close();
   }
 });
+
+test('client: 流式读取超时中止时保留已收正文与响应头（不当成零产出）', async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'x-request-id': 'abort-rid-1' });
+    res.write(
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '半截回答' }, finish_reason: null }] })}\n\n`,
+    );
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 200, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }], stream: true });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /^timeout：/);
+    assert.equal(result.text, '半截回答', '超时中止前已收的正文必须保留作 partial 证据');
+    assert.equal(result.responseHeaders?.['x-request-id'], 'abort-rid-1', '中断路径同样要带已采集的响应头');
+  } finally {
+    server.closeAllConnections();
+    server.close();
+  }
+});
+
+test('client: 200 error 载荷失败路径保留已采集的响应头', async () => {
+  const server = createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'application/json', 'x-request-id': 'err-rid-9' });
+    res.end(JSON.stringify({ error: { message: 'insufficient quota' } }));
+  });
+  const baseUrl = await listen(server);
+  try {
+    const client = createClient({ baseUrl, apiKey: 'k', timeoutMs: 5000, retries: 0 });
+    const result = await client.chat({ model: 'm', messages: [{ role: 'user', content: 'hi' }] });
+    assert.equal(result.ok, false);
+    assert.match(result.error ?? '', /insufficient quota/);
+    assert.equal(result.responseHeaders?.['x-request-id'], 'err-rid-9');
+  } finally {
+    server.close();
+  }
+});

@@ -32,6 +32,7 @@ test('totalAuditCostNote: 汇总全部带 usage 证据，按录入价估算并�
   assert.match(note, /0\.660（与录入价同单位）/);
   assert.match(note, /输入 1000000 \/ 输出 500000 tokens/);
   assert.match(note, /余额消耗请自行核对/);
+  assert.match(note, /仅统计主端点/, '参考端点的用量与单价不同，费用注记必须明示口径');
 });
 
 test('totalAuditCostNote: 无录入价或无 usage 时不编造费用', () => {

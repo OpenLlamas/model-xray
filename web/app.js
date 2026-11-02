@@ -263,6 +263,11 @@ export function buildCommand(input) {
   if (httpRetriesRaw !== '') parts.push(`--http-retries ${httpRetriesRaw}`);
   if (outRaw !== '') parts.push(`--out ${quote(outRaw)}`);
   if (baselineRaw !== '') parts.push(`--baseline ${quote(baselineRaw)}`);
+  const qualitySamplesRaw = String(input?.qualitySamples ?? '').trim();
+  if (qualitySamplesRaw !== '' && !/^[1-5]$/.test(qualitySamplesRaw)) {
+    return fail(`--quality-samples 必须是 1-5 的整数。收到：${JSON.stringify(qualitySamplesRaw)}。示例：--quality-samples 3`);
+  }
+  if (qualitySamplesRaw !== '') parts.push(`--quality-samples ${qualitySamplesRaw}`);
   if (input?.deep === true) parts.push('--deep');
   if (dryRun) parts.push('--dry-run');
   if (yes) parts.push('--yes');
@@ -271,7 +276,7 @@ export function buildCommand(input) {
 }
 
 // 总评徽标：仅 fail 有结论词（不通过）；pass/warn/unknown 一律只展示分数（无「可疑/通过」档）
-const OVERALL_LABEL = { fail: '不通过' };
+const OVERALL_LABEL = { fail: '不通过', unknown: '未判定' };
 
 function badgeClass(level) {
   return ['pass', 'warn', 'fail', 'unknown'].includes(level) ? level : 'unknown';
@@ -560,7 +565,8 @@ export function renderScorecard(jsonText) {
   ).map((record) => {
     const id = fieldText(record, 'id') ?? '（缺失）';
     const level = fieldText(record, 'level');
-    const levelLabel = level ?? '缺失';
+    // 与 Markdown/HTML 的 statusTag 同源：unknown 显示 N/A，不把内部档位名当结论词展示。
+    const levelLabel = level === 'unknown' ? 'N/A' : (level ?? '缺失');
     // 实锤封顶同源：fail 档位行无论来自 scores（已封顶，幂等）还是未覆盖的 outcomes 原始分，
     // 一律执行封顶——「定罪维度不保留及格分」不依赖 scores 覆盖完整。
     const raw = record?.score;
@@ -971,6 +977,7 @@ if (typeof document !== 'undefined') {
       httpRetries: inputValue('f-http-retries'),
       out: inputValue('f-out'),
       baseline: inputValue('f-baseline'),
+      qualitySamples: inputValue('f-quality-samples'),
       deep: checkedValue('f-deep'),
       dryRun: checkedValue('f-dry-run'),
     };
@@ -989,7 +996,7 @@ if (typeof document !== 'undefined') {
     'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
     'f-price-cached-read', 'f-price-threshold', 'f-price-input2', 'f-price-output2', 'f-price-cached-read2',
     'f-expect-model-ratio', 'f-expect-completion-ratio', 'f-quota-per-usd', 'f-declared-price-page',
-    'f-seed', 'f-timeout', 'f-http-retries', 'f-out', 'f-baseline',
+    'f-seed', 'f-timeout', 'f-http-retries', 'f-out', 'f-baseline', 'f-quality-samples',
   ]) {
     byId(id)?.addEventListener('input', updateCommandPreview);
   }

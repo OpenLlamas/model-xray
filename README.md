@@ -89,9 +89,10 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 维度 | 权重 | 查什么 |
 |---|---|---|
 | 计费 Billing | 25 | 端点自报 token 的线性 / 一致性 / 输出侧核对 + 价格核对（默认比较「录入价 ÷ 当前公示价」，一致=1×；列表价折扣另列；guard / 余额模式做实测扣费对账） |
-| 质量 Quality | 25 | 版本化固定题集，pass@1 首答正确率对照参考答案（降智检测） |
+| 质量 Quality | 25 | 版本化程序化题集，pass@1 首答正确率对照参考答案（降智检测）；默认 12 题一轮，可用 `--quality-samples 1~5`（`--deep` 默认 3 轮）扩样缩窄置信区间 |
 | 身份 Identity | 15 | 自我身份问答 + 行为指纹：换标签、换护栏、换变体都逃不过 |
 | 上下文 Context | 15 | 按标称深度埋 needle，验证窗口真实、usage 校准可信 |
+| Tokenizer 指纹 | 5 | 可选参考端点：7 类固定语料对比输入 token 增量向量，识别不同 tokenizer / 模型族；不单独证明身份 |
 | 能力 Capability | 10 | 宣称的 vision / tool / thinking 逐项实测，而不只看宣称 |
 | 时延 TTFT | 仅观测 | 流式首字延迟 p50/p95，不计入总分 |
 
@@ -99,8 +100,9 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 
 - 判定 = 退出码：**完成（只给分数）**（0）· **不通过**（1）· **用法错误 / 未得出结论**（2）。不设「可疑」结论档。
 - 证据不足的维度标 `N/A` 并排除计分——绝不按 0 分算。
-- **不通过仅由两类实锤触发**：计费维度 fail（倍率/计量造假、乱收费）或身份维度 fail（明显换壳：自述族矛盾、基线指纹漂移）。其余情况的结论就是分数本身：「可信度总分 X/100」+ 分项分数。计费 / 能力 / 上下文 / 质量低于 40 触发**硬红线**（总分封顶 45）；能力被证伪封顶 60——都只压分数。
-- **实锤不保留及格分**：定罪维度（fail）的分项分一律封顶 45；计费/身份实锤时可信度总分同样封顶 45——「不通过」结论不得配上及格区分数。
+- **不通过仅由两类实锤触发**：计费维度 fail（倍率/计量造假、乱收费）或身份维度 fail（明显换壳：自述族矛盾、基线指纹漂移）。其余情况的结论就是分数本身：「可信度总分 X/100」+ 分项分数。计费 / 能力 / 上下文 / 质量 / tokenizer 指纹低于 40 触发**硬红线**（总分封顶 45）；能力被证伪封顶 60——都只压分数。
+- **参考差分是可选增强**：配置可信的同模型参考端点后，质量探针会同题集逐样本做首答配对比较；主端点比参考少对 ≥3 题且相对差距 ≥25%、且配对分歧通过 McNemar 精确检验（单侧 p ≤ 0.15）才升级为系统性差分。参考正确率 ≥90%、主端点 <60% 且 p ≤ 0.05 时质量封顶 45，其余系统性差距封顶 70；反向分歧会抬高 p 值、阻假定罪；单题差异只披露。tokenizer 探针另外比较 7 类固定语料的输入 token 增量向量，至少 5 类可比才给出分数。
+- **实锤不保留及格分**：定罪维度（fail）的分项分一律封顶 45；计费/身份实锤时可信度总分同样封顶 45——「不通过」结论不得配上及格区分数。任一维度被判 fail（非仅计费/身份）时，总评不得为 pass，至少降为 warn（避免「分项 FAIL 45 + 总评 pass」自相矛盾）。
 - **计费默认是「形状体检」**：形状检查全过但没做绝对对账时给 **85 分 + 明确披露**（全量等比缩放、虚高扣费无法靠形状排除）；绝对对账成立才 100 分，有矛盾证据直接 fail。
 - **价格下调不扣分**：`--baseline` / 本地价格账本检出显著变化时，只有上调或口径断裂才降档；明确下调视为更划算，只在 findings 披露。
 - **0.3× 不是计费倍率**：报告里的「列表价折扣」= 站内公示价 ÷ 原价；「价格核对」才是你录入的价 ÷ 当前官方公示价，两者一致时为 **1×**。
@@ -112,8 +114,9 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 
 | 维度 | 实测方法（简化） |
 |---|---|
-| 身份 | 问「你是谁 / 什么版本」+ 多轮行为指纹；自述的模型、族系、变体后缀与请求名对不上即报警——专抓换壳、轻量版冒充、换护栏。 |
-| 质量 | 跑一套版本化固定题集，用 pass@1 首答正确率对照参考答案；复采样只作证据，避免一次偶发失手就冤枉人。 |
+| 身份 | 问「你是谁 / 什么版本」+ 多轮行为指纹；自述的模型、族系、变体后缀与请求名对不上即报警——专抓换壳、轻量版冒充、换护栏。配置参考端点后，质量与 tokenizer 差分也作为身份旁证；响应中的 `responseId` / `systemFingerprint` / 白名单响应头 / `logprobs`（仅透传上游返回，本工具不主动请求）只作协议元数据旁证，不单独定罪。 |
+| 质量 | 跑一套版本化程序化题集，用 pass@1 首答正确率对照参考答案；复采样只作证据，避免一次偶发失手就冤枉人。每轮 12 道主题 + 3 道控制题，`--quality-samples`（或 `--deep` 默认 3 轮）可扩样，报告附 95% 置信区间与证据强度（low / medium / high）。配置可信的同模型参考端点后，逐样本做首答配对 + McNemar 显著性检验，只有统计显著的系统性差分才降档。 |
+| Tokenizer 指纹 | 可选参考端点：7 类固定语料分别请求主/参考端点，比较输入 token 增量向量；至少 5 类可比才评分，多类别一致偏离才判 tokenizer / 模型族差异。 |
 | 上下文 | 在标称窗口的深处埋「针」并要求原样找回；同时核对端点自报的 `prompt_tokens` 与实际发送量，防止「号称 128K、实际 32K」。 |
 | 计费 | 对端点自报 token 计数做线性回归与硬矛盾检查（非空正文报 0、total 对不上等）；默认核对「录入价 ÷ 当前公示价」（一致=1×），列表价折扣只披露；余额/guard 模式下再用「实际扣费 ÷（录入价 × 自报 usage）」实测真实倍率。 |
 | 能力 | 宣称支持视觉 / 工具调用 / 推理，就真的发对应请求逐项验收，不看参数表。 |
@@ -132,7 +135,17 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 标称价格（每百万 tokens） | `--price-input 0.2 --price-output 0.7`（启用计费探针） |
 | 你所在分组的公示倍率 | `--expect-model-ratio 1.5 --expect-completion-ratio 4`（偏差 > 5% 判计费失败） |
 | 站点没有 `/api/pricing` | `--declared-price-page /pricing`（同源价格页，仅 warn 参照） |
+| 有可信的同模型参考端点 | `--reference-base-url <url> --reference-api-key <key> [--reference-model <model>]`（启用质量差分与 tokenizer 指纹；仅 CLI） |
 | 想先看请求量和花费 | `--dry-run`（不发任何请求） |
+| 想让质量结论更稳 | `--quality-samples 3`（Web 控制台也提供同一表单项；`--deep` 默认 3 轮） |
+
+```powershell
+$env:MODEL_XRAY_REFERENCE_KEY = 'sk-reference-key'
+model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes `
+  --reference-base-url https://api.openai.com/v1 --reference-model gpt-4o
+```
+
+参考模型默认与主模型相同；完整参考配置会把基准从 63 calls / 240600 input tokens 增加到 89 calls / 252600 input tokens（+26 calls；基准为默认 `--expect vision,tool`，`--expect none` 时是 58/84）。参考端点与密钥仅用于对照请求，功能目前仅 CLI 提供，WebUI 尚未接入该表单。
 
 **复测 / 抓偷换**：保留首轮生成的 `reports/baseline-<模型名>-<时间>.json`，复测时加 `--baseline <该文件>` 对比指纹。
 
@@ -242,17 +255,18 @@ The score is a weighted geometric credibility total (0–100); every dimension i
 | Dimension | Weight | Verifies |
 |---|---|---|
 | Billing | 25 | endpoint-reported token shape (linearity / consistency / output side) + rate comparison (default: price ratio from public vs list price; guard / balance mode: measured spend delta) |
-| Quality | 25 | versioned fixed question bank, pass@1 accuracy against reference answers |
-| Identity | 15 | self-ID questions + behavioral fingerprints — catches relabeled / guardrail-swapped / variant-swapped models |
+| Quality | 25 | versioned programmatic question bank, pass@1 accuracy; default round is 12 main + 3 control questions, expandable to 5 rounds via `--quality-samples` (`--deep` defaults to 3) to tighten the confidence interval |
+| Identity | 15 | self-ID questions + behavioral fingerprints, corroborated by quality/tokenizer differentials and response metadata (`responseId`, `systemFingerprint`, allowlisted headers, `logprobs` — only when the upstream returns it; the tool never requests it) — metadata never convicts alone |
 | Context | 15 | needle test at claimed depth; usage-calibration cross-check |
+| Tokenizer | 5 | optional reference endpoint: compares input-token increments across 7 fixed corpora; at least 5 comparable corpora are required |
 | Capability | 10 | advertised vision / tool / thinking actually exercised |
 | TTFT | observation only | streaming first-token latency p50/p95, never scored |
 
 **How to read the result:**
 
-- Verdict = exit code: **pass** (0) · **warn** (0) · **fail** (1) · **usage error / inconclusive** (2).
+- Verdict / exit code: **completed, score-only** (0) · **fail** (1) · **usage error / inconclusive** (2). There is no middle suspicious verdict.
 - Dimensions without sufficient evidence are marked `N/A` and excluded — never counted as 0.
-- Any dimension fail or total < 40 → fail; billing / capability / context / quality below 40 hits a hard red line (total capped at 45); falsified capability caps at 60; total < 75 or any warn → suspicious.
+- Overall **fail** is triggered only by a billing- or identity-dimension `fail`; every other dimension affects the score, and any dimension at `fail` keeps the overall verdict out of `pass` (it degrades to `warn`). Billing / capability / context / quality / tokenizer below 40 hits a hard red line (total capped at 45); falsified capability caps at 60.
 - **Billing is shape-only by default:** all shape checks passing without absolute reconciliation passes at **85 with explicit disclosure** (uniform rescaling and inflated charges cannot be excluded by shape alone); absolute reconciliation passing raises it to 100.
 - **Price cuts are not penalized:** when `--baseline` or the local price ledger detects a significant change, only an increase or a basis break lowers the score; an explicit decrease is disclosed as cheaper and does not cap the score.
 - **Run 2–3 times before concluding.** Transient endpoint anomalies (empty bodies, 429/503, network hiccups) skew single runs; fix `--seed` and pair `--baseline` / `--baseline-out` to keep the probeset comparable.
@@ -263,8 +277,9 @@ In one sentence: **it behaves like a real user and measures differences — in b
 
 | Dimension | Probe (simplified) |
 |---|---|
-| Identity | Asks "who are you / which version" plus behavioral fingerprints; a self-reported model, family, or variant suffix that doesn't match the requested id raises an alert — catches relabeling, lighter siblings, guardrail swaps. |
-| Quality | Runs a versioned fixed question bank and scores pass@1 against reference answers; the resample is evidence only, so one unlucky first answer doesn't convict a station. |
+| Identity | Asks "who are you / which version" plus behavioral fingerprints; a self-reported model, family, or variant suffix that doesn't match the requested id raises an alert — catches relabeling, lighter siblings, guardrail swaps. Reference differentials and response metadata are corroborating evidence only. |
+| Quality | Runs a versioned programmatic question bank and scores pass@1 against reference answers; each round has 12 main + 3 control questions, and `--quality-samples` (or `--deep` defaulting to 3 rounds) aggregates rounds with a reported 95% CI plus an evidence-strength label. With a trusted same-model reference endpoint it pairs first answers per sample and gates the systematic verdict on an exact McNemar test. The resample is evidence only, so one unlucky first answer doesn't convict a station. |
+| Tokenizer | Sends 7 fixed corpora to the main and reference endpoints and compares input-token increment vectors; at least 5 comparable corpora are required. Consistent deviation across categories indicates a tokenizer / model-family mismatch. |
 | Context | Hides a needle at the claimed depth and asks for it back; cross-checks endpoint-reported `prompt_tokens` against what was actually sent — catches "claims 128K, serves 32K". |
 | Billing | Runs a within-run linearity regression and hard-contradiction checks on self-reported tokens; by default compares public vs list price for a price ratio, and in balance/guard mode measures the real multiplier as spend ÷ (claimed price × reported usage). |
 | Capability | Actually exercises advertised vision / tool calling / thinking instead of reading the spec sheet. |
@@ -275,6 +290,14 @@ Thresholds, question banks, and needles are versioned so reports stay reproducib
 ### 5. Advanced usage
 
 Know the station's claims? Add `--claimed-context 128000`, `--expect vision,tool,thinking`, `--price-input 0.2 --price-output 0.7`, `--expect-model-ratio 1.5 --expect-completion-ratio 4`, `--declared-price-page /pricing`; preview with `--dry-run`.
+
+**Reference-endpoint differential (CLI-only):** if you have a trusted endpoint for the same model, add `--reference-base-url`, `--reference-api-key` (or `MODEL_XRAY_REFERENCE_KEY`), and optionally `--reference-model` (defaults to the audited model). This enables first-answer quality pairing and the tokenizer fingerprint. A fully configured reference run increases the baseline plan (default `--expect vision,tool`) from 63 calls / 240,600 input tokens to 89 calls / 252,600 input tokens (`--expect none`: 58 → 84); the quality-pairing portion scales with the question-bank rounds (12 calls + 12,000 input tokens per round), the tokenizer side stays 14 calls. `--deep` also raises the quality bank to 3 rounds (15 calls + up to 12 resample calls per round). WebUI does not expose these fields yet.
+
+```powershell
+$env:MODEL_XRAY_REFERENCE_KEY = 'sk-reference-key'
+model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --yes `
+  --reference-base-url https://api.openai.com/v1 --reference-model gpt-4o
+```
 
 **Re-audit / catch a silent swap:** keep the `baseline-<model>-<timestamp>.json` from the first run and pass `--baseline reports/baseline-....json`.
 

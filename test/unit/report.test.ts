@@ -45,6 +45,7 @@ function sampleReport(textPreview: string): AuditReport {
       {
         id: 'ev-001',
         probe: 'identity',
+        endpoint: 'main',
         label: 'probe',
         request: {
           model: 'gpt-4o',

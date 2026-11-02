@@ -85,6 +85,7 @@ export async function chatWithBlankFallback(
   const first = await ctx.client.chat(input.request);
   const firstEvidence = recordCall(ctx.evidence, {
     probe: input.probe,
+    endpoint: ctx.endpoint ?? 'main',
     label: input.label,
     request: evidenceRequestOf(input.request),
     result: first,
@@ -106,6 +107,7 @@ export async function chatWithBlankFallback(
   const fallback = await ctx.client.chat(fallbackRequest);
   const fallbackEvidence = recordCall(ctx.evidence, {
     probe: input.probe,
+    endpoint: ctx.endpoint ?? 'main',
     label: `${input.label} (stream-retry@${input.streamBudget})`,
     request: evidenceRequestOf(fallbackRequest),
     result: fallback,

@@ -2,7 +2,7 @@ import type { TokenReference } from './token-reference.js';
 import type { DeclaredPricing, PricingSource, QuotaPerUnitSource } from './pricing.js';
 import type { PricingLedgerEntry, PricingLedgerWriteResult } from './pricing-ledger.js';
 
-export type ProbeId = 'identity' | 'context' | 'billing' | 'capability' | 'quality' | 'ttft' | 'decoy';
+export type ProbeId = 'identity' | 'context' | 'billing' | 'capability' | 'quality' | 'tokenizer' | 'ttft' | 'decoy';
 
 export type ProbeStatus = 'ok' | 'insufficient' | 'error';
 
@@ -92,6 +92,14 @@ export interface ChatRequest {
   stream?: boolean;
   temperature?: number;
   max_tokens?: number;
+  response_format?: {
+    type: 'text' | 'json_object' | 'json_schema';
+    [key: string]: unknown;
+  };
+  seed?: number;
+  n?: number;
+  logprobs?: boolean;
+  top_logprobs?: number;
   tools?: ToolDef[];
   tool_choice?: 'auto' | 'none' | { type: 'function'; function: { name: string } };
   /**
@@ -109,6 +117,14 @@ export interface ChatResult {
   finishReason: string | null;
   /** 上游回显的 model 字段（缺失为 null）：与请求模型不一致 = 换壳/换通道的直接线索 */
   model: string | null;
+  /** OpenAI-compatible response id (auxiliary fingerprint evidence, never decisive by itself). */
+  responseId?: string | null;
+  /** Upstream system_fingerprint (auxiliary fingerprint evidence, never decisive by itself). */
+  systemFingerprint?: string | null;
+  /** Whitelisted, non-sensitive response headers used as protocol evidence. */
+  responseHeaders?: Record<string, string>;
+  /** Raw logprobs payload when explicitly requested; kept opaque for evidence. */
+  logprobs?: unknown | null;
   text: string;
   reasoning: string | null;
   usage: Usage | null;
@@ -218,6 +234,10 @@ export interface EvidenceResponse {
   status: number;
   /** 上游回显的 model 字段（缺失为 null），identity 维度据此核对请求/回显是否一致 */
   model: string | null;
+  responseId?: string | null;
+  systemFingerprint?: string | null;
+  responseHeaders?: Record<string, string>;
+  logprobs?: unknown | null;
   textPreview: string;
   textChars: number;
   usage: Usage | null;
@@ -236,9 +256,13 @@ export interface EvidenceResponse {
   rawChars: number;
 }
 
+/** 证据来源端点：reference=参考端点（仅 tokenizer/quality 差分用），不参与主端点汇总、失败归因与费用估算。 */
+export type EvidenceEndpoint = 'main' | 'reference';
+
 export interface EvidenceRecord {
   id: string;
   probe: ProbeId;
+  endpoint: EvidenceEndpoint;
   label: string;
   request: EvidenceRequest;
   response: EvidenceResponse;
@@ -258,6 +282,10 @@ export interface RunConfig {
   baseUrl: string;
   apiKey: string;
   model: string;
+  /** Optional same-model reference endpoint used for differential fingerprinting. */
+  referenceBaseUrl?: string | null;
+  referenceApiKey?: string | null;
+  referenceModel?: string | null;
   claimedContext: number | null;
   expect: string[];
   deep: boolean;
@@ -265,6 +293,8 @@ export interface RunConfig {
   contextSamples?: number;
   /** context 确认性复采每档样本数（仅 contextSamples>=3 的标准档使用；缺省 2，--deep 3）。 */
   contextConfirmSamples?: number;
+  /** quality 程序化题集轮数（每轮 12 主问题 + 3 控制题，多轮聚合 pass@1）：[1,5]，缺省 1；--deep 缺省 3。 */
+  qualitySamples?: number;
   /** context 软预算上限（与 --price-input/--price-output 同单位，按「估算输入×输入价+输出预算×输出价」逐请求预扣）；超限停发，须与价格成对提供。 */
   contextBudgetUsd?: number;
   /** billing 目标长度档位（内部/测试用；缺省标准 5 档、--deep 6 档）。 */
@@ -319,6 +349,11 @@ export interface Rng {
 
 export interface ProbeCtx {
   client: OpenAIClient;
+  /** Optional independent client for the reference endpoint (never shares retry budget). */
+  referenceClient?: OpenAIClient | null;
+  referenceModel?: string | null;
+  /** 该 ctx 的请求打到哪个端点：缺省 main；quality 的参考差分 ctx 置 reference，证据据此与主端点分开汇总。 */
+  endpoint?: EvidenceEndpoint;
   cfg: RunConfig;
   rng: Rng;
   evidence: EvidenceRecorder;
@@ -367,6 +402,8 @@ export interface AuditReport {
     assetsVersion: string;
     model: string;
     baseUrl: string;
+    referenceBaseUrl?: string | null;
+    referenceModel?: string | null;
     seed: number;
     startedAt: string;
     durationMs: number;

@@ -1,4 +1,4 @@
-import type { ChatResult, EvidenceRecord, EvidenceRecorder, ProbeId } from './types.js';
+import type { ChatResult, EvidenceEndpoint, EvidenceRecord, EvidenceRecorder, ProbeId } from './types.js';
 
 export function createEvidenceRecorder(): EvidenceRecorder {
   const records: EvidenceRecord[] = [];
@@ -29,6 +29,8 @@ export function createEvidenceRecorder(): EvidenceRecorder {
 export interface EvidenceInput {
   probe: ProbeId;
   label: string;
+  /** 缺省 main；参考端点请求必须显式标 reference，否则会被计入主端点汇总/费用估算。 */
+  endpoint?: EvidenceEndpoint;
   request: {
     model: string;
     stream: boolean;
@@ -50,6 +52,7 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
   const totalChars = request.messages.reduce((acc, message) => acc + renderContent(message.content).length, 0);
   return recorder.record({
     probe: input.probe,
+    endpoint: input.endpoint ?? 'main',
     label: input.label,
     request: {
       model: request.model,
@@ -65,6 +68,10 @@ export function recordCall(recorder: EvidenceRecorder, input: EvidenceInput): Ev
     response: {
       status: result.status,
       model: result.model,
+      responseId: result.responseId ?? null,
+      systemFingerprint: result.systemFingerprint ?? null,
+      responseHeaders: result.responseHeaders ?? {},
+      logprobs: result.logprobs ?? null,
       textPreview: truncate(result.text, PREVIEW_CHARS),
       textChars: result.text.length,
       usage: result.usage,

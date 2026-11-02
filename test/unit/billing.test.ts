@@ -380,6 +380,18 @@ function errorResult(): ChatResult {
   };
 }
 
+function timeoutResult(): ChatResult {
+  return {
+    ...errorResult(),
+    status: 0,
+    error: 'timeout：1000ms 超时（含流式总时长）',
+  };
+}
+
+function requestText(req: ChatRequest): string {
+  return req.messages.map((m) => (typeof m.content === 'string' ? m.content : '')).join('');
+}
+
 function billingCtx(client: OpenAIClient): ProbeCtx {
   const cfg: RunConfig = {
     baseUrl: 'http://127.0.0.1:0/v1',
@@ -465,6 +477,73 @@ test('probeBilling: 仅一条轨道 ≥3 个有效样本 → insufficient（不�
   // 新口径：失败是样本不足主因时，标题带主导错误归因（3/10 笔失败）
   assert.match(outcome.headline, /有效样本不足/);
   assert.match(outcome.headline, /其他错误（3\/10 笔）：/);
+});
+
+test('probeBilling: 首笔客户端超时 → 同档短输出回退并补齐样本，不再 insufficient', async () => {
+  const { client, requests } = billingClient((track, index) => {
+    if (track === 'en' && index === 0) return timeoutResult();
+    const req = requests[requests.length - 1]!;
+    return usageResult(estimateMessageTokens(req.messages));
+  });
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 70);
+  assert.equal(outcome.level, 'warn');
+  assert.match(outcome.headline, /部分计费探针请求失败（1 笔）/);
+  assert.equal(outcome.metrics['valid_samples_en'], 5);
+  assert.equal(outcome.metrics['valid_samples_zh'], 5);
+  assert.equal(outcome.metrics['failed_samples_en'], 1);
+  assert.equal(outcome.metrics['failed_samples_zh'], 0);
+  assert.equal(outcome.metrics['short_output_requests'], 5);
+  assert.equal(outcome.metrics['short_output_fallback_langs'], 'en');
+  assert.equal(outcome.metrics['requests'], 11);
+  const enReqs = requests.filter((r) => requestText(r).includes('quick brown fox'));
+  assert.equal(enReqs.length, 6);
+  assert.doesNotMatch(requestText(enReqs[0]!), /只回复/);
+  assert.match(requestText(enReqs[1]!), /只回复/);
+  assert.ok(enReqs.slice(1).every((r) => /只回复/.test(requestText(r))), '超时后同档及后续档位都使用短输出提示');
+  assert.ok(outcome.findings.some((f) => /短输出提示重采成功/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('probeBilling: completion 超上限 → 保留异常样本但后续档位切短输出（避免整轨超时）', async () => {
+  const { client, requests } = billingClient((track, index) => {
+    const req = requests[requests.length - 1]!;
+    const prompt = estimateMessageTokens(req.messages);
+    return usageResult(prompt, track === 'en' && index === 0 ? 99 : 16);
+  });
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 70);
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.metrics['completion_over_cap'], 1);
+  assert.equal(outcome.metrics['short_output_requests'], 4);
+  assert.equal(outcome.metrics['short_output_switched_langs'], 'en');
+  const enReqs = requests.filter((r) => requestText(r).includes('quick brown fox'));
+  assert.equal(enReqs.length, 5);
+  assert.doesNotMatch(requestText(enReqs[0]!), /只回复/);
+  assert.ok(enReqs.slice(1).every((r) => /只回复/.test(requestText(r))), '超上限后的后续档位使用短输出提示');
+  assert.match(outcome.headline, /completion_tokens/);
+  assert.ok(outcome.findings.some((f) => /忽略输出上限/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('probeBilling: 单轨全超时但另一轨有 completion 硬矛盾 → warn 70 出分（不被 insufficient 吞掉）', async () => {
+  const { client, requests } = billingClient((track, index) => {
+    if (track === 'en') return timeoutResult();
+    const req = requests[requests.length - 1]!;
+    return usageResult(estimateMessageTokens(req.messages), index === 0 ? 99 : 16);
+  });
+  const outcome = await probeBilling(billingCtx(client));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.score, 70);
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.metrics['valid_samples_en'], 0);
+  assert.equal(outcome.metrics['valid_samples_zh'], 5);
+  assert.equal(outcome.metrics['failed_samples_en'], 2);
+  assert.equal(outcome.metrics['completion_over_cap'], 1);
+  assert.match(outcome.headline, /completion_tokens/);
+  assert.ok(!outcome.headline.includes('有效样本不足'), outcome.headline);
+  assert.ok(outcome.findings.some((f) => /回归因有效样本不足未运行/.test(f.message)), JSON.stringify(outcome.findings));
+  assert.ok(outcome.findings.some((f) => /输出侧计费异常/.test(f.message)));
 });
 
 test('probeBilling: non-positive english slope → zh_en_slope_ratio is N/A (no astronomical fake ratio)', async () => {

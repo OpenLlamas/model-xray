@@ -35,6 +35,9 @@ test Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
   --key <key>               API key (or env MODEL_XRAY_KEY / OPENAI_API_KEY)
   --model <model>           Model name to audit, e.g. gpt-4o
+  --reference-base-url <url>  Optional reference endpoint used as a same-model differential control
+  --reference-api-key <key>   Reference endpoint API key (or env MODEL_XRAY_REFERENCE_KEY)
+  --reference-model <model>   Reference model name (default: same as --model)
   --claimed-context <n>     Advertised context window in tokens, integer in [1000, 100000000] (enables context probe)
   --expect <list>           Claimed capabilities, comma-separated from: vision,tool,thinking (or "none"; default: vision,tool)
   --price-input <n>         Claimed input price per 1M tokens, must be > 0 (with --price-output, enables price-based billing check)
@@ -62,6 +65,9 @@ test Options:
   --deep                    More samples (slower, more tokens)
   --context-samples <n>     Context needle samples per depth, integer in [1, 5] (default: 1; --deep: 5;
                             3 = statistical mode with confirmation resampling; higher = more confidence/cost)
+  --quality-samples <n>     Quality question-bank rounds, integer in [1, 5] (default: 1; --deep: 3).
+                            Each round adds 12 main + 3 control questions; more rounds = tighter
+                            confidence interval and stronger evidence (more calls)
   --context-budget-usd <n>  Context probe spend cap in the same unit as --price-input/--price-output (must be > 0, finite;
                             requires both price flags). Soft cap: pre-charges an estimate (input tokens × input price
                             + full output budget × output price) per request and stops sending once exceeded.
@@ -110,8 +116,12 @@ async function main(argv: string[]): Promise<number> {
         'base-url': { type: 'string' },
         key: { type: 'string' },
         model: { type: 'string' },
+        'reference-base-url': { type: 'string' },
+        'reference-api-key': { type: 'string' },
+        'reference-model': { type: 'string' },
         'claimed-context': { type: 'string' },
         'context-samples': { type: 'string' },
+        'quality-samples': { type: 'string' },
         'context-budget-usd': { type: 'string' },
         expect: { type: 'string' },
         'price-input': { type: 'string' },
@@ -188,6 +198,38 @@ async function main(argv: string[]): Promise<number> {
     return 2;
   }
 
+  const referenceBaseUrl = values['reference-base-url'] ?? '';
+  const referenceApiKey =
+    values['reference-api-key'] ?? process.env['MODEL_XRAY_REFERENCE_KEY'] ?? '';
+  const referenceModelRaw = values['reference-model'];
+  const referenceOnlyFlags =
+    values['reference-api-key'] !== undefined || referenceModelRaw !== undefined;
+  if (referenceBaseUrl === '') {
+    if (values['reference-base-url'] !== undefined || referenceOnlyFlags) {
+      console.error('--reference-base-url 不能为空；参考端点的 key/model 必须与 URL 成组出现。');
+      console.error('示例：--reference-base-url https://api.openai.com/v1 --reference-api-key sk-xxx --reference-model gpt-4o');
+      return 2;
+    }
+  } else {
+    try {
+      new URL(referenceBaseUrl);
+    } catch {
+      console.error(`--reference-base-url 不是合法 URL：${redactUrl(referenceBaseUrl)}`);
+      console.error('示例：--reference-base-url https://api.openai.com/v1（通常以 /v1 结尾）');
+      return 2;
+    }
+    if (!referenceApiKey && !values['dry-run']) {
+      console.error('缺少参考端点 API key：--reference-api-key 或环境变量 MODEL_XRAY_REFERENCE_KEY。');
+      console.error('示例：--reference-api-key sk-xxx');
+      return 2;
+    }
+  }
+  const referenceModel = (referenceModelRaw ?? model).trim();
+  if (referenceBaseUrl !== '' && referenceModel === '') {
+    console.error('--reference-model 不能为空字符串。');
+    return 2;
+  }
+
   let claimedContext: number | null = null;
   if (values['claimed-context'] !== undefined) {
     claimedContext = strictInt(values['claimed-context'], 1000, 100000000, 'claimed-context', '32000');
@@ -199,6 +241,13 @@ async function main(argv: string[]): Promise<number> {
     const parsed = strictInt(values['context-samples'], 1, 5, 'context-samples', '1');
     if (parsed === null) return 2;
     contextSamples = parsed;
+  }
+
+  let qualitySamples: number | undefined;
+  if (values['quality-samples'] !== undefined) {
+    const parsedQuality = strictInt(values['quality-samples'], 1, 5, 'quality-samples', '3');
+    if (parsedQuality === null) return 2;
+    qualitySamples = parsedQuality;
   }
 
   const expectAllowed = ['vision', 'tool', 'thinking'] as const;
@@ -365,10 +414,14 @@ async function main(argv: string[]): Promise<number> {
     baseUrl,
     apiKey,
     model,
+    referenceBaseUrl: referenceBaseUrl === '' ? null : referenceBaseUrl,
+    referenceApiKey: referenceBaseUrl === '' ? null : referenceApiKey || null,
+    referenceModel: referenceBaseUrl === '' ? null : referenceModel,
     claimedContext,
     expect,
     deep: values.deep === true,
     contextSamples,
+    qualitySamples,
     contextBudgetUsd,
     seed,
     timeoutMs: timeoutSeconds * 1000,
@@ -409,13 +462,16 @@ async function main(argv: string[]): Promise<number> {
     return 0;
   }
 
-  if (!isLocalEndpoint(baseUrl) && !cfg.yes) {
+  const hasRemoteEndpoint =
+    !isLocalEndpoint(baseUrl) ||
+    (referenceBaseUrl !== '' && !isLocalEndpoint(referenceBaseUrl));
+  if (hasRemoteEndpoint && !cfg.yes) {
     if (!process.stdin.isTTY) {
       console.error('远程端点需确认成本。下一步：加 --yes 跳过确认，或先跑 --dry-run 查看预估。');
       return 2;
     }
     const confirmed = await confirm(
-      `将对远程端点发起真实请求（预估 ~${cost.inputTokens.toLocaleString('en-US')} tokens 输入）。继续？[y/N] `,
+      `将对远程端点发起真实请求（含参考端点差分；预估 ~${cost.inputTokens.toLocaleString('en-US')} tokens 输入）。继续？[y/N] `,
     );
     if (!confirmed) {
       console.error('已取消。下一步：确认成本后重跑，加 --yes 可跳过确认；先 --dry-run 可预览请求量。');
@@ -514,6 +570,11 @@ export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: numb
   const billingLevels = cfg.billingLevels ?? (cfg.deep ? [2000, 4000, 8000, 16000, 24000, 32000] : [2000, 4000, 8000, 16000, 24000]);
   const billingCalls = 2 * billingLevels.length;
   const billingInputTokens = Math.round(2 * billingLevels.reduce((sum, n) => sum + n, 0) * 1.1);
+  const referenceConfigured = Boolean(cfg.referenceBaseUrl && cfg.referenceModel);
+  // quality 题集轮数：缺省 1 轮，--deep 3 轮，显式 --quality-samples 优先（每轮 15 题 + 至多 12 发复采样）。
+  const qualityRounds = cfg.qualitySamples ?? (cfg.deep ? 3 : 1);
+  // Reference differential: quality 每轮 12 道主题 + tokenizer 7 corpora x 2 sides（tokenizer 不随轮数扩）。
+  const referenceCalls = referenceConfigured ? 14 + 12 * qualityRounds : 0;
   const calls =
     contextCalls +
     billingCalls +
@@ -521,11 +582,17 @@ export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: numb
     (cfg.deep ? 10 : 7) +
     (cfg.expect.includes('vision') ? 3 : 0) +
     (cfg.expect.includes('tool') ? 2 : 0) +
-    15 + // quality 题集（与模式无关，恒 15 题）
-    // quality 主问题复采样上限（仅干净答错时触发；最坏 +12）
-    12 +
-    9; // ttft 观测：5 串行 + 1 轮 4 并发（重试不计入）
-  const inputTokens = contextTokens + billingInputTokens + 15000 + (cfg.expect.includes('vision') ? 1200 : 0);
+    15 * qualityRounds + // quality 题集（每轮 12 主问题 + 3 控制题；--quality-samples/--deep 可扩轮）
+    // quality 主问题复采样上限（仅干净答错时触发；最坏每轮 +12）
+    12 * qualityRounds +
+    9 + // ttft 观测：5 串行 + 1 轮 4 并发（重试不计入）
+    referenceCalls;
+  const inputTokens =
+    contextTokens +
+    billingInputTokens +
+    15000 +
+    (cfg.expect.includes('vision') ? 1200 : 0) +
+    (referenceConfigured ? 12000 * qualityRounds : 0);
   return { calls, inputTokens };
 }
 

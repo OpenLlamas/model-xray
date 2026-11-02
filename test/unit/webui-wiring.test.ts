@@ -65,7 +65,7 @@ test('webui 接线：一次性检测表单字段进入 collectForm() 提交体',
   for (const field of [
     'f-base-url', 'f-model', 'f-claimed-context', 'f-price-input', 'f-price-output',
     'f-price-cached-read', 'f-price-threshold', 'f-price-input2', 'f-price-output2', 'f-price-cached-read2',
-    'f-seed', 'f-timeout', 'f-out', 'f-baseline', 'f-deep', 'f-dry-run', 'f-expect-',
+    'f-seed', 'f-timeout', 'f-out', 'f-baseline', 'f-quality-samples', 'f-deep', 'f-dry-run', 'f-expect-',
   ]) {
     assert.ok(region.includes(field), `collectForm() 缺少字段 ${field}`);
   }

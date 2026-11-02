@@ -1,4 +1,4 @@
-import type { ChatMessage, Finding, ProbeCtx, ProbeOutcome, ToolDef } from '../types.js';
+import type { ChatMessage, ChatResult, Finding, ProbeCtx, ProbeOutcome, ToolDef } from '../types.js';
 import { recordCall } from '../evidence.js';
 import { dataUrlPng, solidRgbPng } from '../png.js';
 import { PROBE_BUDGETS, chatWithStarveRetry, isBlankAnswer } from './starve.js';
@@ -22,9 +22,20 @@ const KNOWN = new Set(['vision', 'tool', 'thinking']);
  *  其余一切失败（0/5xx/鉴权/限流/路由/未知 status）一律视为证据不足。 */
 const EXPLICIT_REJECT = new Set<number>([400, 415, 422]);
 
-/** 失败归因：仅白名单内的 4xx 构成「能力不存在」证据；0/5xx/鉴权/限流/路由/未知 status 一律 inconclusive（降 na）。 */
-function classifyFailure(status: number): 'reject' | 'inconclusive' {
-  return EXPLICIT_REJECT.has(status) ? 'reject' : 'inconclusive';
+/**
+ * 请求参数/尺寸类拒绝特征（max_tokens 上限、schema 校验、上下文超长等）：这类 400/422 与
+ * 「能力不存在」无关——端点限制 max_tokens<=512 时工具探针首轮请求就会被 400 拒绝，
+ * 若直接当能力拒绝会把实际支持工具调用的端点误判为 fail。命中即降为 inconclusive。
+ * 415（Unsupported Media Type）本身就是媒体类型不被接受的明确信号，不参与此豁免。
+ */
+const PARAM_LIMIT_REJECT =
+  /max[_\s-]?tokens?|maximum.{0,24}tokens|parameter|invalid.{0,24}(?:value|schema)|unsupported.{0,24}parameter|context[_\s-]?length|too many tokens|payload too large|request too large/i;
+
+/** 失败归因：仅白名单内的 4xx 且错误正文未指向参数/尺寸问题，才构成「能力不存在」证据。 */
+function classifyFailure(result: ChatResult): 'reject' | 'inconclusive' {
+  if (!EXPLICIT_REJECT.has(result.status)) return 'inconclusive';
+  if (result.status !== 415 && PARAM_LIMIT_REJECT.test(result.error ?? '')) return 'inconclusive';
+  return 'reject';
 }
 
 export async function probeCapability(ctx: ProbeCtx): Promise<ProbeOutcome> {
@@ -124,7 +135,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   let emptyCount = 0;
   let blankRetriedCount = 0;
   let streamFallbackCount = 0;
-  const failStatuses: number[] = [];
+  const failResults: ChatResult[] = [];
   const evidenceIds: string[] = [];
   const starvedEvidence: string[] = [];
   const emptyEvidence: string[] = [];
@@ -169,7 +180,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
     const { result } = call;
     if (!result.ok) {
       failCount += 1;
-      failStatuses.push(result.status);
+      failResults.push(result);
       continue;
     }
     if (isBlankAnswer(result)) {
@@ -214,7 +225,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
   if (okCount === 0) {
     // 三个图像请求全部被 4xx 显式拒绝才算「能力不存在」；只有 1-2 次拒绝、其余空/截断时
     // 端点毕竟接受过部分图像请求，不能把个别 400/415/422 当成全量能力否定。
-    if (failCount === 3 && failStatuses.every((s) => classifyFailure(s) === 'reject')) {
+    if (failCount === 3 && failResults.every((r) => classifyFailure(r) === 'reject')) {
       findings.push({
         level: 'fail',
         message: '标称支持 vision，但端点对图像请求明确返回 4xx 拒绝：该能力不存在。',
@@ -238,7 +249,7 @@ async function runVision(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState
       });
       return { state: 'na' };
     }
-    const codes = [...new Set(failStatuses)].join('/');
+    const codes = [...new Set(failResults.map((r) => r.status))].join('/');
     const reasons = [
       failCount > 0 ? `${failCount} 次请求失败（状态码 ${codes}）` : '',
       emptyCount > 0 ? `${emptyCount} 次空响应` : '',
@@ -384,7 +395,7 @@ async function runTool(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> 
     });
   }
   if (!first.ok) {
-    if (classifyFailure(first.status) === 'reject') {
+    if (classifyFailure(first) === 'reject') {
       findings.push({
         level: 'fail',
         message: `标称支持 tool calling，但首轮请求被明确拒绝（HTTP ${first.status}，${first.error ?? 'unknown'}）。`,
@@ -465,7 +476,7 @@ async function runTool(ctx: ProbeCtx, findings: Finding[]): Promise<CheckState> 
     return { state: 'na' };
   }
   if (!second.ok) {
-    if (classifyFailure(second.status) === 'reject') {
+    if (classifyFailure(second) === 'reject') {
       findings.push({
         level: 'fail',
         message: `工具结果回传后第二轮请求被明确拒绝（HTTP ${second.status}，${second.error ?? 'unknown'}），往返调用不完整。`,

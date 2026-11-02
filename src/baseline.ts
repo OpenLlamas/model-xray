@@ -11,7 +11,14 @@ export interface BaselineFile {
   assetsVersion: string;
   identity: { families: string[]; schemaCompliant: boolean | null; refusalRate: number } | null;
   /** quality 指标口径版本：'pass1' = 首答正确率（2026-10-19 起）；缺省 = 旧两次机会口径，对比时跳过质量项 */
-  quality: { accuracy: number; mainCorrect: number; mainTotal: number; metricVersion?: string } | null;
+  quality: {
+    accuracy: number;
+    mainCorrect: number;
+    mainTotal: number;
+    metricVersion?: string;
+    /** 题集轮数（--quality-samples；缺省/旧基线 = 1）。轮数不同时题面与样本量都不可比，对比时跳过质量项。 */
+    samples?: number;
+  } | null;
   capability: Record<string, string> | null;
   billing: { slopeEn: number | null; slopeZh: number | null } | null;
   /** 公示倍率快照（本轮起写入）：下一轮经 --baseline 注入 billing 的倍率漂移检测；
@@ -103,7 +110,15 @@ function buildQuality(outcome: ProbeOutcome | undefined): BaselineFile['quality'
   // metrics['main'] 自 2026-10-19 起为 pass@1（首答正确率）口径；旧口径基线无 metricVersion，
   // diffBaseline 会跳过质量对比（两种口径的 accuracy 不可比，混比会假漂移）。
   const metricVersion = typeof outcome.metrics['metric_version'] === 'string' ? outcome.metrics['metric_version'] : undefined;
-  return { accuracy: correct / total, mainCorrect: correct, mainTotal: total, ...(metricVersion !== undefined ? { metricVersion } : {}) };
+  const samplesRaw = outcome.metrics['quality_samples'];
+  const samples = typeof samplesRaw === 'number' && Number.isInteger(samplesRaw) ? samplesRaw : undefined;
+  return {
+    accuracy: correct / total,
+    mainCorrect: correct,
+    mainTotal: total,
+    ...(metricVersion !== undefined ? { metricVersion } : {}),
+    ...(samples !== undefined ? { samples } : {}),
+  };
 }
 
 function buildCapability(outcome: ProbeOutcome | undefined): BaselineFile['capability'] {
@@ -265,6 +280,16 @@ function validateBaseline(b: Record<string, unknown>): void {
     // metricVersion 可选（旧基线无此字段 = 旧口径）；存在时必须是非空字符串
     if ('metricVersion' in quality && (typeof quality['metricVersion'] !== 'string' || (quality['metricVersion'] as string) === '')) {
       throw fieldError('baseline.quality.metricVersion', '非空字符串', quality['metricVersion']);
+    }
+    // samples 可选（--quality-samples 题集轮数；旧基线无此字段 = 1 轮）；存在时必须是 [1,5] 的整数
+    if (
+      'samples' in quality &&
+      (typeof quality['samples'] !== 'number' ||
+        !Number.isInteger(quality['samples']) ||
+        (quality['samples'] as number) < 1 ||
+        (quality['samples'] as number) > 5)
+    ) {
+      throw fieldError('baseline.quality.samples', '[1,5] 的整数', quality['samples']);
     }
     // buildQuality 拒收 total<=0（题集恒 15 题，mainTotal 恒正数）——0 属畸形基线，与口径一致拒收
     if (typeof quality['mainTotal'] !== 'number' || !Number.isFinite(quality['mainTotal']) || quality['mainTotal'] <= 0) {
@@ -446,6 +471,11 @@ export function diffBaseline(oldBaseline: BaselineFile, current: BaselineFile): 
       // 误读成漂移。跳过质量对比并注明，要求重建基线。
       notes.push(
         `基线质量口径与本次不同（基线 ${oldBaseline.quality.metricVersion ?? '旧两次机会口径'} vs 本次 ${current.quality.metricVersion ?? '旧两次机会口径'}），质量漂移对比已跳过；建议用一次正常跑批重建基线。`,
+      );
+    } else if ((oldBaseline.quality.samples ?? 1) !== (current.quality.samples ?? 1)) {
+      // 题集轮数不同（如 1 轮 vs 3 轮）：同 seed 但题面与样本量都不同，准确率混比会假漂移。
+      notes.push(
+        `基线质量题集轮数与本次不同（基线 ${oldBaseline.quality.samples ?? 1} 轮 vs 本次 ${current.quality.samples ?? 1} 轮），题面与样本量不可比，质量漂移对比已跳过；建议以相同 --quality-samples 重建基线。`,
       );
     } else {
       const from = percent(oldBaseline.quality.accuracy);

@@ -14,6 +14,7 @@ import { probeContext } from './probes/context.js';
 import { probeBilling } from './probes/billing.js';
 import { probeCapability } from './probes/capability.js';
 import { probeQuality } from './probes/quality.js';
+import { probeTokenizer } from './probes/tokenizer.js';
 import { probeTtft } from './probes/ttft.js';
 import { isBlankAnswer, isStarved } from './probes/starve.js';
 import type {
@@ -37,6 +38,7 @@ const PHASE_LABELS: Record<ProbeId | 'decoy', string> = {
   context: '上下文',
   billing: '计量',
   capability: '能力',
+  tokenizer: '分词指纹',
   decoy: '诱饵',
   quality: '质量',
   ttft: '首字时延',
@@ -109,6 +111,23 @@ export async function runAudit(
             activity(formatRequestActivity(currentPhase, event, cfg.timeoutMs));
           },
   });
+  const referenceClient =
+    cfg.referenceBaseUrl && cfg.referenceApiKey && cfg.referenceModel
+      ? createClient({
+          baseUrl: normalizeBase(cfg.referenceBaseUrl),
+          apiKey: cfg.referenceApiKey,
+          timeoutMs: cfg.timeoutMs,
+          retries: Math.min(cfg.retries, 1),
+          httpRetries: Math.min(cfg.httpRetries ?? 2, 1),
+          abortOnQuota: false,
+          onRequest:
+            activity === undefined
+              ? undefined
+              : (event) => {
+                  activity(`[REF] ${formatRequestActivity(currentPhase, event, cfg.timeoutMs)}`);
+                },
+        })
+      : null;
   // 基线必须在探针执行前确定（注释见 baselineRef 参数说明）：billing 的公示倍率漂移检测也需要历史快照，
   // 先烧钱再重读磁盘会静默丢掉倍率对比；加载失败在此记下原因，探针照跑、对比环节如实披露。
   let baselineForRun: BaselineFile | null = null;
@@ -164,6 +183,8 @@ export async function runAudit(
   const previousPricingAltSource = previousPricingAlt !== null ? ('ledger' as const) : null;
   const ctx: ProbeCtx = {
     client,
+    referenceClient,
+    referenceModel: cfg.referenceModel ?? null,
     cfg,
     rng,
     evidence,
@@ -245,15 +266,17 @@ export async function runAudit(
   const context = await runPhase('context', () => probeContext(ctx));
   const billing = await runPhase('billing', () => probeBilling(ctx));
   const capability = await runPhase('capability', () => probeCapability(ctx));
+  const tokenizer = await runPhase('tokenizer', () => probeTokenizer(ctx));
   const decoy = await runPhase('decoy', () => decoyProbe(ctx));
   const quality = await runPhase('quality', () => probeQuality(ctx));
   const ttft = await runPhase('ttft', () => probeTtft(ctx));
 
-  const outcomes = [identity, context, billing, capability, decoy, quality, ttft];
+  const outcomes = [identity, context, billing, capability, tokenizer, decoy, quality, ttft];
 
   const notes = [
     `seed=${cfg.seed}：同一 seed 与同一端点可复现探针内容；真实模型输出仍可能因服务端非确定性略有波动。`,
     'TTFT 为观测项，不计入总分。',
+    'tokenizer 指纹仅在配置参考端点时判定；协议元数据只作辅助证据，不能单独证明模型身份。',
     '诱饵请求仅记录行为供人工复核。',
   ];
   if (client.quotaExhausted?.() === true) {
@@ -261,11 +284,13 @@ export async function runAudit(
       `API key 配额耗尽（${client.quotaMessage?.() ?? 'quota exceeded'}）：审计已提前熔断${quotaSkipped.length > 0 ? `，跳过 ${quotaSkipped.length} 个维度（${quotaSkipped.join('、')}）` : ''}；已执行维度仅代表配额耗尽前的样本，请充值或更换 key 后复测。`,
     );
   }
-  notes.push(...gatewayDiagnosisNotes(outcomes, evidence.all(), cfg.model));
+  // 参考端点证据只服务 tokenizer/quality 差分：不得计入主端点的网关诊断、失败归因与费用估算。
+  const mainEvidence = evidence.all().filter((record) => record.endpoint !== 'reference');
+  notes.push(...gatewayDiagnosisNotes(outcomes, mainEvidence, cfg.model));
   // 运行级失败归因：N/M 笔请求被端点/网关拒绝等，让「为什么这么多未判定」一眼可读
-  const runFailureNote = runFailureDigest(evidence.all());
+  const runFailureNote = runFailureDigest(mainEvidence);
   if (runFailureNote !== null) notes.push(runFailureNote);
-  const costNote = totalAuditCostNote(outcomes, evidence.all());
+  const costNote = totalAuditCostNote(outcomes, mainEvidence);
   if (costNote !== null) notes.push(costNote);
 
   // 指纹基线：先构建本轮基线，再与输入基线对比；全部在 computeTotal 之前完成
@@ -317,6 +342,8 @@ export async function runAudit(
       model: cfg.model,
       // 报告是可分享产物：baseUrl 里的 userinfo/query 可能夹带凭据，回显前先脱敏。
       baseUrl: redactUrl(cfg.baseUrl),
+      referenceBaseUrl: cfg.referenceBaseUrl ? redactUrl(cfg.referenceBaseUrl) : null,
+      referenceModel: cfg.referenceModel ?? null,
       seed: cfg.seed,
       startedAt,
       durationMs: Date.now() - startedMs,
@@ -458,7 +485,7 @@ export function totalAuditCostNote(outcomes: ProbeOutcome[], evidence: EvidenceR
   const cost = (prompt / 1_000_000) * inputPrice + (completion / 1_000_000) * outputPrice;
   const costText = cost < 0.01 ? cost.toFixed(4) : cost.toFixed(3);
   return (
-    `测试总费用（按录入价估算，${calls} 条带 usage 请求）：${costText}（与录入价同单位）` +
+    `测试总费用（按录入价估算，${calls} 条带 usage 请求；仅统计主端点，参考端点请求不计入——其单价可能不同）：${costText}（与录入价同单位）` +
     `（输入 ${prompt} / 输出 ${completion} tokens；未含缓存折扣/阶梯差异，余额消耗请自行核对）。`
   );
 }

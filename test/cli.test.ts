@@ -265,6 +265,21 @@ test('cli: --timeout 0 is rejected (out of range)', async () => {
   assert.ok(result.stderr.includes('示例'), result.stderr);
 });
 
+test('cli: --quality-samples rejects non-integers and out-of-range values (exit 2, no requests)', async () => {
+  for (const bad of ['abc', '0', '6', '2.5', '']) {
+    const result = await runCli([...REMOTE_ARGS, '--quality-samples', bad, '--dry-run']);
+    assert.equal(result.status, 2, `--quality-samples ${JSON.stringify(bad)}: ${result.stderr}`);
+    assert.ok(result.stderr.includes('--quality-samples 必须是'), result.stderr);
+    assert.ok(result.stderr.includes('示例'), result.stderr);
+  }
+});
+
+test('cli: --quality-samples 3 is accepted in dry-run (cost estimate scales)', async () => {
+  const result = await runCli([...REMOTE_ARGS, '--quality-samples', '3', '--dry-run']);
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /151 次请求|预估/);
+});
+
 test('cli: --timeout abc is rejected (not an integer)', async () => {
   const result = await runCli([...REMOTE_ARGS, '--timeout', 'abc', '--dry-run']);
   assert.equal(result.status, 2, result.stderr);

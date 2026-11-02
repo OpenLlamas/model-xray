@@ -15,9 +15,16 @@ function outcome(id: ProbeOutcome['id'], score: number | null, status: ProbeOutc
   };
 }
 
-test('weights sum to 90 across scored probes; TTFT is observation-only (weight 0)', () => {
-  const sum = WEIGHTS.billing + WEIGHTS.quality + WEIGHTS.identity + WEIGHTS.context + WEIGHTS.capability;
-  assert.equal(sum, 90);
+test('weights sum to 95 across scored probes; TTFT is observation-only (weight 0)', () => {
+  const sum =
+    WEIGHTS.billing +
+    WEIGHTS.quality +
+    WEIGHTS.identity +
+    WEIGHTS.context +
+    WEIGHTS.capability +
+    WEIGHTS.tokenizer;
+  assert.equal(sum, 95);
+  assert.equal(WEIGHTS.tokenizer, 5);
   assert.equal(WEIGHTS.ttft, 0);
   assert.equal(WEIGHTS.decoy, 0);
 });
@@ -201,6 +208,22 @@ test('non-billing/non-identity dim fails (context/quality) stay score-only, neve
   // 上下文/质量双双跌破 40 → 硬红线封顶 45，但不通过不触发（仅计费/身份实锤触发）
   assert.ok(result.total !== null && result.total <= 45, `total=${result.total}`);
   assert.equal(result.overall, 'warn');
+});
+
+test('分项 fail（45）不得配 pass 总评：任一维度 fail 时整体至少 warn', () => {
+  // 质量 6/12 → fail 50，封顶 45；其余维度满分时几何聚合仍可能 >75。
+  const result = computeTotal([
+    outcome('identity', 100),
+    outcome('context', 100),
+    outcome('billing', 100),
+    outcome('capability', 100),
+    outcome('tokenizer', 100),
+    outcome('quality', 45),
+    outcome('ttft', null, 'insufficient'),
+  ]);
+  assert.ok(result.total !== null && result.total > 75, `total=${result.total}`);
+  assert.equal(result.scores.find((s) => s.id === 'quality')?.level, 'fail');
+  assert.equal(result.overall, 'warn', '「分项 FAIL + 总评 pass」是自相矛盾报告');
 });
 
 test('identity hard fail (明显换壳) forces overall fail', () => {

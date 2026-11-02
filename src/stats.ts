@@ -92,6 +92,35 @@ export function wilsonUpperBound(successes: number, total: number, z = 1.64): nu
   return Math.min(1, (center + spread) / denom);
 }
 
+function logFactorial(n: number): number {
+  let acc = 0;
+  for (let i = 2; i <= n; i += 1) acc += Math.log(i);
+  return acc;
+}
+
+/**
+ * McNemar 精确单侧检验：在「两侧无差异」（Binomial(0.5)）零假设下，discordant 对配对分歧样本中
+ * reference 侧恰好多对 ≥ referenceBetter 题的概率。p 越小，差分越不可能是随机噪声；
+ * 反向分歧（主端点反而多对）会被正确计入分母、显著性随之下降。非法入参返回 1（不显著，fail-closed）。
+ */
+export function exactMcNemarP(discordant: number, referenceBetter: number): number {
+  if (
+    !Number.isInteger(discordant) ||
+    discordant < 0 ||
+    !Number.isInteger(referenceBetter) ||
+    referenceBetter < 0 ||
+    referenceBetter > discordant
+  ) {
+    return 1;
+  }
+  const logN = logFactorial(discordant);
+  let p = 0;
+  for (let k = referenceBetter; k <= discordant; k += 1) {
+    p += Math.exp(logN - logFactorial(k) - logFactorial(discordant - k) - discordant * Math.LN2);
+  }
+  return Math.min(1, p);
+}
+
 export function clampScore(value: number): number {
   if (!Number.isFinite(value)) return 0;
   return Math.max(0, Math.min(100, Math.round(value)));

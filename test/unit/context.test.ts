@@ -210,6 +210,16 @@ test('context: 400 尺寸类显式拒绝 → fail 15（差分验证通过后才�
   assert.match(String(outcome.metrics['size_differential']), /accepted/);
 });
 
+test('context: 413（Payload Too Large）同样进入尺寸差分验证 → 确认后 fail 15', async () => {
+  const tooLong = () => failResult(413, 'HTTP 413: Payload Too Large');
+  // 与 400 用例同构：90%/75%/50% 整档 413，25% 档命中，短输入对照成功，最小被拒档复验仍 413。
+  const { client } = scriptedContextClient((index) => (index < 9 || index === 14 ? tooLong() : 'hit'), tooLong());
+  const outcome = await probeContext(makeCtx(client));
+  assert.equal(outcome.level, 'fail', outcome.headline);
+  assert.equal(outcome.score, 15);
+  assert.equal(outcome.metrics['depth_explicit_reject'], 1);
+});
+
 test('context: 50% 档可读、75%/90% 整档 400 → 显式拒绝前沿从 75% 起成立，fail 15', async () => {
   const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
   // 降序：0..2=90%、3..5=75% 整档 400；6..11=50%/25% 命中；12/13 = 短输入对照成功；
@@ -227,7 +237,6 @@ test('context: 50% 档可读、75%/90% 整档 400 → 显式拒绝前沿从 75% 
   assert.equal(outcome.metrics['depth_explicit_reject'], 1);
   assert.match(String(outcome.metrics['size_differential']), /75%:rejected/);
 });
-
 test('context: 50% 档首样本偶发 400 后成功、75%/90% 整档 400 → 复验取 75% 前沿，不因 50% 偶发 400 漏判', async () => {
   const tooLong = () => failResult(400, 'HTTP 400: {"error":{"message":"maximum context length exceeded","code":"context_length_exceeded"}}');
   // 降序：0..5=90%/75% 整档 400；6=50% 首样本 400、7..8 同档命中；9..11=25% 命中。

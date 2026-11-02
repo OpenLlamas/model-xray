@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { linearRegression, mad, median, quantile, stdev, wilsonLowerBound, wilsonUpperBound } from '../../src/stats.js';
+import { exactMcNemarP, linearRegression, mad, median, quantile, stdev, wilsonLowerBound, wilsonUpperBound } from '../../src/stats.js';
 
 test('quantile: interpolation and edges', () => {
   const xs = [1, 2, 3, 4, 5];
@@ -55,6 +55,27 @@ test('wilson guard: non-finite or non-positive totals return 0 (no >1 pseudo-low
   assert.equal(wilsonLowerBound(5, Number.POSITIVE_INFINITY), 0);
   assert.equal(wilsonLowerBound(5, -1), 0);
   assert.equal(wilsonLowerBound(5, 0), 0);
+});
+
+test('exactMcNemarP: exact one-sided binomial tail under the no-difference null', () => {
+  // 无配对分歧 → 无差异证据，p=1
+  assert.equal(exactMcNemarP(0, 0), 1);
+  // discordant=3 全部 reference 多对：P(X>=3 | n=3, p=0.5) = 1/8
+  assert.ok(Math.abs(exactMcNemarP(3, 3) - 0.125) < 1e-12);
+  // 5 对中 reference 多对 4（主端点多对 1）：P(X>=4 | n=5) = 6/32 = 0.1875（反向分歧抬高 p）
+  assert.ok(Math.abs(exactMcNemarP(5, 4) - 0.1875) < 1e-12);
+  // discordant=7 全部单边：P(X>=7 | n=7) = 1/128 = 0.0078125（fail 级显著性）
+  assert.ok(Math.abs(exactMcNemarP(7, 7) - 0.0078125) < 1e-12);
+  // 大样本不溢出：全单边 60 对的精确尾部仍可计算且量级合理
+  const large = exactMcNemarP(60, 60);
+  assert.ok(large < 1e-16, "large tail should be tiny, got " + large);
+});
+
+test('exactMcNemarP: invalid or out-of-range inputs fail closed to p=1', () => {
+  assert.equal(exactMcNemarP(-1, 0), 1);
+  assert.equal(exactMcNemarP(3, 4), 1);
+  assert.equal(exactMcNemarP(2.5, 1), 1);
+  assert.equal(exactMcNemarP(3, Number.NaN), 1);
 });
 
 test('wilsonUpperBound mirrors lower bound and stays in [0,1]', () => {

@@ -459,3 +459,21 @@ test('capability tool: 首轮全 422 → 显式拒绝 fail（与 400 同口径�
   assert.equal(outcome.level, 'fail', outcome.headline);
   assert.ok(outcome.findings.some((f) => f.level === 'fail' && /明确拒绝（HTTP 422/.test(f.message)), JSON.stringify(outcome.findings));
 });
+
+test('capability tool: 400 指向 max_tokens 上限（参数拒绝）→ na，不得误判工具能力缺失', async () => {
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(): Promise<ChatResult> {
+      return rejectedResult(400, 'HTTP 400: {"error":{"message":"max_tokens must be <= 512"}}');
+    },
+  };
+  const ctx = makeCtx(client);
+  ctx.cfg.expect = ['tool'];
+  const outcome = await probeCapability(ctx);
+  assert.equal(outcome.metrics['tool'], 'na', JSON.stringify(outcome.findings));
+  assert.notEqual(outcome.level, 'fail', outcome.headline);
+  assert.ok(
+    outcome.findings.some((f) => f.level === 'warn' && /无法判定/.test(f.message)),
+    JSON.stringify(outcome.findings),
+  );
+});

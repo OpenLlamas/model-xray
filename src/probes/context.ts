@@ -22,9 +22,11 @@ const DEPTH_TOP = DEPTHS[0] as number;
 const NON_SIZE_REJECT =
   /insufficient[_\s-]?(balance|quota|credit)|quota[_\s-]?(exhaust|exceeded)|exceeded your current quota|rate[_\s-]?limit|too many requests|余额|欠费|额度|计费|unauthori[sz]ed|invalid[_\s-]?api[_\s-]?key|authentication|permission[_\s-]?denied|model[_\s-]?(not[_\s-]?(found|exist|support))|does not exist|unsupported model|content[_\s-]?(policy|moderation|filter)|sensitive/i;
 
-/** 仅「400 且响应体未指向其他归因」才构成「输入过大被显式拒绝」的证据。 */
+/** 仅「400/413 且响应体未指向其他归因」才构成「输入过大被显式拒绝」的证据。 */
 function isSizeRejection(result: ChatResult): boolean {
-  return !result.ok && result.status === 400 && !NON_SIZE_REJECT.test(result.error ?? '');
+  if (result.ok) return false;
+  if (result.status !== 400 && result.status !== 413) return false;
+  return !NON_SIZE_REJECT.test(result.error ?? '');
 }
 
 /**
@@ -610,16 +612,16 @@ export async function probeContext(ctx: ProbeCtx): Promise<ProbeOutcome> {
     if (sizeRejectionConfirmed) {
       findings.push({
         level: 'info',
-        message: `差分验证通过：${pendingSizeRejects} 个 HTTP 400 样本之外，${controls.map((c) => `${c.tokens} tokens 短输入${c.hit ? '请求成功且可检索命中' : '请求成功'}`).join('、')}，并在最小被拒深度 ${(smallestRejected! * 100).toFixed(0)}% 复验仍被拒 → 拒绝与输入长度相关且可复现，可作为「窗口不实」证据。`,
+        message: `差分验证通过：${pendingSizeRejects} 个尺寸类拒绝（HTTP 400/413）样本之外，${controls.map((c) => `${c.tokens} tokens 短输入${c.hit ? '请求成功且可检索命中' : '请求成功'}`).join('、')}，并在最小被拒深度 ${(smallestRejected! * 100).toFixed(0)}% 复验仍被拒 → 拒绝与输入长度相关且可复现，可作为「窗口不实」证据。`,
         evidenceIds: [...controls.flatMap((c) => c.evidenceIds), ...(longRetest?.evidenceIds ?? [])],
       });
     } else {
       const why = !shortOk
         ? `${controls.filter((c) => !c.ok).map((c) => `${c.tokens} tokens 对照失败（${c.error}）`).join('、')}`
-        : `最小被拒深度 ${(smallestRejected! * 100).toFixed(0)}% 复验未被拒（400 未复现）`;
+        : `最小被拒深度 ${(smallestRejected! * 100).toFixed(0)}% 复验未被拒（尺寸类拒绝未复现）`;
       findings.push({
         level: 'warn',
-        message: `差分验证未通过：${why} → 无法确认 HTTP 400 与输入长度相关，${pendingSizeRejects} 个 400 样本按证据不足处理（可能为欠费、参数校验或瞬时故障），不作为「窗口不实」证据。`,
+        message: `差分验证未通过：${why} → 无法确认 HTTP 400/413 与输入长度相关，${pendingSizeRejects} 个 400/413 样本按证据不足处理（可能为欠费、参数校验或瞬时故障），不作为「窗口不实」证据。`,
         evidenceIds: [...controls.flatMap((c) => c.evidenceIds), ...(longRetest?.evidenceIds ?? [])],
       });
       erroredSamples += pendingSizeRejects;

@@ -40,6 +40,17 @@ test('checkAnswer: exclusive distractor still blocks (comma-aware both sides)', 
   assert.ok(checkAnswer('7,718 或 9,999', question(7718, [7719])));
 });
 
+test('checkAnswer: 被否定的正确答案不算答对（"不是 42，是 43" / "11（不是 12）"）', () => {
+  assert.ok(!checkAnswer('不是 42，是 43', question(42)));
+  assert.ok(!checkAnswer('11（不是 12）', question(12)));
+  assert.ok(!checkAnswer('42? not 42, the answer is 43', question(42)));
+  // 无任何肯定作答（只否定）也判错；肯定语境照常计对
+  assert.ok(!checkAnswer('不是 42', question(42)));
+  assert.ok(checkAnswer('42', question(42)));
+  assert.ok(checkAnswer('答案是 42', question(42)));
+  assert.ok(checkAnswer('答案是 42（不是 43）', question(42)));
+});
+
 // ---------- v0.2.2 复采样抗噪（F1）：脚本化 stub 驱动 probeQuality ----------
 
 const SEED = 4242;
@@ -114,7 +125,11 @@ function scriptedQuality(script: (q: Question, req: ChatRequest) => ChatResult):
   return { client, requests, questions };
 }
 
-function qualityCtx(client: OpenAIClient): ProbeCtx {
+function qualityCtx(
+  client: OpenAIClient,
+  referenceClient: OpenAIClient | null = null,
+  referenceModel = 'gpt-4o-reference',
+): ProbeCtx {
   const cfg: RunConfig = {
     baseUrl: 'http://127.0.0.1:0/v1',
     apiKey: 'k',
@@ -131,7 +146,14 @@ function qualityCtx(client: OpenAIClient): ProbeCtx {
     yes: true,
     quiet: true,
   };
-  return { client, cfg, rng: createRng(SEED), evidence: createEvidenceRecorder() };
+  return {
+    client,
+    referenceClient,
+    referenceModel: referenceClient === null ? null : referenceModel,
+    cfg,
+    rng: createRng(SEED),
+    evidence: createEvidenceRecorder(),
+  };
 }
 
 const isMain = (q: Question): boolean => !q.control;
@@ -445,6 +467,20 @@ test('quality insufficient: starved control → dedicated control-starved headli
   assert.match(outcome.headline, /控制题未产出答案（1 题推理占满预算未作答）/);
 });
 
+test('quality pass@1: 可用样本全对但有 2 题空响应 → 空响应不算答错，仍 pass（剔除数在 metrics 披露）', async () => {
+  const blankIds = new Set(mains().slice(0, 2).map((q) => q.id));
+  const { client } = scriptedQuality((q) => (blankIds.has(q.id) ? okResult('') : rightAnswer(q)));
+  const outcome = await probeQuality(qualityCtx(client));
+
+  assert.equal(outcome.status, 'ok');
+  // 2026-11 复核裁决：MIN_USABLE_RATIO=0.8 已限制剔除比例（≤20%），把无答案样本算回分母
+  // 等于把「未获得答案」当「答错」，会误伤推理占满预算的正常端点（thinking-starve e2e 实证）。
+  assert.equal(outcome.metrics['main'], '10/10');
+  assert.equal(outcome.metrics['empty'], 2);
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+});
+
 test('quality insufficient: failed control request → unavailable copy with the upstream error', async () => {
   const control = generateQuestions(createRng(SEED)).find((q) => q.control) as Question;
   const { client } = scriptedQuality((q) => (q.id === control.id ? failedResult() : rightAnswer(q)));
@@ -491,4 +527,246 @@ test('quality: HTTP 200 blank answers are excluded (not wrong, no resample), con
   assert.equal(requests.filter((r) => r.temperature === 0.7).length, 0, '空响应不得触发复采样');
   assert.match(outcome.headline, /空响应/);
   assert.ok(!outcome.findings.some((f) => f.level === 'fail'), JSON.stringify(outcome.findings));
+});
+
+test('quality reference: no reference endpoint sends no reference requests and records configured=0', async () => {
+  const { client, requests } = scriptedQuality(rightAnswer);
+  const outcome = await probeQuality(qualityCtx(client));
+  assert.equal(requests.length, 15);
+  assert.equal(outcome.metrics['reference_configured'], 0);
+  assert.equal(outcome.metrics['reference_main'], '0/0');
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+});
+
+test('quality reference: requests only the 12 main questions with paired evidence labels', async () => {
+  const { client } = scriptedQuality(rightAnswer);
+  const { client: referenceClient, requests: referenceRequests } = scriptedQuality(rightAnswer);
+  const ctx = qualityCtx(client, referenceClient, 'gpt-4o-reference');
+  const outcome = await probeQuality(ctx);
+
+  assert.equal(referenceRequests.length, 12);
+  assert.ok(referenceRequests.every((request) => request.model === 'gpt-4o-reference'));
+  const referenceEvidence = ctx.evidence.all().filter((record) => record.label.startsWith('reference main '));
+  assert.equal(referenceEvidence.length, 12);
+  assert.ok(referenceEvidence.every((record) => !record.label.includes('control')));
+  assert.equal(outcome.metrics['reference_configured'], 1);
+  assert.equal(outcome.metrics['reference_main'], '12/12');
+  assert.equal(outcome.metrics['reference_delta'], 0);
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+});
+
+test('quality reference: blank, starved, and failed reference answers are excluded from the paired denominator', async () => {
+  const badIds = new Set(mains().slice(0, 3).map((question) => question.id));
+  const { client } = scriptedQuality(rightAnswer);
+  let referenceIndex = 0;
+  const { client: referenceClient } = scriptedQuality((question) => {
+    if (!badIds.has(question.id)) return rightAnswer(question);
+    const kind = referenceIndex % 3;
+    referenceIndex += 1;
+    if (kind === 0) return okResult('');
+    if (kind === 1) return starvedResult('');
+    return failedResult();
+  });
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.metrics['reference_main'], '9/9');
+  assert.equal(outcome.metrics['reference_delta'], 0);
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+  assert.ok(outcome.findings.some((finding) => finding.level === 'info' && /从配对分母剔除/.test(finding.message)));
+});
+
+test('quality reference: one-question difference is info only and does not cap the score', async () => {
+  const target = mains()[0] as Question;
+  const { client } = scriptedQuality((question) => (question.id === target.id ? wrongAnswer(question) : rightAnswer(question)));
+  const { client: referenceClient } = scriptedQuality(rightAnswer);
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 92);
+  assert.equal(outcome.metrics['reference_main'], '12/12');
+  assert.equal(outcome.metrics['reference_delta'], -1);
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+  assert.ok(outcome.findings.some((finding) => finding.level === 'info' && /单题差异仅披露/.test(finding.message)));
+});
+
+test('quality reference: systematic 25% deficit caps a warn result at 70', async () => {
+  const wrongIds = new Set(mains().slice(0, 3).map((question) => question.id));
+  const { client } = scriptedQuality((question) =>
+    wrongIds.has(question.id) ? wrongAnswer(question) : rightAnswer(question),
+  );
+  const { client: referenceClient } = scriptedQuality(rightAnswer);
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 70);
+  assert.equal(outcome.metrics['reference_main'], '12/12');
+  assert.equal(outcome.metrics['reference_delta'], -3);
+  assert.equal(outcome.metrics['reference_systematic'], 1);
+  // 3/3 单边差分达到数量门槛，McNemar 精确检验 p=0.125 仍在 warn 判据（p<=0.15）内
+  assert.equal(outcome.metrics['reference_discordant'], 3);
+  assert.equal(outcome.metrics['reference_ref_better'], 3);
+  assert.equal(outcome.metrics['reference_mcnemar_p'], 0.125);
+  assert.ok(outcome.findings.some((finding) => finding.level === 'warn' && /系统性质量差分/.test(finding.message)));
+  assert.ok(outcome.findings.some((finding) => finding.level === 'warn' && /McNemar 精确检验 p=0\.1250/.test(finding.message)));
+});
+
+test('quality reference: high reference accuracy versus low main accuracy caps at fail 45', async () => {
+  const wrongIds = new Set(mains().slice(0, 7).map((question) => question.id));
+  const recoveredIds = new Set([...wrongIds].slice(0, 4));
+  const { client } = scriptedQuality((question, request) => {
+    if (!wrongIds.has(question.id)) return rightAnswer(question);
+    if (request.temperature === 0.7 && recoveredIds.has(question.id)) return rightAnswer(question);
+    return wrongAnswer(question);
+  });
+  const { client: referenceClient } = scriptedQuality(rightAnswer);
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.level, 'fail');
+  assert.equal(outcome.score, 45);
+  assert.equal(outcome.metrics['main'], '5/12');
+  assert.equal(outcome.metrics['reference_main'], '12/12');
+  assert.equal(outcome.metrics['reference_delta'], -7);
+  assert.equal(outcome.metrics['reference_systematic'], 1);
+});
+
+test('quality reference: control failure still returns the reference differential metrics', async () => {
+  const control = generateQuestions(createRng(SEED)).find((question) => question.control) as Question;
+  const { client } = scriptedQuality((question) => (question.id === control.id ? failedResult() : rightAnswer(question)));
+  const { client: referenceClient } = scriptedQuality(rightAnswer);
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.status, 'insufficient');
+  assert.equal(outcome.score, null);
+  assert.equal(outcome.metrics['reference_configured'], 1);
+  assert.equal(outcome.metrics['reference_main'], '12/12');
+  assert.equal(outcome.metrics['reference_delta'], 0);
+});
+
+// ---------- 多轮题集（--quality-samples / --deep 默认 3 轮）与 McNemar 显著性门控 ----------
+
+/**
+ * 多轮脚本化 stub：与 probeQuality 相同的方式逐轮生成题集（同一 rng 起点顺序一致），
+ * 按 prompt 路由请求；prompt → 题面映射覆盖 5 轮，足够覆盖任何 [1,5] 轮配置。
+ */
+function scriptedQualityRounds(script: (q: Question, req: ChatRequest) => ChatResult): {
+  client: OpenAIClient;
+  requests: ChatRequest[];
+} {
+  const rng = createRng(SEED);
+  const byPrompt = new Map<string, Question>();
+  for (let round = 0; round < 5; round += 1) {
+    for (const q of generateQuestions(rng)) byPrompt.set(q.prompt, q);
+  }
+  const requests: ChatRequest[] = [];
+  const client: OpenAIClient = {
+    baseUrl: 'http://127.0.0.1:0/v1',
+    async chat(req: ChatRequest): Promise<ChatResult> {
+      requests.push(req);
+      const prompt = String(req.messages[0]?.content ?? '');
+      const q = byPrompt.get(prompt);
+      if (!q) throw new Error(`stub client: unknown prompt ${prompt.slice(0, 30)}`);
+      return script(q, req);
+    },
+  };
+  return { client, requests };
+}
+
+test('quality multi-round: qualitySamples=3 aggregates 45 requests into 36 main + 9 controls', async () => {
+  const { client, requests } = scriptedQualityRounds(rightAnswer);
+  const ctx = qualityCtx(client);
+  ctx.cfg.qualitySamples = 3;
+  const outcome = await probeQuality(ctx);
+
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 100);
+  assert.equal(requests.length, 45, `3 轮 × 15 题，实际 ${requests.length}`);
+  assert.equal(outcome.metrics['main'], '36/36');
+  assert.equal(outcome.metrics['main_recovered'], '36/36');
+  assert.equal(outcome.metrics['controls'], '9/9');
+  assert.equal(outcome.metrics['quality_samples'], 3);
+  assert.equal(outcome.metrics['main_total'], 36);
+  assert.equal(outcome.metrics['metric_version'], 'pass1');
+  // 36/36 全对：CI 宽约 0.096 ≤0.10 但有效样本 <45 → 证据强度 medium
+  assert.equal(outcome.metrics['evidence_strength'], 'medium');
+  // findings 中错误题标识应带轮次前缀（本测试全对，检查复算说明里的轮数披露）
+  assert.ok(outcome.findings.some((finding) => finding.level === 'info' && /共 3 轮 36 主问题 \+ 9 控制题/.test(finding.message)));
+});
+
+test('quality multi-round: --deep defaults to 3 rounds and explicit qualitySamples overrides deep', async () => {
+  const deep = qualityCtx(scriptedQualityRounds(rightAnswer).client);
+  deep.cfg.deep = true;
+  const deepOutcome = await probeQuality(deep);
+  assert.equal(deepOutcome.metrics['quality_samples'], 3);
+  assert.equal((deepOutcome.metrics['main'] as string).split('/')[1], '36');
+
+  const explicit = qualityCtx(scriptedQualityRounds(rightAnswer).client);
+  explicit.cfg.deep = true;
+  explicit.cfg.qualitySamples = 1;
+  const explicitOutcome = await probeQuality(explicit);
+  assert.equal(explicitOutcome.metrics['quality_samples'], 1);
+  assert.equal((explicitOutcome.metrics['main'] as string).split('/')[1], '12');
+});
+
+test('quality multi-round: the same question id wrong in every round aggregates across rounds', async () => {
+  // 'mod' 每轮出现一次（题面不同）：3 轮都首答错且复采样仍错 → 36 题主分母中聚合 3 错
+  const { client } = scriptedQualityRounds((q, req) => {
+    if (q.id === 'mod') return wrongAnswer(q);
+    return rightAnswer(q);
+  });
+  const ctx = qualityCtx(client);
+  ctx.cfg.qualitySamples = 3;
+  const outcome = await probeQuality(ctx);
+
+  assert.equal(outcome.metrics['main'], '33/36');
+  assert.equal(outcome.metrics['retried'], 3);
+  assert.equal(outcome.metrics['recovered'], undefined, '无复采样恢复时不应有 recovered 计数');
+  // pass@1 33/36 = 0.9167 ≥ 0.9 → pass 92（多轮聚合不改判定阈值）
+  assert.equal(outcome.level, 'pass');
+  assert.equal(outcome.score, 92);
+  // 错题披露必须带轮次前缀，才能区分同 id 的不同轮题面
+  assert.ok(
+    outcome.findings.some((finding) => finding.level === 'warn' && /题 r2\/mod 答错/.test(finding.message)),
+    JSON.stringify(outcome.findings),
+  );
+});
+
+test('quality reference: multi-round pairing compares every main sample, not just round 1', async () => {
+  const { client } = scriptedQualityRounds(rightAnswer);
+  const { client: referenceClient, requests: referenceRequests } = scriptedQualityRounds(rightAnswer);
+  const ctx = qualityCtx(client, referenceClient);
+  ctx.cfg.qualitySamples = 3;
+  const outcome = await probeQuality(ctx);
+
+  assert.equal(outcome.metrics['reference_configured'], 1);
+  assert.equal(outcome.metrics['reference_main'], '36/36');
+  assert.equal(outcome.metrics['reference_delta'], 0);
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+  assert.equal(outcome.metrics['reference_discordant'], 0);
+  assert.equal(outcome.metrics['reference_mcnemar_p'], 1);
+  assert.equal(referenceRequests.length, 36, '参考端点应逐样本配对全部 36 道主题');
+});
+
+test('quality reference: reverse mismatches raise the McNemar p-value and block the systematic verdict', async () => {
+  // 主端点首答错 4 题（参考全对）+ 参考错 1 题（主端点对）：deficit=3、相对差距 3/11≈27% 达数量门槛，
+  // 但配对分歧 5 题中含 1 题反向 → McNemar p=0.1875 > 0.15，不升级系统性差分（小样本 + 反向分歧不定罪）。
+  const mainWrong = new Set(mains().slice(0, 4).map((q) => q.id));
+  const refWrong = mains()[6]?.id as string;
+  assert.ok(!mainWrong.has(refWrong));
+  const { client } = scriptedQuality((q) => (mainWrong.has(q.id) ? wrongAnswer(q) : rightAnswer(q)));
+  const { client: referenceClient } = scriptedQuality((q) => (q.id === refWrong ? wrongAnswer(q) : rightAnswer(q)));
+  const outcome = await probeQuality(qualityCtx(client, referenceClient));
+
+  assert.equal(outcome.metrics['main'], '8/12');
+  assert.equal(outcome.metrics['reference_main'], '11/12');
+  assert.equal(outcome.metrics['reference_delta'], -3);
+  assert.equal(outcome.metrics['reference_discordant'], 5);
+  assert.equal(outcome.metrics['reference_main_better'], 1);
+  assert.equal(outcome.metrics['reference_ref_better'], 4);
+  assert.equal(outcome.metrics['reference_mcnemar_p'], 0.1875);
+  assert.equal(outcome.metrics['reference_systematic'], 0);
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 67, '未被参考差分封顶（66.67 四舍五入）');
+  assert.ok(!outcome.findings.some((finding) => /系统性质量差分/.test(finding.message)));
 });

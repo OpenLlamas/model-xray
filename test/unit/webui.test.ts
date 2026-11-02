@@ -60,6 +60,7 @@ function fullInput() {
     timeout: '60',
     out: 'reports-out',
     baseline: 'reports/baseline-x.json',
+    qualitySamples: '3',
     deep: true,
     dryRun: true,
     yes: false,
@@ -88,6 +89,7 @@ function minimalInput() {
     timeout: '',
     out: '',
     baseline: '',
+    qualitySamples: '',
     deep: false,
     dryRun: false,
     yes: false,
@@ -150,6 +152,7 @@ const ALLOWED_FLAGS = [
   '--timeout',
   '--out',
   '--baseline',
+  '--quality-samples',
   '--deep',
   '--dry-run',
   '--yes',
@@ -219,6 +222,7 @@ test('buildCommand：全参数——含全部 flag，字符串参数单引号包
   assert.ok(command.includes("--declared-price-page '/pricing'"), command);
   assert.ok(command.includes('--read-balance'), command);
   assert.ok(command.includes('--timeout 60'), command);
+  assert.ok(command.includes('--quality-samples 3'), command);
   assert.ok(command.includes('--deep'), command);
   assert.ok(command.includes('--dry-run'), command);
   assert.ok(!command.includes('--yes'), command);
@@ -299,6 +303,19 @@ test('buildCommand：缓存读与二档阶梯价——完整通过（缓存 0 �
 
   const badCache = buildCommand({ ...minimalInput(), priceInput: '2.5', priceOutput: '10', priceCachedRead: '-1' });
   assert.ok(badCache.error !== null && badCache.error.includes('price-cached-read'), String(badCache.error));
+});
+
+test('buildCommand：--quality-samples 支持 1-5；空串保持默认；非法值拒绝', () => {
+  for (const value of ['1', '2', '3', '4', '5']) {
+    const result = buildCommand({ ...minimalInput(), qualitySamples: value });
+    assert.equal(result.error, null);
+    assert.ok(result.command.includes(`--quality-samples ${value}`), result.command);
+  }
+  for (const value of ['0', '6', '2.5', 'abc']) {
+    const result = buildCommand({ ...minimalInput(), qualitySamples: value });
+    assert.ok(result.error !== null && result.error.includes('--quality-samples'), result.error ?? '');
+    assert.equal(result.command, '');
+  }
 });
 
 test('buildCommand：--dry-run 与 --yes 同勾 → 互斥 error', () => {

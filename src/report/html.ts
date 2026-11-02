@@ -10,6 +10,7 @@ const DIMENSION_DESC: Readonly<Record<string, string>> = {
   billing: 'token 计量与线性：自报 usage 随输入长度的回归一致性 + completion_tokens 硬矛盾检查；绝对对账（--token-reference 或价格+余额实扣倍率）缺失时判「未判定」，不给分',
   capability: '标称能力实测：vision/tool/thinking 逐项验证而非只看宣称；评分依据：标称能力实测通过率',
   quality: '程序化题集：版本化可复现题集对照参考答案；评分依据：程序化判定的正确率',
+  tokenizer: 'tokenizer 指纹（可选参考端点）：7 类固定语料比较输入 token 增量向量；至少 5 类可比才评分，≥3 类且中位差 ≥20% 判不匹配',
   ttft: '流式首字延迟：采样 TTFT 分位数；观测项不计分，仅披露 p50/p95（非流式响应计至完整响应体到达）',
   decoy: '诱饵对照项：不计分，仅用于识别「对固定题集特判」的端点',
 };

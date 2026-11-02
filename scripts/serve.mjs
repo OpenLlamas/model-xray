@@ -762,6 +762,21 @@ export async function createConsoleServer(options = {}) {
       }
       args.push('--read-balance');
     }
+    const qualitySamplesInput = body.qualitySamples;
+    const qualitySamples = typeof qualitySamplesInput === 'string' ? qualitySamplesInput.trim() : '';
+    if (qualitySamples === '' && qualitySamplesInput !== undefined && qualitySamplesInput !== null) {
+      throw new Error(
+        `quality-samples 必须是 1-5 的整数。收到：${JSON.stringify(qualitySamplesInput)}。示例：3`,
+      );
+    }
+    if (qualitySamples !== '') {
+      if (!/^[1-5]$/.test(qualitySamples)) {
+        throw new Error(
+          `quality-samples 必须是 1-5 的整数。收到：${JSON.stringify(qualitySamples)}。示例：3`,
+        );
+      }
+      args.push('--quality-samples', qualitySamples);
+    }
     if (body.deep === true) args.push('--deep');
     if (body.dryRun === true) args.push('--dry-run');
     else args.push('--yes');

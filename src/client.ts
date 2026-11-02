@@ -207,6 +207,7 @@ async function attemptChat(url: string, options: ClientOptions, req: ChatRequest
         Date.now() - started,
         '',
         parseRetryAfterMs(response.headers.get('retry-after')),
+        evidenceResponseHeaders(response),
       );
     }
 
@@ -214,10 +215,11 @@ async function attemptChat(url: string, options: ClientOptions, req: ChatRequest
     // 按响应实际 content-type 分派解析器，否则非流式探针 JSON.parse 整轮失败、审计全灭；
     // 「请求非流式却被强制流式」本身是端点 spec 违规，由调用方（guard/ttft 的观测）另行记录。
     const contentType = response.headers.get('content-type') ?? '';
+    const responseHeaders = evidenceResponseHeaders(response);
     if (req.stream === true || contentType.includes('text/event-stream')) {
-      return await readStream(response, started);
+      return await readStream(response, started, responseHeaders, controller.signal);
     }
-    return await readJson(response, started);
+    return await readJson(response, started, responseHeaders);
   } catch (error) {
     const durationMs = Date.now() - started;
     // 错误四分类：timeout / network / HTTP <status> / invalid JSON，让 stderr 与 finding 一眼可分辨
@@ -237,16 +239,27 @@ function isAbortError(error: unknown, controller: AbortController): boolean {
   return reason instanceof Error && reason.name === 'AbortError';
 }
 
-async function readJson(response: Response, started: number): Promise<ChatResult> {
+async function readJson(
+  response: Response,
+  started: number,
+  responseHeaders: Record<string, string>,
+): Promise<ChatResult> {
   const raw = await response.text();
   const durationMs = Date.now() - started;
-  const parsed = parseChatCompletionJson(raw, response.status, durationMs);
+  const parsed = parseChatCompletionJson(raw, response.status, durationMs, responseHeaders);
   if (parsed !== null) return parsed;
   // HTTP 200 却返回 `{"error":{...}}`（中转站欠费/限流/上游熔断的常见形态）：按请求失败处理，
   // 否则会被当成「成功但空正文」，探针据此指控「未发起工具调用 / 内容不可读」= 诬告。
   const upstreamError = upstreamErrorMessage(raw);
   if (response.ok && upstreamError !== null) {
-    return errorResult(`upstream error payload（HTTP ${response.status}）：${upstreamError}`, response.status, durationMs);
+    return errorResult(
+      `upstream error payload（HTTP ${response.status}）：${upstreamError}`,
+      response.status,
+      durationMs,
+      '',
+      null,
+      responseHeaders,
+    );
   }
   // 端点兼容（与 readStream 的零信号回退对称）：部分中转站把 SSE 流标成 application/json，
   // JSON.parse 必然失败 → 整轮探针全废（实测「invalid JSON response: data: {...}」）。
@@ -254,10 +267,17 @@ async function readJson(response: Response, started: number): Promise<ChatResult
   // （否则会被伪装成 ok 响应、绕过探针的 reject/error 分级）；event:/id:/retry: 不作触发条件，
   // 因为它们在畸形 JSON 里也容易出现。正常 JSON 与真实畸形响应行为不变。
   if (response.ok && /^\s*data:/m.test(raw)) {
-    const sse = parseSseBody(raw, response.status, durationMs);
+    const sse = parseSseBody(raw, response.status, durationMs, responseHeaders);
     if (sse !== null) return sse;
   }
-  return errorResult(`invalid JSON response: ${truncate(raw, 300)}`, response.status, durationMs);
+  return errorResult(
+    `invalid JSON response: ${truncate(raw, 300)}`,
+    response.status,
+    durationMs,
+    '',
+    null,
+    responseHeaders,
+  );
 }
 
 /** 从「整份已读响应体」提取上游错误载荷（宽容：允许前后空白/多行文本包裹的 JSON）。 */
@@ -273,18 +293,23 @@ function upstreamErrorMessage(raw: string): string | null {
 }
 
 /** 解析「已被完整读取」的 SSE 响应体；零信号（无正文/推理/工具调用/finish_reason）返回 null。 */
-function parseSseBody(raw: string, status: number, durationMs: number): ChatResult | null {
+function parseSseBody(
+  raw: string,
+  status: number,
+  durationMs: number,
+  responseHeaders: Record<string, string> = {},
+): ChatResult | null {
   const parser = new SseParser();
   const agg = createSseAggregate();
   applySseEvents(agg, parser.feed(raw));
   applySseEvents(agg, parser.end());
   const upstreamError = agg.errorMessage;
   if (upstreamError !== null && !hasSseSignal(agg)) {
-    return errorResult(`upstream error payload（HTTP ${status}）：${upstreamError}`, status, durationMs);
+    return errorResult(`upstream error payload（HTTP ${status}）：${upstreamError}`, status, durationMs, '', null, responseHeaders);
   }
   if (!hasSseSignal(agg)) return null;
   // raw 与流式路径同口径（仅供人工复核的截断原文，16KB 上限），ttftMs=null 表示「整体读取、无 TTFT 观测」
-  return buildStreamResult(agg, status, durationMs, null, raw.slice(0, 16384));
+  return buildStreamResult(agg, status, durationMs, null, raw.slice(0, 16384), responseHeaders);
 }
 
 /**
@@ -292,7 +317,12 @@ function parseSseBody(raw: string, status: number, durationMs: number): ChatResu
  * 返回 null 表示「不是可解析的 chat.completion JSON」（非法 JSON / 无 choices），
  * 调用方据此区分「解析失败」与「SSE 路径的 JSON 回退无信号」。
  */
-function parseChatCompletionJson(raw: string, status: number, durationMs: number): ChatResult | null {
+function parseChatCompletionJson(
+  raw: string,
+  status: number,
+  durationMs: number,
+  responseHeaders: Record<string, string> = {},
+): ChatResult | null {
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(raw) as Record<string, unknown>;
@@ -317,13 +347,20 @@ function parseChatCompletionJson(raw: string, status: number, durationMs: number
     // 上游错误载荷 + 残缺正文：判为失败并把正文留作 partial 证据 —— 上层（质量题/检索）
     // 会把 !ok 的样本剔除分母，避免把「上游中断后的残句」当成模型答错（层 3 审查必修项）。
     const partial = [text, reasoning ?? ''].join(' ').trim();
-    return errorResult(`upstream error payload（HTTP ${status}）：${errorMessage}`, status, durationMs, partial);
+    return errorResult(`upstream error payload（HTTP ${status}）：${errorMessage}`, status, durationMs, partial, null, responseHeaders);
   }
   return {
     ok: true,
     status,
     finishReason,
     model: typeof parsed['model'] === 'string' && parsed['model'] !== '' ? (parsed['model'] as string) : null,
+    responseId: typeof parsed['id'] === 'string' && parsed['id'] !== '' ? parsed['id'] : null,
+    systemFingerprint:
+      typeof parsed['system_fingerprint'] === 'string' && parsed['system_fingerprint'] !== ''
+        ? parsed['system_fingerprint']
+        : null,
+    responseHeaders,
+    logprobs: choice && 'logprobs' in choice ? choice['logprobs'] : null,
     text,
     reasoning: reasoning.length > 0 ? reasoning : null,
     usage,
@@ -346,12 +383,27 @@ interface SseAggregate {
   usageRejected: UsageRejection | null;
   finishReason: string | null;
   model: string | null;
+  responseId: string | null;
+  systemFingerprint: string | null;
+  logprobs: unknown | null;
   errorMessage: string | null;
   toolAcc: Map<number, { id: string; name: string; args: string }>;
 }
 
 function createSseAggregate(): SseAggregate {
-  return { text: '', reasoning: '', usage: null, usageRejected: null, finishReason: null, model: null, errorMessage: null, toolAcc: new Map() };
+  return {
+    text: '',
+    reasoning: '',
+    usage: null,
+    usageRejected: null,
+    finishReason: null,
+    model: null,
+    responseId: null,
+    systemFingerprint: null,
+    logprobs: null,
+    errorMessage: null,
+    toolAcc: new Map(),
+  };
 }
 
 /** 累积 SSE 事件；onFirstDelta 用于流式路径打 TTFT 时间戳（整体读取的 JSON 误标路径不传）。 */
@@ -367,6 +419,9 @@ function applySseEvents(agg: SseAggregate, events: Array<{ data: string }>, onFi
     agg.text += deltaText;
     agg.reasoning += deltaReasoning;
     if (chunk.model !== null) agg.model = chunk.model;
+    if (chunk.responseId !== null) agg.responseId = chunk.responseId;
+    if (chunk.systemFingerprint !== null) agg.systemFingerprint = chunk.systemFingerprint;
+    if (chunk.logprobs !== null) agg.logprobs = chunk.logprobs;
     if (chunk.errorMessage !== null) agg.errorMessage = chunk.errorMessage;
     if (chunk.usage) {
       agg.usage = chunk.usage;
@@ -383,7 +438,14 @@ function hasSseSignal(agg: SseAggregate): boolean {
   return agg.finishReason !== null || agg.text.length > 0 || agg.reasoning.length > 0 || agg.toolAcc.size > 0;
 }
 
-function buildStreamResult(agg: SseAggregate, status: number, durationMs: number, ttftMs: number | null, raw = ''): ChatResult {
+function buildStreamResult(
+  agg: SseAggregate,
+  status: number,
+  durationMs: number,
+  ttftMs: number | null,
+  raw = '',
+  responseHeaders: Record<string, string> = {},
+): ChatResult {
   const toolCalls: ToolCall[] = [...agg.toolAcc.entries()]
     .sort((a, b) => a[0] - b[0])
     .map(([index, acc]) => ({
@@ -397,6 +459,10 @@ function buildStreamResult(agg: SseAggregate, status: number, durationMs: number
     status,
     finishReason: agg.finishReason,
     model: agg.model,
+    responseId: agg.responseId,
+    systemFingerprint: agg.systemFingerprint,
+    responseHeaders,
+    logprobs: agg.logprobs,
     text: agg.text,
     reasoning: agg.reasoning.length > 0 ? agg.reasoning : null,
     usage: agg.usage,
@@ -415,9 +481,16 @@ function buildStreamResult(agg: SseAggregate, status: number, durationMs: number
   };
 }
 
-async function readStream(response: Response, started: number): Promise<ChatResult> {
+async function readStream(
+  response: Response,
+  started: number,
+  responseHeaders: Record<string, string> = {},
+  signal?: AbortSignal,
+): Promise<ChatResult> {
   const reader = response.body?.getReader();
-  if (!reader) return errorResult('response has no body', response.status, Date.now() - started);
+  if (!reader) {
+    return errorResult('response has no body', response.status, Date.now() - started, '', null, responseHeaders);
+  }
   const decoder = new TextDecoder();
   const parser = new SseParser();
   let ttftMs: number | null = null;
@@ -445,17 +518,33 @@ async function readStream(response: Response, started: number): Promise<ChatResu
     });
   };
 
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    const decoded = decoder.decode(value, { stream: true });
-    if (bodyLen < 65536) {
-      bodyParts.push(decoded);
-      bodyLen += decoded.length;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const decoded = decoder.decode(value, { stream: true });
+      if (bodyLen < 65536) {
+        bodyParts.push(decoded);
+        bodyLen += decoded.length;
+      }
+      handle(parser.feed(decoded));
     }
-    handle(parser.feed(decoded));
+    handle(parser.end());
+  } catch (error) {
+    // 超时 abort / 连接中断时保留已累积的正文与推理：否则探针只看到「timeout 且零产出」，
+    // 把「已收到的部分回答」当成空响应，连带丢失 usage 与 TTFT 观测。
+    const partial = [agg.text, agg.reasoning].filter((part) => part.length > 0).join(' ');
+    const message = error instanceof Error ? error.message : String(error);
+    const aborted = signal?.aborted === true || (error instanceof Error && error.name === 'AbortError');
+    return errorResult(
+      aborted ? 'timeout：流式读取被超时中止（已保留已收到的部分正文）' : `network：流式读取中断（${message}）`,
+      response.status,
+      Date.now() - started,
+      partial,
+      null,
+      responseHeaders,
+    );
   }
-  handle(parser.end());
 
   // HTTP 200 + 纯 error 事件流（欠费/限流/上游熔断）：按请求失败处理，避免「空正文」被当成
   // 「未发起工具调用」「内容不可读」等诬告。
@@ -463,7 +552,7 @@ async function readStream(response: Response, started: number): Promise<ChatResu
     // 同上：错误载荷优先于残缺 delta，正文留作 partial 证据但样本判失败。
     // 注意：agg 是累积对象，extractText(agg) 只会得到空串；必须显式拼接已收正文/推理增量。
     const partial = [agg.text, agg.reasoning].filter((part) => part.length > 0).join(' ');
-    return errorResult(`upstream error payload（HTTP ${response.status}）：${agg.errorMessage}`, response.status, Date.now() - started, partial);
+    return errorResult(`upstream error payload（HTTP ${response.status}）：${agg.errorMessage}`, response.status, Date.now() - started, partial, null, responseHeaders);
   }
 
   if (!hasSseSignal(agg)) {
@@ -472,7 +561,7 @@ async function readStream(response: Response, started: number): Promise<ChatResu
     // 'empty stream'，把可用证据全丢掉（identity/quality 退化为 N/A、billing 误判缺 usage）。
     // 仅在 SSE 零信号（无 finish_reason/正文/推理/工具调用）时回退解析原始体，
     // 正常 SSE 与正常 JSON 路径行为完全不变；回退也拿不到信号则维持原 'empty stream'。
-    const fallback = parseChatCompletionJson(bodyParts.join(''), response.status, Date.now() - started);
+    const fallback = parseChatCompletionJson(bodyParts.join(''), response.status, Date.now() - started, responseHeaders);
     if (fallback !== null) return fallback;
   }
 
@@ -485,6 +574,8 @@ async function readStream(response: Response, started: number): Promise<ChatResu
       response.status,
       Date.now() - started,
       partial,
+      null,
+      responseHeaders,
     );
   }
 
@@ -527,12 +618,23 @@ async function safeReadBody(response: Response): Promise<string> {
   }
 }
 
-function errorResult(message: string, status = 0, durationMs = 0, partialText = '', retryAfterMs: number | null = null): ChatResult {
+function errorResult(
+  message: string,
+  status = 0,
+  durationMs = 0,
+  partialText = '',
+  retryAfterMs: number | null = null,
+  responseHeaders: Record<string, string> = {},
+): ChatResult {
   return {
     ok: false,
     status,
     finishReason: null,
     model: null,
+    responseId: null,
+    systemFingerprint: null,
+    responseHeaders,
+    logprobs: null,
     text: partialText,
     reasoning: null,
     usage: null,
@@ -549,6 +651,18 @@ function errorResult(message: string, status = 0, durationMs = 0, partialText = 
 }
 
 /** 解析 Retry-After 响应头（仅秒数形式；HTTP-date 含字母、非法值、负值一律返回 null 不采纳）。 */
+const EVIDENCE_RESPONSE_HEADERS = ['x-request-id', 'request-id', 'openai-version', 'server', 'cf-ray'] as const;
+
+/** Keep only protocol-relevant, non-sensitive headers. Never persist auth/cookie headers. */
+function evidenceResponseHeaders(response: Response): Record<string, string> {
+  const headers: Record<string, string> = {};
+  for (const name of EVIDENCE_RESPONSE_HEADERS) {
+    const value = response.headers.get(name);
+    if (value !== null && value.trim() !== '') headers[name] = value.trim().slice(0, 512);
+  }
+  return headers;
+}
+
 function parseRetryAfterMs(value: string | null): number | null {
   if (value === null) return null;
   const trimmed = value.trim();

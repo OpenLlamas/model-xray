@@ -128,6 +128,11 @@ test('serve.mjs：buildTestArgs 透传公示价锚点四参数（倍率/quota �
   const end = source.indexOf('function startTestJob', start);
   assert.ok(start !== -1 && end > start, '未找到 buildTestArgs 边界（抽取规则疑似过期）');
   const region = source.slice(start, end);
+  // 质量题集轮数：WebUI 可直接配置，与 CLI 同域校验（1-5，空串=默认）。
+  assert.ok(region.includes('body.qualitySamples'), 'buildTestArgs 未读取 body.qualitySamples');
+  assert.ok(region.includes("'--quality-samples'"), 'buildTestArgs 未透传 --quality-samples');
+  assert.ok(region.includes('if (!/^[1-5]$/.test(qualitySamples))'), 'quality-samples 缺 1-5 严格校验');
+  assert.ok(region.includes('qualitySamplesInput !== undefined && qualitySamplesInput !== null'), 'quality-samples 非字符串不得静默忽略');
   for (const [field, flag] of [
     ['expectModelRatio', '--expect-model-ratio'],
     ['expectCompletionRatio', '--expect-completion-ratio'],

@@ -92,6 +92,12 @@ export interface StreamChunk {
   finishReason: string | null;
   /** 响应自述模型名（网关旁路观测用；payload 未带或非字符串时为 null） */
   model: string | null;
+  /** OpenAI-compatible response id; auxiliary evidence only. */
+  responseId: string | null;
+  /** Upstream system_fingerprint; auxiliary evidence only. */
+  systemFingerprint: string | null;
+  /** Raw logprobs payload when requested. */
+  logprobs: unknown | null;
   /**
    * 上游错误载荷（HTTP 200 却带 `{"error":{...}}` 的 SSE/JSON 事件，常见于中转站欠费、限流、
    * 上游渠道熔断）。此前这类事件零信号 → 被误当作「成功但空正文」，探针据此指控
@@ -202,7 +208,24 @@ export function parseStreamPayload(data: string): StreamChunk | null {
 
   const finishReason = choice && typeof choice['finish_reason'] === 'string' ? (choice['finish_reason'] as string) : null;
   const model = typeof obj['model'] === 'string' && obj['model'] !== '' ? (obj['model'] as string) : null;
-  return { contentDelta: content, reasoningDelta: reasoning, toolCallDeltas: toolCalls, usage, usageReason, finishReason, model, errorMessage: extractErrorMessage(obj) };
+  const responseId = typeof obj['id'] === 'string' && obj['id'] !== '' ? obj['id'] : null;
+  const systemFingerprint =
+    typeof obj['system_fingerprint'] === 'string' && obj['system_fingerprint'] !== ''
+      ? obj['system_fingerprint']
+      : null;
+  return {
+    contentDelta: content,
+    reasoningDelta: reasoning,
+    toolCallDeltas: toolCalls,
+    usage,
+    usageReason,
+    finishReason,
+    model,
+    responseId,
+    systemFingerprint,
+    logprobs: choice && 'logprobs' in choice ? choice['logprobs'] : null,
+    errorMessage: extractErrorMessage(obj),
+  };
 }
 
 /** 提取 `error` 载荷（字符串 / {message,type,code} 对象均可）；无 error 或空消息返回 null。 */
@@ -316,6 +339,9 @@ function emptyStreamChunk(): StreamChunk {
     usageReason: null,
     finishReason: null,
     model: null,
+    responseId: null,
+    systemFingerprint: null,
+    logprobs: null,
     errorMessage: null,
   };
 }
