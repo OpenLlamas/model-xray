@@ -1,6 +1,7 @@
 import type { ChatMessage, Finding, OpenAIClient, ProbeCtx, ProbeOutcome } from '../types.js';
 import { recordCall } from '../evidence.js';
 import { median } from '../stats.js';
+import { runLogprobFingerprint } from './logprob.js';
 
 interface TokenizerCorpus {
   id: string;
@@ -42,6 +43,20 @@ interface Sample {
   id: string;
   mainTokens: number;
   referenceTokens: number;
+}
+
+/** tokenizer 语料证据不足时仍尝试 logprob 指纹：后者的样本不依赖 usage.prompt_tokens。 */
+async function attachLogprobEvidence(
+  ctx: ProbeCtx,
+  findings: Finding[],
+  metrics: Record<string, number | string | null>,
+  headline: string,
+): Promise<{ level: 'warn' | 'unknown'; headline: string }> {
+  const logprob = await runLogprobFingerprint(ctx);
+  findings.push(...logprob.findings);
+  Object.assign(metrics, logprob.metrics);
+  if (!logprob.confirmedMismatch) return { level: 'unknown', headline };
+  return { level: 'warn', headline: `${headline}；logprob 首 token 指纹两轮不一致` };
 }
 
 export async function probeTokenizer(ctx: ProbeCtx): Promise<ProbeOutcome> {
@@ -86,20 +101,24 @@ export async function probeTokenizer(ctx: ProbeCtx): Promise<ProbeOutcome> {
 
   const baseline = samples.find((sample) => sample.id === 'baseline');
   if (baseline === undefined) {
+    const headline = 'tokenizer 指纹证据不足：参考端点未返回可用 usage';
+    const branchFindings: Finding[] = [
+      {
+        level: 'warn',
+        message: '主端点或参考端点的基线样本缺少有效 usage.prompt_tokens，无法消除聊天模板开销；本次不做 tokenizer 判定。',
+        evidenceIds: attemptedEvidenceIds,
+      },
+    ];
+    const branchMetrics: Record<string, number | string | null> = { reference_configured: 1, compared: 0 };
+    const logprob = await attachLogprobEvidence(ctx, branchFindings, branchMetrics, headline);
     return {
       id: 'tokenizer',
       status: 'insufficient',
       score: null,
-      level: 'unknown',
-      headline: 'tokenizer 指纹证据不足：参考端点未返回可用 usage',
-      findings: [
-        {
-          level: 'warn',
-          message: '主端点或参考端点的基线样本缺少有效 usage.prompt_tokens，无法消除聊天模板开销；本次不做 tokenizer 判定。',
-          evidenceIds: attemptedEvidenceIds,
-        },
-      ],
-      metrics: { reference_configured: 1, compared: 0 },
+      level: logprob.level,
+      headline: logprob.headline,
+      findings: branchFindings,
+      metrics: branchMetrics,
     };
   }
 
@@ -122,23 +141,27 @@ export async function probeTokenizer(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const compared = comparable.length;
 
   if (compared < 5) {
+    const headline = `tokenizer 指纹证据不足：仅 ${compared} 类语料可比`;
+    const branchFindings: Finding[] = [
+      {
+        level: 'warn',
+        message: `需要至少 5 类有效 tokenizer 样本，本次仅 ${compared} 类；已获得的差分不用于评分。`,
+        evidenceIds: attemptedEvidenceIds,
+      },
+    ];
+    const branchMetrics: Record<string, number | string | null> = {
+      reference_configured: 1,
+      compared,
+    };
+    const logprob = await attachLogprobEvidence(ctx, branchFindings, branchMetrics, headline);
     return {
       id: 'tokenizer',
       status: 'insufficient',
       score: null,
-      level: 'unknown',
-      headline: `tokenizer 指纹证据不足：仅 ${compared} 类语料可比`,
-      findings: [
-        {
-          level: 'warn',
-          message: `需要至少 5 类有效 tokenizer 样本，本次仅 ${compared} 类；已获得的差分不用于评分。`,
-          evidenceIds: attemptedEvidenceIds,
-        },
-      ],
-      metrics: {
-        reference_configured: 1,
-        compared,
-      },
+      level: logprob.level,
+      headline: logprob.headline,
+      findings: branchFindings,
+      metrics: branchMetrics,
     };
   }
 
@@ -188,6 +211,16 @@ export async function probeTokenizer(ctx: ProbeCtx): Promise<ProbeOutcome> {
     });
   }
 
+  // logprob 首 token 指纹：只比较主/参考同模型的第一 token 分布，两轮随机 prompt 同向才压分。
+  // 不支持 logprobs 的网关只披露、不扣分，避免把「字段被剥除」误判成换壳。
+  const logprob = await runLogprobFingerprint(ctx);
+  findings.push(...logprob.findings);
+  if (logprob.confirmedMismatch) {
+    score = Math.min(score, 65);
+    if (level === 'pass') level = 'warn';
+    headline = `${headline}；logprob 首 token 指纹两轮不一致`;
+  }
+
   if (responseIdDiffers || fingerprintMissing) {
     findings.push({
       level: 'info',
@@ -212,6 +245,7 @@ export async function probeTokenizer(ctx: ProbeCtx): Promise<ProbeOutcome> {
       median_relative_delta: Math.round(medianDelta * 1000) / 1000,
       vector,
       samples: attempts,
+      ...logprob.metrics,
     },
   };
 }

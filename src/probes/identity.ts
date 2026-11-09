@@ -187,22 +187,11 @@ function normalizeModelName(model: string): string {
 }
 
 /**
- * 上游别名后缀（滚动别名而非更轻的变体）：请求 gpt-4o 回显 gpt-4o-latest 属官方别名，
- * 不应按换壳告警。只认「剩余段恰好是这些词」——glm-5.3-flash / gpt-4o-mini / 1-flash-preview
- * 这类真降级名不会命中（剩余段含更多内容），仍按可疑计。
- */
-const BENIGN_ALIAS_SUFFIXES = new Set(['latest', 'preview', 'beta', 'exp', 'experimental']);
-
-/**
  * 统计上游回显 model 字段与请求模型的一致性（分母只计非空回显：端点不回 model 属无证据，不稀释真实换壳信号）。
  * 判定口径（保守，宁可少判也不诬告）：
  * - 回显为空/缺失：不计入（无证据），且不进分母（否则端点偶尔不回 model 会稀释真实换壳信号）；
- * - 分隔符等价（glm-5.3-flash ≡ glm-5-3-flash，网关混用点号/连字符）：视为一致；
- * - 完全相等（去厂商前缀、大小写不敏感）：一致；
- * - 回显是请求名的前缀且裁掉的是纯数字日期钉版（gpt-4o-2024-08-06 → gpt-4o）或官方滚动
- *   别名后缀（gpt-4o-latest → gpt-4o）：视为一致；裁掉的其余部分（qwen2.5-72b-instruct →
- *   qwen2.5、glm-5.3-flash → glm-5.3）意味着上游只认领了不同的更小变体，按可疑计（审计钉 ⑤）；
- * - 回显 = 请求名 + 纯数字后缀（日期钉版）或官方滚动别名后缀（latest/preview/beta/exp）：视为一致；
+ * - 归一口径与路由分组一致（routingEchoKey）：去厂商前缀、分隔符等价，并反复剔除日期钉版与
+ *   官方滚动别名后缀，`openai/gpt-4o-2024-08-06-preview` ≡ `gpt-4o`；
  * - 其余（回显是请求的「更窄变体」如 glm-5.3-flash、gpt-4o-mini，或完全另一个模型）：计入 suspicious。
  */
 function countEchoMismatch(
@@ -213,33 +202,18 @@ function countEchoMismatch(
   let total = 0;
   let match = 0;
   let suspicious = 0;
-  const wanted = normalizeModelName(target);
+  const wanted = routingEchoKey(target);
   for (const raw of models) {
     if (raw === null || raw.trim() === '') continue;
     total += 1;
     const echoed = raw.trim();
     values.add(echoed);
-    const got = normalizeModelName(echoed);
-    if (got === wanted) {
+    const got = routingEchoKey(echoed);
+    if (wanted !== null && got !== null && got === wanted) {
       match += 1;
-      continue;
+    } else {
+      suspicious += 1;
     }
-    if (wanted.startsWith(`${got}-`)) {
-      // 回显是请求名的删节：仅当裁掉的部分是纯数字日期钉版或官方滚动别名后缀才按一致处理
-      const removed = wanted.slice(got.length + 1);
-      if (/^\d[\d.-]*$/.test(removed) || BENIGN_ALIAS_SUFFIXES.has(removed)) {
-        match += 1;
-      } else {
-        suspicious += 1;
-      }
-      continue;
-    }
-    const narrowed = got.startsWith(`${wanted}-`) ? got.slice(wanted.length + 1) : '';
-    if (narrowed !== '' && (/^\d[\d.-]*$/.test(narrowed) || BENIGN_ALIAS_SUFFIXES.has(narrowed))) {
-      match += 1;
-      continue;
-    }
-    suspicious += 1;
   }
   return { total, match, suspicious, values };
 }
@@ -358,7 +332,7 @@ function buildClaimedModelPattern(identity: TargetModelIdentity): RegExp {
 }
 
 /** 变体段归一：去 benign 滚动别名尾缀与裸别名词（latest/preview/…）后的比较形态；
- * 剥空视为无变体声明（与回显判定 BENIGN_ALIAS_SUFFIXES 同口径，不诬告）。 */
+ * 剥空视为无变体声明（与路由归一的滚动别名口径一致，不诬告）。 */
 function normalizeClaimedVariant(variant: string): string {
   let v = variant.toLowerCase().trim();
   for (;;) {
@@ -565,6 +539,177 @@ function largestNearDupGroup(texts: readonly string[], threshold: number, minLen
   return max;
 }
 
+// —— 路由一致性 / 推理类型 / 响应重放（2026-11 增强）——
+// 目的：不新增请求，复用 identity 已有样本，识别同一模型名在不同请求间被路由到不同上游、
+// 非推理模型返回推理内容、以及 response id 跨请求重放。证据分级沿用 identity 的保守口径：
+// 单轮弱信号只 info；warn 仅在保守门槛（混流多簇、明确非推理矛盾、response id 重放）给出，
+// 且不新增扣分——避免与 echo/模板信号重复压分。
+const REASONING_NAME_RE = /(^|[-_/])(o[134](?:-mini)?|r1|reasoner|reasoning|thinking|qwq)([-_/]|$)/i;
+// 明确不提供推理内容的官方命名（模型名归一后匹配）。只有命中此白名单才把「出现推理内容」视为矛盾；
+// 新模型/别名一律只 info，避免把支持 thinking 的模型误判成换壳。
+const NON_REASONING_MODEL_RE = /^(?:gpt-4o(?:-mini)?|gpt-4-1(?:-(?:mini|nano))?|gpt-3-5[\w-]*)$/;
+
+function reasoningObserved(result: ChatResult): boolean {
+  const tokens = result.usage?.reasoning_tokens;
+  // 门槛 8：不少网关把 reasoning_tokens 当 usage 标签恒填 1（本仓库 mock 即如此），
+  // 单个 token 不足以证明「返回了推理内容」；真实推理回答通常远超 8，且该信号本身只作保守旁证。
+  // 只采信这条数值路径——reasoning 文本字段可能被网关/兼容层塞入元数据或错误文案，
+  // 非空不等于真实推理内容，不作为矛盾依据。
+  // 字段来源：client 层 validateUsage 已把上游 usage.completion_tokens_details.reasoning_tokens
+  // （OpenAI 实际形态）归一进本字段，并校验子集不变量（≤ completion_tokens），此处无需再读 details。
+  return typeof tokens === 'number' && tokens >= 8;
+}
+
+/**
+ * 反复剔除日期钉版/滚动别名，兼容 `gpt-4o-2024-08-06-preview` 这类组合后缀。
+ * 循环必然终止：每次替换只删除末尾一段（字符串严格变短），不再变化即返回。
+ */
+function stripRollingSuffixes(model: string): string {
+  let key = model;
+  for (;;) {
+    const next = key
+      .replace(/-\d{4}(?:-\d{2}(?:-\d{2})?)?$/, '')
+      .replace(/-(?:latest|preview|beta|exp|experimental)$/, '');
+    if (next === key) return key;
+    key = next;
+  }
+}
+
+/**
+ * 路由分组用的回显名：去厂商前缀、分隔符归一，并剔除日期钉版/滚动别名（官方别名滚动不算混流）。
+ * 归一或剔除后为空串按“无证据”处理（返回 null），空串之间不得互判相等。
+ */
+function routingEchoKey(model: string | null): string | null {
+  if (model === null || model.trim() === '') return null;
+  const normalized = normalizeModelName(model);
+  if (normalized === '') return null;
+  const stripped = stripRollingSuffixes(normalized);
+  return stripped === '' ? null : stripped;
+}
+
+function isKnownNonReasoningModel(model: string): boolean {
+  return NON_REASONING_MODEL_RE.test(stripRollingSuffixes(normalizeModelName(model)));
+}
+
+export interface RoutingSampleInput {
+  question: string;
+  result: ChatResult;
+  evidenceId: string;
+}
+
+export interface RoutingSignals {
+  findings: Finding[];
+  metrics: Record<string, number | string | null>;
+  /** 是否存在 warn 级路由信号（供提前返回分支统一决定 level）。 */
+  warn: boolean;
+}
+
+/**
+ * 纯函数：从 identity 的已有样本推导路由一致性信号。
+ * 只对「回显 model 非空」的样本做分组；空回显不稀释分组，也不计入 n。
+ */
+export function analyzeRoutingSignals(
+  samples: readonly RoutingSampleInput[],
+  targetModel: string,
+): RoutingSignals {
+  const findings: Finding[] = [];
+  const metrics: Record<string, number | string | null> = {};
+  const echoed = samples.filter((sample) => routingEchoKey(sample.result.model) !== null);
+
+  // 混流只看「归一回显名」：推理内容出现与否是独立信号，不能把同一回显名拆成两簇再判混流。
+  const groups = new Map<string, { echo: string; count: number; evidenceIds: string[] }>();
+  for (const sample of echoed) {
+    const echo = routingEchoKey(sample.result.model);
+    if (echo === null) continue;
+    const hit = groups.get(echo);
+    if (hit === undefined) {
+      groups.set(echo, { echo, count: 1, evidenceIds: [sample.evidenceId] });
+    } else {
+      hit.count += 1;
+      hit.evidenceIds.push(sample.evidenceId);
+    }
+  }
+
+  const n = echoed.length;
+  const ranked = [...groups.values()].sort((a, b) => b.count - a.count);
+  metrics['routing_samples'] = n;
+  metrics['routing_groups'] = ranked.length;
+  metrics['routing_echo_values'] =
+    ranked.length > 0 ? ranked.map((group) => `${group.echo}×${group.count}`).join('/') : 'none';
+  metrics['routing_top_support'] = ranked[0]?.count ?? 0;
+
+  const second = ranked[1];
+  // 混流 warn 的保守门槛：至少 8 条带回显样本、两个簇各 ≥3 条。n=5 时 2+2 只够 info。
+  const mixedWarn = n >= 8 && second !== undefined && (ranked[0]?.count ?? 0) >= 3 && second.count >= 3;
+  if (ranked.length >= 2) {
+    const detail = ranked
+      .map((group) => `${group.echo}×${group.count}`)
+      .join('、');
+    findings.push({
+      level: mixedWarn ? 'warn' : 'info',
+      message: mixedWarn
+        ? `同一模型名的上游回显出现 ${ranked.length} 个稳定分簇（${detail}）：疑似多上游混流/负载不均，同一审计内的样本可能来自不同模型。`
+        : `上游回显存在 ${ranked.length} 个分簇（${detail}），但样本量或单簇支持不足：仅披露，不判混流。`,
+      evidenceIds: ranked.flatMap((group) => group.evidenceIds),
+    });
+  }
+
+  const reasoningSamples = samples.filter((sample) => reasoningObserved(sample.result));
+  metrics['routing_reasoning_samples'] = reasoningSamples.length;
+  const expectedReasoning = REASONING_NAME_RE.test(stripVendorPrefix(targetModel));
+  if (!expectedReasoning && reasoningSamples.length > 0) {
+    const contradiction = isKnownNonReasoningModel(targetModel) && reasoningSamples.length >= 2;
+    findings.push({
+      level: contradiction ? 'warn' : 'info',
+      message: contradiction
+        ? `请求的是非推理模型 ${targetModel}，但 ${reasoningSamples.length} 个样本返回了实质推理内容（usage.reasoning_tokens ≥ 8）：实际上游可能与请求模型类型不符。`
+        : `观测到 ${reasoningSamples.length} 个样本返回推理内容（目标模型 ${targetModel} 未声明推理能力）：仅披露，不作为换壳定罪。`,
+      evidenceIds: reasoningSamples.map((sample) => sample.evidenceId),
+    });
+  } else if (expectedReasoning && reasoningSamples.length === 0 && samples.length >= 3) {
+    findings.push({
+      level: 'info',
+      message: '目标模型按命名属于推理型，但本次未观测到推理内容：推理可能被隐藏或被网关剥除，不构成异常。',
+      evidenceIds: [],
+    });
+  }
+
+  // response id 重放：同一 id 只能证明缓存/传输复用，不能单独证明换壳；阈值保守且不压分。
+  const byId = new Map<string, { questions: Set<string>; evidenceIds: string[] }>();
+  for (const sample of samples) {
+    const rawId = sample.result.responseId;
+    if (typeof rawId !== 'string') continue;
+    const id = rawId.trim();
+    if (id.length < 6 || !/[0-9]/.test(id)) continue;
+    const hit = byId.get(id) ?? { questions: new Set<string>(), evidenceIds: [] };
+    hit.questions.add(sample.question);
+    hit.evidenceIds.push(sample.evidenceId);
+    byId.set(id, hit);
+  }
+  const replays = [...byId.entries()].filter(([, hit]) => hit.questions.size >= 2);
+  metrics['routing_replay_ids'] = replays.length;
+  if (replays.length > 0) {
+    const maxShared = Math.max(...replays.map(([, hit]) => hit.questions.size));
+    const replayWarn = replaysExceedThreshold(replays.length, maxShared);
+    findings.push({
+      level: replayWarn ? 'warn' : 'info',
+      message:
+        `检测到 ${replays.length} 个 response id 被复用于不同请求（单 id 最多跨 ${maxShared} 个问题）：` +
+        (replayWarn
+          ? '疑似响应缓存/重放层，报告中的回答可能不代表独立采样。'
+          : '可能为网关缓存或重试复用，仅作数据质量披露。'),
+      evidenceIds: replays.flatMap(([, hit]) => hit.evidenceIds),
+    });
+  }
+
+  const warn = findings.some((finding) => finding.level === 'warn');
+  return { findings, metrics, warn };
+}
+
+function replaysExceedThreshold(replayIds: number, maxShared: number): boolean {
+  return replayIds >= 2 || maxShared >= 3;
+}
+
 export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   const findings: Finding[] = [];
   const metrics: Record<string, number | string | null> = {};
@@ -728,6 +873,19 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       }
     : null;
 
+  // 路由一致性/推理类型/响应重放：复用本轮已有样本，不新增请求。warn 不额外压分（避免与
+  // echo/模板信号重复扣分），但会阻止「身份探针未见异常」的 pass 结论。
+  const routing = analyzeRoutingSignals(
+    [
+      ...samples,
+      ...(schemaResult.ok
+        ? [{ question: '<schema-probe>', result: schemaResult, evidenceId: schemaCall.evidenceId }]
+        : []),
+    ],
+    ctx.cfg.model,
+  );
+  Object.assign(metrics, routing.metrics);
+
   const refusalCount = texts.filter((t) => REFUSAL_PATTERNS.some((p) => p.test(t))).length;
   metrics['refusals'] = refusalCount;
 
@@ -773,6 +931,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   metrics['claimed_version'] = claimedVersion ?? 'none';
 
   if (samples.length === 0) {
+    for (const finding of routing.findings) findings.push(finding);
     if (echoFinding !== null) {
       findings.push(echoFinding);
       // 无有效自述 ⇒ 不给分（status insufficient），但回显不一致必须升到 warn，
@@ -791,7 +950,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       id: 'identity',
       status: 'insufficient',
       score: null,
-      level: 'unknown',
+      level: routing.warn ? 'warn' : 'unknown',
       headline: failureDigest(
         selfIdErrors,
         questions.length,
@@ -869,6 +1028,8 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
         evidenceIds: [...personaHits.values()].flatMap((v) => v.evidenceIds),
       });
     }
+    // 路由一致性/推理类型/重放信号：在诚实降级分支同样披露，不因「无法核验自述」而丢失。
+    for (const finding of routing.findings) findings.push(finding);
   };
 
   // —— 诚实降级分支（真实事故：中转站全程自述他族，旧逻辑却输出 PASS「身份探针未见异常」）——
@@ -890,7 +1051,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       id: 'identity',
       status: 'insufficient',
       score: null,
-      level: echoFinding !== null ? 'warn' : 'unknown',
+      level: echoFinding !== null || routing.warn ? 'warn' : 'unknown',
       headline: `目标模型族不在已知别名表内，无法据自述核验身份${echoNote}`,
       findings,
       metrics,
@@ -968,7 +1129,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       id: 'identity',
       status: 'insufficient',
       score: null,
-      level: echoFinding !== null ? 'warn' : 'unknown',
+      level: echoFinding !== null || routing.warn ? 'warn' : 'unknown',
       headline: `自述未声明可识别模型族，无法核验身份${echoNote}`,
       findings,
       metrics,
@@ -980,6 +1141,13 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
   let score = 100;
   let level: ProbeOutcome['level'] = 'pass';
   let headline = '身份探针未见异常';
+
+  // 路由一致性/推理类型/重放：只影响档位（阻止 pass），不再重复扣分。
+  for (const finding of routing.findings) findings.push(finding);
+  if (routing.warn) level = 'warn';
+  if (routing.warn && headline === '身份探针未见异常') {
+    headline = '身份探针存在上游一致性异常信号（路由混流/推理类型/响应重放，见明细）';
+  }
 
   if (falsified) {
     score = 0;
@@ -1123,6 +1291,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       message: `共采样 ${samples.length} 次自述 + 1 次格式合规探针，全部返回空文本（HTTP 200${allZeroCompletion ? ' 且 completion_tokens=0' : ''}），无法完成身份核验（这是上游端点未产出内容，不是检测程序错误）。`,
       evidenceIds: [],
     });
+    for (const finding of routing.findings) findings.push(finding);
     if (echoFinding !== null) {
       return {
         id: 'identity',
@@ -1138,7 +1307,7 @@ export async function probeIdentity(ctx: ProbeCtx): Promise<ProbeOutcome> {
       id: 'identity',
       status: 'insufficient',
       score: null,
-      level: 'unknown',
+      level: routing.warn ? 'warn' : 'unknown',
       headline: '身份探针无有效回答（全部空响应），无法核验',
       findings,
       metrics,

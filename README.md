@@ -92,7 +92,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 质量 Quality | 25 | 版本化程序化题集，pass@1 首答正确率对照参考答案（降智检测）；默认 12 题一轮，可用 `--quality-samples 1~5`（`--deep` 默认 3 轮）扩样缩窄置信区间 |
 | 身份 Identity | 15 | 自我身份问答 + 行为指纹：换标签、换护栏、换变体都逃不过 |
 | 上下文 Context | 15 | 按标称深度埋 needle，验证窗口真实、usage 校准可信 |
-| Tokenizer 指纹 | 5 | 可选参考端点：7 类固定语料对比输入 token 增量向量，识别不同 tokenizer / 模型族；不单独证明身份 |
+| Tokenizer 指纹 | 5 | 可选参考端点：7 类固定语料对比输入 token 增量向量，并追加 logprob 首 token 指纹（两轮确认）；识别不同 tokenizer / 模型族；不单独证明身份 |
 | 能力 Capability | 10 | 宣称的 vision / tool / thinking 逐项实测，而不只看宣称 |
 | 时延 TTFT | 仅观测 | 流式首字延迟 p50/p95，不计入总分 |
 
@@ -101,7 +101,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 - 判定 = 退出码：**完成（只给分数）**（0）· **不通过**（1）· **用法错误 / 未得出结论**（2）。不设「可疑」结论档。
 - 证据不足的维度标 `N/A` 并排除计分——绝不按 0 分算。
 - **不通过仅由两类实锤触发**：计费维度 fail（倍率/计量造假、乱收费）或身份维度 fail（明显换壳：自述族矛盾、基线指纹漂移）。其余情况的结论就是分数本身：「可信度总分 X/100」+ 分项分数。计费 / 能力 / 上下文 / 质量 / tokenizer 指纹低于 40 触发**硬红线**（总分封顶 45）；能力被证伪封顶 60——都只压分数。
-- **参考差分是可选增强**：配置可信的同模型参考端点后，质量探针会同题集逐样本做首答配对比较；主端点比参考少对 ≥3 题且相对差距 ≥25%、且配对分歧通过 McNemar 精确检验（单侧 p ≤ 0.15）才升级为系统性差分。参考正确率 ≥90%、主端点 <60% 且 p ≤ 0.05 时质量封顶 45，其余系统性差距封顶 70；反向分歧会抬高 p 值、阻假定罪；单题差异只披露。tokenizer 探针另外比较 7 类固定语料的输入 token 增量向量，至少 5 类可比才给出分数。
+- **参考差分是可选增强**：配置可信的同模型参考端点后，质量探针会同题集逐样本做首答配对比较；主端点比参考少对 ≥3 题且相对差距 ≥25%、且配对分歧通过 McNemar 精确检验（单侧 p ≤ 0.15）才升级为系统性差分。参考正确率 ≥90%、主端点 <60% 且 p ≤ 0.05 时质量封顶 45，其余系统性差距封顶 70；反向分歧会抬高 p 值、阻假定罪；单题差异只披露。tokenizer 探针另外比较 7 类固定语料的输入 token 增量向量，至少 5 类可比才给出分数；同一探针还会请求 `logprobs`，只比较首个非空白 token 的分布（两轮随机题同向才压分），端点不支持时只披露不扣分；logprob 指纹不依赖语料 usage，即使 tokenizer 语料不足也会尝试。
 - **实锤不保留及格分**：定罪维度（fail）的分项分一律封顶 45；计费/身份实锤时可信度总分同样封顶 45——「不通过」结论不得配上及格区分数。任一维度被判 fail（非仅计费/身份）时，总评不得为 pass，至少降为 warn（避免「分项 FAIL 45 + 总评 pass」自相矛盾）。
 - **计费默认是「形状体检」**：形状检查全过但没做绝对对账时给 **85 分 + 明确披露**（全量等比缩放、虚高扣费无法靠形状排除）；绝对对账成立才 100 分，有矛盾证据直接 fail。
 - **价格下调不扣分**：`--baseline` / 本地价格账本检出显著变化时，只有上调或口径断裂才降档；明确下调视为更划算，只在 findings 披露。
@@ -114,7 +114,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 
 | 维度 | 实测方法（简化） |
 |---|---|
-| 身份 | 问「你是谁 / 什么版本」+ 多轮行为指纹；自述的模型、族系、变体后缀与请求名对不上即报警——专抓换壳、轻量版冒充、换护栏。配置参考端点后，质量与 tokenizer 差分也作为身份旁证；响应中的 `responseId` / `systemFingerprint` / 白名单响应头 / `logprobs`（仅透传上游返回，本工具不主动请求）只作协议元数据旁证，不单独定罪。 |
+| 身份 | 问「你是谁 / 什么版本」+ 多轮行为指纹；自述的模型、族系、变体后缀与请求名对不上即报警——专抓换壳、轻量版冒充、换护栏。配置参考端点后，质量与 tokenizer（含 logprob 首 token 指纹）差分也作为身份旁证；同一模型名的回显稳定多簇、明确非推理模型返回实质推理内容、response id 达到复用阈值时会给出保守 warn（不额外扣分，只阻止 pass）；`responseId` / `systemFingerprint` / 白名单响应头只作协议元数据旁证，不单独定罪。 |
 | 质量 | 跑一套版本化程序化题集，用 pass@1 首答正确率对照参考答案；复采样只作证据，避免一次偶发失手就冤枉人。每轮 12 道主题 + 3 道控制题，`--quality-samples`（或 `--deep` 默认 3 轮）可扩样，报告附 95% 置信区间与证据强度（low / medium / high）。配置可信的同模型参考端点后，逐样本做首答配对 + McNemar 显著性检验，只有统计显著的系统性差分才降档。 |
 | Tokenizer 指纹 | 可选参考端点：7 类固定语料分别请求主/参考端点，比较输入 token 增量向量；至少 5 类可比才评分，多类别一致偏离才判 tokenizer / 模型族差异。 |
 | 上下文 | 在标称窗口的深处埋「针」并要求原样找回；同时核对端点自报的 `prompt_tokens` 与实际发送量，防止「号称 128K、实际 32K」。 |
@@ -135,7 +135,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
 | 标称价格（每百万 tokens） | `--price-input 0.2 --price-output 0.7`（启用计费探针） |
 | 你所在分组的公示倍率 | `--expect-model-ratio 1.5 --expect-completion-ratio 4`（偏差 > 5% 判计费失败） |
 | 站点没有 `/api/pricing` | `--declared-price-page /pricing`（同源价格页，仅 warn 参照） |
-| 有可信的同模型参考端点 | `--reference-base-url <url> --reference-api-key <key> [--reference-model <model>]`（启用质量差分与 tokenizer 指纹；仅 CLI） |
+| 有可信的同模型参考端点 | `--reference-base-url <url> --reference-api-key <key> [--reference-model <model>]`（启用质量差分与 tokenizer/logprob 指纹；仅 CLI） |
 | 想先看请求量和花费 | `--dry-run`（不发任何请求） |
 | 想让质量结论更稳 | `--quality-samples 3`（Web 控制台也提供同一表单项；`--deep` 默认 3 轮） |
 
@@ -145,7 +145,7 @@ model-xray test --base-url https://your-relay.example.com/v1 --model gpt-4o --ye
   --reference-base-url https://api.openai.com/v1 --reference-model gpt-4o
 ```
 
-参考模型默认与主模型相同；完整参考配置会把基准从 63 calls / 240600 input tokens 增加到 89 calls / 252600 input tokens（+26 calls；基准为默认 `--expect vision,tool`，`--expect none` 时是 58/84）。参考端点与密钥仅用于对照请求，功能目前仅 CLI 提供，WebUI 尚未接入该表单。
+参考模型默认与主模型相同；完整参考配置会把基准从 63 calls / 240600 input tokens 增加到 89 calls / 252600 input tokens（+26 calls；基准为默认 `--expect vision,tool`，`--expect none` 时是 58/84）。logprob 指纹另计：端点不支持时 +2 calls（91，`--expect none` 为 86）；支持且首轮一致时 +12（101/96）；首轮可疑并复测时最多 +24（113/108）。`--dry-run` 的预估计入 logprob 最坏情形 +24，因此显示 113 而非 89。logprob 只在主/参考模型规范化后完全同名时启用；日期钉版不同会跳过（避免拿不同快照当同模型）。参考端点与密钥仅用于对照请求，功能目前仅 CLI 提供，WebUI 尚未接入该表单。
 
 **复测 / 抓偷换**：保留首轮生成的 `reports/baseline-<模型名>-<时间>.json`，复测时加 `--baseline <该文件>` 对比指纹。
 
@@ -256,7 +256,7 @@ The score is a weighted geometric credibility total (0–100); every dimension i
 |---|---|---|
 | Billing | 25 | endpoint-reported token shape (linearity / consistency / output side) + rate comparison (default: price ratio from public vs list price; guard / balance mode: measured spend delta) |
 | Quality | 25 | versioned programmatic question bank, pass@1 accuracy; default round is 12 main + 3 control questions, expandable to 5 rounds via `--quality-samples` (`--deep` defaults to 3) to tighten the confidence interval |
-| Identity | 15 | self-ID questions + behavioral fingerprints, corroborated by quality/tokenizer differentials and response metadata (`responseId`, `systemFingerprint`, allowlisted headers, `logprobs` — only when the upstream returns it; the tool never requests it) — metadata never convicts alone |
+| Identity | 15 | self-ID questions + behavioral fingerprints, corroborated by quality/tokenizer (including logprob first-token) differentials. Stable multi-cluster model echoes, substantive reasoning from a known non-reasoning model, and response-id reuse across requests raise conservative warnings (no extra score deduction; they only block a `pass`). `responseId` / `systemFingerprint` / allowlisted headers never convict alone |
 | Context | 15 | needle test at claimed depth; usage-calibration cross-check |
 | Tokenizer | 5 | optional reference endpoint: compares input-token increments across 7 fixed corpora; at least 5 comparable corpora are required |
 | Capability | 10 | advertised vision / tool / thinking actually exercised |
@@ -279,7 +279,7 @@ In one sentence: **it behaves like a real user and measures differences — in b
 |---|---|
 | Identity | Asks "who are you / which version" plus behavioral fingerprints; a self-reported model, family, or variant suffix that doesn't match the requested id raises an alert — catches relabeling, lighter siblings, guardrail swaps. Reference differentials and response metadata are corroborating evidence only. |
 | Quality | Runs a versioned programmatic question bank and scores pass@1 against reference answers; each round has 12 main + 3 control questions, and `--quality-samples` (or `--deep` defaulting to 3 rounds) aggregates rounds with a reported 95% CI plus an evidence-strength label. With a trusted same-model reference endpoint it pairs first answers per sample and gates the systematic verdict on an exact McNemar test. The resample is evidence only, so one unlucky first answer doesn't convict a station. |
-| Tokenizer | Sends 7 fixed corpora to the main and reference endpoints and compares input-token increment vectors; at least 5 comparable corpora are required. Consistent deviation across categories indicates a tokenizer / model-family mismatch. |
+| Tokenizer | Sends 7 fixed corpora to the main and reference endpoints and compares input-token increment vectors (at least 5 comparable corpora required), then requests `logprobs` and compares only the first non-whitespace token distribution across two independent randomized rounds. Consistent deviation indicates a tokenizer / model-family mismatch; unsupported `logprobs` is disclosed but never penalized. |
 | Context | Hides a needle at the claimed depth and asks for it back; cross-checks endpoint-reported `prompt_tokens` against what was actually sent — catches "claims 128K, serves 32K". |
 | Billing | Runs a within-run linearity regression and hard-contradiction checks on self-reported tokens; by default compares public vs list price for a price ratio, and in balance/guard mode measures the real multiplier as spend ÷ (claimed price × reported usage). |
 | Capability | Actually exercises advertised vision / tool calling / thinking instead of reading the spec sheet. |
@@ -291,7 +291,7 @@ Thresholds, question banks, and needles are versioned so reports stay reproducib
 
 Know the station's claims? Add `--claimed-context 128000`, `--expect vision,tool,thinking`, `--price-input 0.2 --price-output 0.7`, `--expect-model-ratio 1.5 --expect-completion-ratio 4`, `--declared-price-page /pricing`; preview with `--dry-run`.
 
-**Reference-endpoint differential (CLI-only):** if you have a trusted endpoint for the same model, add `--reference-base-url`, `--reference-api-key` (or `MODEL_XRAY_REFERENCE_KEY`), and optionally `--reference-model` (defaults to the audited model). This enables first-answer quality pairing and the tokenizer fingerprint. A fully configured reference run increases the baseline plan (default `--expect vision,tool`) from 63 calls / 240,600 input tokens to 89 calls / 252,600 input tokens (`--expect none`: 58 → 84); the quality-pairing portion scales with the question-bank rounds (12 calls + 12,000 input tokens per round), the tokenizer side stays 14 calls. `--deep` also raises the quality bank to 3 rounds (15 calls + up to 12 resample calls per round). WebUI does not expose these fields yet.
+**Reference-endpoint differential (CLI-only):** if you have a trusted endpoint for the same model, add `--reference-base-url`, `--reference-api-key` (or `MODEL_XRAY_REFERENCE_KEY`), and optionally `--reference-model` (defaults to the audited model). This enables first-answer quality pairing, the tokenizer fingerprint, and the logprob first-token fingerprint. A fully configured reference run increases the baseline plan (default `--expect vision,tool`) from 63 calls / 240,600 input tokens to 89 calls / 252,600 input tokens (`--expect none`: 58 → 84); the quality-pairing portion scales with the question-bank rounds (12 calls + 12,000 input tokens per round), and the tokenizer side stays at 14 calls. The logprob fingerprint adds 2 calls when unsupported (91 total), 12 when supported and consistent (101 total), and up to 24 when a second confirmation round is needed (113 total); `--dry-run` counts that worst case, so it prints 113 rather than the 89-call tokenizer/quality base. Logprob runs only when the main and reference model names canonicalize to the same value, so different date-pinned snapshots are skipped and do not add the 24-call worst case to the estimate. `--deep` also raises the quality bank to 3 rounds (15 calls + up to 12 resample calls per round). WebUI does not expose these fields yet.
 
 ```powershell
 $env:MODEL_XRAY_REFERENCE_KEY = 'sk-reference-key'

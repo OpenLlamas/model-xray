@@ -14,6 +14,7 @@ import { runPricingScan } from './pricing-scan/cli.js';
 import { parsePriceFlags } from './price-flags.js';
 import { redactUrl } from './redact.js';
 import { isPlausibleQuotaPerUnit, QUOTA_PER_UNIT_MAX, QUOTA_PER_UNIT_MIN } from './pricing.js';
+import { canonicalModel } from './probes/logprob.js';
 import type { AuditReport, RunConfig } from './types.js';
 
 const HELP = `model-xray — audit OpenAI-compatible endpoints for fake or watered-down models
@@ -35,7 +36,7 @@ test Options:
   --base-url <url>          Endpoint base URL, e.g. https://relay.example.com/v1
   --key <key>               API key (or env MODEL_XRAY_KEY / OPENAI_API_KEY)
   --model <model>           Model name to audit, e.g. gpt-4o
-  --reference-base-url <url>  Optional reference endpoint used as a same-model differential control
+  --reference-base-url <url>  Optional same-model reference endpoint: quality/tokenizer/logprob differentials
   --reference-api-key <key>   Reference endpoint API key (or env MODEL_XRAY_REFERENCE_KEY)
   --reference-model <model>   Reference model name (default: same as --model)
   --claimed-context <n>     Advertised context window in tokens, integer in [1000, 100000000] (enables context probe)
@@ -574,7 +575,19 @@ export function estimateCost(cfg: RunConfig): { calls: number; inputTokens: numb
   // quality 题集轮数：缺省 1 轮，--deep 3 轮，显式 --quality-samples 优先（每轮 15 题 + 至多 12 发复采样）。
   const qualityRounds = cfg.qualitySamples ?? (cfg.deep ? 3 : 1);
   // Reference differential: quality 每轮 12 道主题 + tokenizer 7 corpora x 2 sides（tokenizer 不随轮数扩）。
-  const referenceCalls = referenceConfigured ? 14 + 12 * qualityRounds : 0;
+  // 模型不匹配时这部分基线 26 calls 仍全额计入（quality/tokenizer 差分与模型是否同名无关），
+  // 只是不再追加 logprob 的最坏 24 calls（第一轮 12 + 可疑复测 12；不支持时实际只发 2）。
+  const mainCanonical = canonicalModel(cfg.model);
+  const referenceCanonical =
+    cfg.referenceModel === undefined || cfg.referenceModel === null ? null : canonicalModel(cfg.referenceModel);
+  const logprobEligible =
+    referenceConfigured &&
+    mainCanonical !== '' &&
+    referenceCanonical !== null &&
+    referenceCanonical !== '' &&
+    mainCanonical === referenceCanonical;
+  const referenceCalls =
+    referenceConfigured ? 14 + 12 * qualityRounds + (logprobEligible ? 24 : 0) : 0;
   const calls =
     contextCalls +
     billingCalls +

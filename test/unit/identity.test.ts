@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { detectPersonaBrands, familiesIn, probeIdentity } from '../../src/probes/identity.js';
+import { analyzeRoutingSignals, detectPersonaBrands, familiesIn, probeIdentity } from '../../src/probes/identity.js';
 import { createEvidenceRecorder } from '../../src/evidence.js';
 import { createRng } from '../../src/random.js';
 import type { ChatRequest, ChatResult, OpenAIClient, ProbeCtx, RunConfig } from '../../src/types.js';
@@ -41,6 +41,10 @@ function okResult(text: string): ChatResult {
     error: null,
     raw: '',
   };
+}
+
+function echoedResult(text: string, model: string, responseId: string): ChatResult {
+  return { ...okResult(text), model, responseId };
 }
 
 /** 覆盖两个 SCHEMA_PROBES 全部键的超集 JSON，避免测试依赖 rng 选中哪个 schema 探针。 */
@@ -611,6 +615,25 @@ test('identity: 请求带日期钉版、回显被规范化成短名 → 不算�
   assert.equal(outcome.level, 'pass');
   assert.equal(outcome.metrics['model_echo'], '6/6');
   assert.ok(!outcome.findings.some((f) => /上游回显/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+test('identity: 组合日期+预览后缀与短名互认 → 不算异常', async () => {
+  const cases: Array<[string, string]> = [
+    ['openai/gpt-4o-2024-08-06-preview', 'gpt-4o'],
+    ['gpt-4o', 'openai/gpt-4o-2024-08-06-preview'],
+  ];
+  for (const [model, echoedModel] of cases) {
+    const echo = (results: ChatResult[]): ChatResult[] => results.map((r) => ({ ...r, model: echoedModel }));
+    const { client } = stubClient(echo([...gptSelfResults(), schemaOk()]));
+    const ctx = makeCtx(client, { model });
+    const outcome = await probeIdentity(ctx);
+    assert.equal(outcome.level, 'pass', model);
+    assert.equal(outcome.metrics['model_echo'], '6/6', model);
+    assert.ok(
+      !outcome.findings.some((f) => /上游回显/.test(f.message)),
+      `${model}: ${JSON.stringify(outcome.findings)}`,
+    );
+  }
 });
 
 test('identity: starved sample still contributes model echo mismatch', async () => {
@@ -1292,7 +1315,7 @@ test('identity: 冲突变体零散各 1 次、无多源一致性 → 仅 info �
 });
 
 test('identity: 自述带 benign 滚动别名尾缀（glm-5.3-preview/latest）不算冲突', async () => {
-  // 与回显判定 BENIGN_ALIAS_SUFFIXES 同口径：preview/latest 是官方滚动别名而非降级变体。
+  // 与路由归一的滚动别名口径一致：preview/latest 是官方滚动别名而非降级变体。
   const results = [
     okResult('我是 glm-5.3-preview，由智谱开发。'),
     okResult('智谱 AI 的 glm-5.3-latest 是我。'),
@@ -1397,4 +1420,171 @@ test('identity: 目标无 X.Y 版本锚点（gpt-4o）时变体比对整体跳�
   assert.equal(outcome.score, 100);
   assert.ok(!('claimed_variant_conflicts' in outcome.metrics));
   assert.ok(!outcome.findings.some((f) => /同族异版本/.test(f.message)), JSON.stringify(outcome.findings));
+});
+
+// —— 路由一致性/推理类型/响应重放（纯函数） ——
+function routingSample(
+  question: string,
+  model: string | null,
+  options: { reasoning?: boolean; responseId?: string | null } = {},
+): { question: string; result: ChatResult; evidenceId: string } {
+  const base = okResult('gpt-4o');
+  const reasoning = options.reasoning === true;
+  return {
+    question,
+    evidenceId: `ev-${question}`,
+    result: {
+      ...base,
+      model,
+      reasoning: reasoning ? 'thinking...' : null,
+      responseId: options.responseId ?? null,
+      usage: reasoning
+        ? { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30, reasoning_tokens: 10 }
+        : base.usage,
+    },
+  };
+}
+
+test('identity routing: 8 条回显形成 4/4 两簇 → warn 混流', () => {
+  const samples = [
+    ...Array.from({ length: 4 }, (_, i) => routingSample(`a${i}`, 'gpt-4o-2024-08-06')),
+    ...Array.from({ length: 4 }, (_, i) => routingSample(`b${i}`, 'claude-3-5-sonnet-20241022')),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.warn, true);
+  assert.equal(routing.metrics['routing_groups'], 2);
+  assert.ok(routing.findings.some((f) => f.level === 'warn' && /稳定分簇/.test(f.message)));
+});
+
+test('identity routing: 4 条样本 2/2 只披露不判混流', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o'),
+    routingSample('a2', 'gpt-4o'),
+    routingSample('b1', 'claude-3-5-sonnet'),
+    routingSample('b2', 'claude-3-5-sonnet'),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.warn, false);
+  assert.ok(routing.findings.some((f) => f.level === 'info' && /仅披露/.test(f.message)));
+});
+
+test('identity routing: 日期钉版/滚动别名不制造假混流', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o-2024-08-06'),
+    routingSample('a2', 'gpt-4o-2024-11-20'),
+    routingSample('a3', 'gpt-4o-latest'),
+    routingSample('a4', 'openai/gpt-4o'),
+    routingSample('a5', 'gpt-4o-2024-08-06-preview'),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.metrics['routing_groups'], 1);
+  assert.equal(routing.warn, false);
+});
+
+test('identity routing: 同一回显名推理内容出现与否不拆成混流簇', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o', { reasoning: true }),
+    routingSample('a2', 'gpt-4o', { reasoning: true }),
+    routingSample('a3', 'gpt-4o', { reasoning: true }),
+    routingSample('a4', 'gpt-4o'),
+    routingSample('a5', 'gpt-4o'),
+    routingSample('a6', 'gpt-4o'),
+    routingSample('a7', 'gpt-4o'),
+    routingSample('a8', 'gpt-4o'),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.metrics['routing_groups'], 1);
+  assert.ok(!routing.findings.some((f) => /稳定分簇/.test(f.message)));
+  // 推理矛盾仍单独 warn（明确非推理模型 + 3 条实质推理内容）。
+  assert.equal(routing.warn, true);
+  assert.ok(routing.findings.some((f) => /非推理模型/.test(f.message)));
+});
+
+test('identity routing: 明确非推理模型出现 ≥2 次推理内容 → warn（不压分）', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o', { reasoning: true }),
+    routingSample('a2', 'gpt-4o', { reasoning: true }),
+    routingSample('a3', 'gpt-4o'),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.warn, true);
+  assert.ok(routing.findings.some((f) => /非推理模型/.test(f.message)));
+});
+
+test('identity routing: 仅 reasoning 文本、无 reasoning_tokens 数值 → 不判矛盾', () => {
+  const textOnly = (question: string) => ({
+    question,
+    evidenceId: `ev-${question}`,
+    result: {
+      ...okResult('gpt-4o'),
+      model: 'gpt-4o',
+      reasoning: 'gateway metadata / error text',
+      usage: { prompt_tokens: 10, completion_tokens: 20, total_tokens: 30 },
+    },
+  });
+  const routing = analyzeRoutingSignals([textOnly('a1'), textOnly('a2')], 'gpt-4o');
+  assert.equal(routing.metrics['routing_reasoning_samples'], 0);
+  assert.equal(routing.warn, false);
+});
+
+test('identity routing: 带组合日期/预览后缀的非推理目标仍能识别推理矛盾', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o', { reasoning: true }),
+    routingSample('a2', 'gpt-4o', { reasoning: true }),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o-2024-08-06-preview');
+  assert.equal(routing.warn, true);
+  assert.ok(routing.findings.some((f) => /非推理模型/.test(f.message)));
+});
+
+test('identity routing: 未知模型出现推理内容只 info', () => {
+  const samples = [routingSample('a1', 'mystery-model', { reasoning: true })];
+  const routing = analyzeRoutingSignals(samples, 'mystery-model');
+  assert.equal(routing.warn, false);
+  assert.ok(routing.findings.some((f) => f.level === 'info' && /仅披露/.test(f.message)));
+});
+
+test('identity routing: 同一 response id 跨 3 个问题 → warn 数据质量', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o', { responseId: 'resp-123' }),
+    routingSample('a2', 'gpt-4o', { responseId: ' resp-123 ' }),
+    routingSample('a3', 'gpt-4o', { responseId: 'resp-123' }),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.warn, true);
+  assert.equal(routing.metrics['routing_replay_ids'], 1);
+  assert.ok(routing.findings.some((f) => /复用于不同请求/.test(f.message)));
+});
+
+test('identity routing: response id 常量占位/同题重试不误报', () => {
+  const samples = [
+    routingSample('a1', 'gpt-4o', { responseId: 'chatcmpl-constant' }),
+    routingSample('a1', 'gpt-4o', { responseId: 'chatcmpl-constant' }),
+  ];
+  const routing = analyzeRoutingSignals(samples, 'gpt-4o');
+  assert.equal(routing.metrics['routing_replay_ids'], 0);
+  assert.equal(routing.warn, false);
+});
+
+test('identity: 8 条同回显 + 同一 response id 经完整探针仍 warn 且不压分', async () => {
+  const texts = [
+    'I am gpt-4o, made by OpenAI.',
+    '我是 gpt-4o，由 OpenAI 开发。',
+    'I\'m the gpt-4o model.',
+    '我来自 OpenAI 的 gpt-4o。',
+    'gpt-4o is my model name.',
+    'This model is gpt-4o from OpenAI.',
+    'OpenAI 的 gpt-4o 在这里。',
+    'gpt-4o',
+  ];
+  const results = texts.map((text) => echoedResult(text, 'gpt-4o', 'resp-replay-001'));
+  results.push(echoedResult(COMPLETE_SCHEMA_JSON, 'gpt-4o', 'resp-schema-999'));
+  const { client } = stubClient(results);
+  const outcome = await probeIdentity(makeCtx(client, { deep: true, model: 'gpt-4o' }));
+  assert.equal(outcome.status, 'ok');
+  assert.equal(outcome.level, 'warn');
+  assert.equal(outcome.score, 100);
+  assert.equal(outcome.metrics['routing_replay_ids'], 1);
+  assert.ok(outcome.findings.some((f) => f.level === 'warn' && /复用于不同请求/.test(f.message)));
+  assert.ok(!/未见异常/.test(outcome.headline), outcome.headline);
 });
